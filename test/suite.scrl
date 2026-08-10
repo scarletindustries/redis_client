@@ -803,6 +803,7 @@ fn test_pipeline(c Conn) Result(Array(Check), RedisError) {
 		_ -> Err(redis.Protocol('expected five replies'))
 	})
 
+	_ <- result.then(keys.del(c, [k('pl'), k('pl2')]))
 	Ok(
 		array.concat(
 			[
