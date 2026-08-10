@@ -5,6 +5,7 @@
 // them. What these commands add is the coordinate encoding and the searches.
 
 import scarlet/array
+import scarlet/result
 import ./number.{Finite, Score}
 import ./redis.{Conn, RedisError}
 import ./options.{Condition, Direction, Unit}
@@ -86,23 +87,25 @@ pub fn geopos(
 	key String,
 	members Array(String),
 ) Result(Array(Option(Point)), RedisError) {
-	match redis.expect_values(redis.command(c, redis.parts([['GEOPOS', key], members]))) {
-		Err(e) -> Err(e)
-		Ok(values) -> redis.collect(array.map(values, decode_point))
-	}
+	values <- result.then(
+		redis.expect_values(redis.command(c, redis.parts([['GEOPOS', key], members]))),
+	)
+	redis.collect(array.map(values, decode_point))
 }
 
 fn decode_point(v resp.Value) Result(Option(Point), RedisError) {
 	match v {
 		Null -> Ok(None)
-		other -> match redis.expect_values(Ok(other)) {
-			Err(e) -> Err(e)
-			Ok([lon, lat]) -> match (coordinate(lon), coordinate(lat)) {
-				(Ok(x), Ok(y)) -> Ok(Some(Point(x, y)))
-				(Err(e), _) -> Err(e)
-				(_, Err(e)) -> Err(e)
+		other -> {
+			parts <- result.then(redis.expect_values(Ok(other)))
+			match parts {
+				[lon, lat] -> {
+					x <- result.then(coordinate(lon))
+					y <- result.then(coordinate(lat))
+					Ok(Some(Point(x, y)))
+				}
+				_ -> Err(redis.Protocol('expected a longitude and a latitude'))
 			}
-			Ok(_) -> Err(redis.Protocol('expected a longitude and a latitude'))
 		}
 	}
 }
@@ -110,7 +113,7 @@ fn decode_point(v resp.Value) Result(Option(Point), RedisError) {
 fn coordinate(v resp.Value) Result(Float, RedisError) {
 	// A coordinate is always finite — the infinities a Score can carry cannot
 	// occur here, so collapsing to Float loses nothing.
-	redis.map_ok(redis.value_score(v), fn(s) number.score_or(s, 0.0))
+	result.map(redis.value_score(v), fn(s) number.score_or(s, 0.0))
 }
 
 // ---------------------------------------------------------------------------
@@ -252,7 +255,7 @@ fn decode_found(
 	details Array(Detail),
 ) Result(Array(Found), RedisError) {
 	if array.length(details) == 0 {
-		redis.map_ok(
+		result.map(
 			redis.expect_strings(reply),
 			fn(names) array.map(names, fn(n) Found(n, None, None, None)),
 		)
@@ -265,10 +268,10 @@ fn decode_found(
 }
 
 fn decode_entry(entry resp.Value, details Array(Detail)) Result(Found, RedisError) {
-	match redis.expect_values(Ok(entry)) {
-		Err(e) -> Err(e)
-		Ok([]) -> Err(redis.Protocol('empty geo result entry'))
-		Ok([name, ..rest]) -> match redis.value_text(name) {
+	parts <- result.then(redis.expect_values(Ok(entry)))
+	match parts {
+		[] -> Err(redis.Protocol('empty geo result entry'))
+		[name, ..rest] -> match redis.value_text(name) {
 			Err(e) -> Err(e)
 			Ok(member) -> gather(member, rest, details)
 		}
@@ -306,25 +309,23 @@ fn gather(
 	} else {
 		None
 	}
-	match (opt_score(distance), opt_int(hash), opt_point(point)) {
-		(Ok(d), Ok(h), Ok(p)) -> Ok(Found(member, d, h, p))
-		(Err(e), _, _) -> Err(e)
-		(_, Err(e), _) -> Err(e)
-		(_, _, Err(e)) -> Err(e)
-	}
+	d <- result.then(opt_score(distance))
+	h <- result.then(opt_int(hash))
+	p <- result.then(opt_point(point))
+	Ok(Found(member, d, h, p))
 }
 
 fn opt_score(v Option(resp.Value)) Result(Option(Score), RedisError) {
 	match v {
 		None -> Ok(None)
-		Some(x) -> redis.map_ok(redis.value_score(x), fn(s) Some(s))
+		Some(x) -> result.map(redis.value_score(x), fn(s) Some(s))
 	}
 }
 
 fn opt_int(v Option(resp.Value)) Result(Option(Int), RedisError) {
 	match v {
 		None -> Ok(None)
-		Some(x) -> redis.map_ok(redis.value_int(x), fn(n) Some(n))
+		Some(x) -> result.map(redis.value_int(x), fn(n) Some(n))
 	}
 }
 

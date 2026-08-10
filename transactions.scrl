@@ -10,6 +10,7 @@
 // holding a lock.
 
 import scarlet/array
+import scarlet/result
 import ./redis.{Conn, RedisError}
 
 // Open a transaction. Commands sent after this are queued rather than run.
@@ -59,9 +60,9 @@ pub fn transaction(
 	c Conn,
 	commands Array(Array(String)),
 ) Result(Option(Array(resp.Value)), RedisError) {
-	match multi(c) {
-		Err(e) -> Err(e)
-		Ok(Nil) -> match queue_all(c, commands) {
+	opened <- result.then(multi(c))
+	match opened {
+		Nil -> match queue_all(c, commands) {
 			Ok(Nil) -> exec(c)
 			Err(e) -> {
 				discard(c) or Nil

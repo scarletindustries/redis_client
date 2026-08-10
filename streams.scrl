@@ -9,6 +9,8 @@
 // most of its own decoding on top of `redis.expect_values`.
 
 import scarlet/array
+import scarlet/result
+import scarlet/result
 import ./redis.{Conn, RedisError}
 
 // One entry: its ID and its fields, in the order the server returned them.
@@ -337,16 +339,14 @@ pub type PendingSummary {
 }
 
 pub fn xpending(c Conn, key String, group String) Result(PendingSummary, RedisError) {
-	match redis.expect_values(redis.command(c, ['XPENDING', key, group])) {
-		Err(e) -> Err(e)
-		Ok([count, lo, hi, per_consumer]) -> match redis.value_int(count) {
-			Err(e) -> Err(e)
-			Ok(n) -> match consumer_counts(per_consumer) {
-				Err(e) -> Err(e)
-				Ok(consumers) -> Ok(PendingSummary(n, opt_text(lo), opt_text(hi), consumers))
-			}
+	parts <- result.then(redis.expect_values(redis.command(c, ['XPENDING', key, group])))
+	match parts {
+		[count, lo, hi, per_consumer] -> {
+			n <- result.then(redis.value_int(count))
+			consumers <- result.then(consumer_counts(per_consumer))
+			Ok(PendingSummary(n, opt_text(lo), opt_text(hi), consumers))
 		}
-		Ok(_) -> Err(redis.Protocol('unexpected XPENDING summary shape'))
+		_ -> Err(redis.Protocol('unexpected XPENDING summary shape'))
 	}
 }
 
@@ -371,42 +371,35 @@ pub fn xpending_range(
 	consumer Option(String),
 	min_idle_ms Option(Int),
 ) Result(Array(PendingEntry), RedisError) {
-	match redis.expect_values(
-		redis.command(
-			c,
-			redis.parts(
-				[
-					['XPENDING', key, group],
-					redis.when_some(min_idle_ms, fn(n) ['IDLE', redis.arg(n)]),
-					[start, end, redis.arg(count)],
-					redis.when_some(consumer, fn(name) [name]),
-				],
+	rows <- result.then(
+		redis.expect_values(
+			redis.command(
+				c,
+				redis.parts(
+					[
+						['XPENDING', key, group],
+						redis.when_some(min_idle_ms, fn(n) ['IDLE', redis.arg(n)]),
+						[start, end, redis.arg(count)],
+						redis.when_some(consumer, fn(name) [name]),
+					],
+				),
 			),
 		),
-	) {
-		Err(e) -> Err(e)
-		Ok(rows) -> redis.collect(array.map(rows, decode_pending))
-	}
+	)
+	redis.collect(array.map(rows, decode_pending))
 }
 
 fn decode_pending(row resp.Value) Result(PendingEntry, RedisError) {
-	match redis.expect_values(Ok(row)) {
-		Err(e) -> Err(e)
-		Ok(
-			[id, consumer, idle, deliveries],
-		) -> match (
-			redis.value_text(id),
-			redis.value_text(consumer),
-			redis.value_int(idle),
-			redis.value_int(deliveries),
-		) {
-			(Ok(i), Ok(c), Ok(ms), Ok(n)) -> Ok(PendingEntry(i, c, ms, n))
-			(Err(e), _, _, _) -> Err(e)
-			(_, Err(e), _, _) -> Err(e)
-			(_, _, Err(e), _) -> Err(e)
-			(_, _, _, Err(e)) -> Err(e)
+	fields <- result.then(redis.expect_values(Ok(row)))
+	match fields {
+		[id, consumer, idle, deliveries] -> {
+			i <- result.then(redis.value_text(id))
+			c <- result.then(redis.value_text(consumer))
+			ms <- result.then(redis.value_int(idle))
+			n <- result.then(redis.value_int(deliveries))
+			Ok(PendingEntry(i, c, ms, n))
 		}
-		Ok(_) -> Err(redis.Protocol('unexpected XPENDING entry shape'))
+		_ -> Err(redis.Protocol('unexpected XPENDING entry shape'))
 	}
 }
 
@@ -473,37 +466,33 @@ pub fn xautoclaim(
 	start String,
 	count Option(Int),
 ) Result((String, Array(Entry), Array(String)), RedisError) {
-	match redis.expect_values(
-		redis.command(
-			c,
-			redis.parts(
-				[
-					['XAUTOCLAIM', key, group, consumer, redis.arg(min_idle_ms), start],
-					redis.when_some(count, fn(n) ['COUNT', redis.arg(n)]),
-				],
+	parts <- result.then(
+		redis.expect_values(
+			redis.command(
+				c,
+				redis.parts(
+					[
+						['XAUTOCLAIM', key, group, consumer, redis.arg(min_idle_ms), start],
+						redis.when_some(count, fn(n) ['COUNT', redis.arg(n)]),
+					],
+				),
 			),
 		),
-	) {
-		Err(e) -> Err(e)
-		Ok(
-			[cursor, claimed, deleted],
-		) -> match (
-			redis.value_text(cursor),
-			entries(Ok(claimed)),
-			redis.expect_strings(Ok(deleted)),
-		) {
-			(Ok(next), Ok(es), Ok(gone)) -> Ok((next, es, gone))
-			(Err(e), _, _) -> Err(e)
-			(_, Err(e), _) -> Err(e)
-			(_, _, Err(e)) -> Err(e)
+	)
+	match parts {
+		[cursor, claimed, deleted] -> {
+			next <- result.then(redis.value_text(cursor))
+			es <- result.then(entries(Ok(claimed)))
+			gone <- result.then(redis.expect_strings(Ok(deleted)))
+			Ok((next, es, gone))
 		}
 		// Redis before 7.0 omitted the deleted-IDs element.
-		Ok([cursor, claimed]) -> match (redis.value_text(cursor), entries(Ok(claimed))) {
-			(Ok(next), Ok(es)) -> Ok((next, es, []))
-			(Err(e), _) -> Err(e)
-			(_, Err(e)) -> Err(e)
+		[cursor, claimed] -> {
+			next <- result.then(redis.value_text(cursor))
+			es <- result.then(entries(Ok(claimed)))
+			Ok((next, es, []))
 		}
-		Ok(_) -> Err(redis.Protocol('unexpected XAUTOCLAIM shape'))
+		_ -> Err(redis.Protocol('unexpected XAUTOCLAIM shape'))
 	}
 }
 
@@ -532,10 +521,8 @@ pub fn xinfo_consumers(
 }
 
 fn rows(reply Result(resp.Value, RedisError)) Result(Array(Array((String, String))), RedisError) {
-	match redis.expect_values(reply) {
-		Err(e) -> Err(e)
-		Ok(items) -> redis.collect(array.map(items, fn(item) redis.expect_pairs(Ok(item))))
-	}
+	items <- result.then(redis.expect_values(reply))
+	redis.collect(array.map(items, fn(item) redis.expect_pairs(Ok(item))))
 }
 
 // ---------------------------------------------------------------------------
@@ -545,10 +532,8 @@ fn rows(reply Result(resp.Value, RedisError)) Result(Array(Array((String, String
 // An entry is `[id, [field, value, field, value, ...]]` — the fields flat, as
 // everything is under RESP2.
 fn entries(reply Result(resp.Value, RedisError)) Result(Array(Entry), RedisError) {
-	match redis.expect_values(reply) {
-		Err(e) -> Err(e)
-		Ok(items) -> redis.collect(array.map(items, decode_entry))
-	}
+	items <- result.then(redis.expect_values(reply))
+	redis.collect(array.map(items, decode_entry))
 }
 
 fn decode_entry(item resp.Value) Result(Entry, RedisError) {
@@ -557,14 +542,16 @@ fn decode_entry(item resp.Value) Result(Entry, RedisError) {
 		// in their place; there is nothing to decode, and dropping it silently
 		// would misalign the result with the IDs asked for.
 		Null -> Err(redis.Protocol('stream entry no longer exists'))
-		other -> match redis.expect_values(Ok(other)) {
-			Err(e) -> Err(e)
-			Ok([id, fields]) -> match (redis.value_text(id), redis.expect_pairs(Ok(fields))) {
-				(Ok(i), Ok(fs)) -> Ok(Entry(i, fs))
-				(Err(e), _) -> Err(e)
-				(_, Err(e)) -> Err(e)
+		other -> {
+			parts <- result.then(redis.expect_values(Ok(other)))
+			match parts {
+				[id, fields] -> {
+					i <- result.then(redis.value_text(id))
+					fs <- result.then(redis.expect_pairs(Ok(fields)))
+					Ok(Entry(i, fs))
+				}
+				_ -> Err(redis.Protocol('expected an id and a field list'))
 			}
-			Ok(_) -> Err(redis.Protocol('expected an id and a field list'))
 		}
 	}
 }
@@ -574,42 +561,31 @@ fn decode_entry(item resp.Value) Result(Entry, RedisError) {
 fn streams_reply(
 	reply Result(resp.Value, RedisError),
 ) Result(Option(Array(StreamEntries)), RedisError) {
-	match redis.expect_opt_values(reply) {
-		Err(e) -> Err(e)
-		Ok(None) -> Ok(None)
-		Ok(Some(items)) ->
-			redis.map_ok(redis.collect(array.map(items, decode_stream)), fn(ss) Some(ss))
+	found <- result.then(redis.expect_opt_values(reply))
+	match found {
+		None -> Ok(None)
+		Some(items) -> result.map(redis.collect(array.map(items, decode_stream)), Some)
 	}
 }
 
 fn decode_stream(item resp.Value) Result(StreamEntries, RedisError) {
-	match redis.expect_values(Ok(item)) {
-		Err(e) -> Err(e)
-		Ok([name, es]) -> match (redis.value_text(name), entries(Ok(es))) {
-			(Ok(stream), Ok(decoded)) -> Ok(StreamEntries(stream, decoded))
-			(Err(e), _) -> Err(e)
-			(_, Err(e)) -> Err(e)
+	parts <- result.then(redis.expect_values(Ok(item)))
+	match parts {
+		[name, es] -> {
+			stream <- result.then(redis.value_text(name))
+			decoded <- result.then(entries(Ok(es)))
+			Ok(StreamEntries(stream, decoded))
 		}
-		Ok(_) -> Err(redis.Protocol('expected a stream name and its entries'))
+		_ -> Err(redis.Protocol('expected a stream name and its entries'))
 	}
 }
 
 fn consumer_counts(v resp.Value) Result(Array((String, Int)), RedisError) {
 	match v {
 		Null -> Ok([])
-		other -> match redis.expect_values(Ok(other)) {
-			Err(e) -> Err(e)
-			Ok(items) -> redis.collect(
-				array.map(items, fn(item) match redis.expect_values(Ok(item)) {
-					Err(e) -> Err(e)
-					Ok([name, count]) -> match (redis.value_text(name), redis.value_int(count)) {
-						(Ok(n), Ok(k)) -> Ok((n, k))
-						(Err(e), _) -> Err(e)
-						(_, Err(e)) -> Err(e)
-					}
-					Ok(_) -> Err(redis.Protocol('expected a consumer and a count'))
-				}),
-			)
+		other -> {
+			items <- result.then(redis.expect_values(Ok(other)))
+			redis.collect(array.map(items, decode_consumer_count))
 		}
 	}
 }
@@ -654,20 +630,18 @@ pub type DeleteOutcome {
 }
 
 fn outcomes(reply Result(resp.Value, RedisError)) Result(Array(DeleteOutcome), RedisError) {
-	match redis.expect_values(reply) {
-		Err(e) -> Err(e)
-		Ok(values) -> redis.collect(
-			array.map(values, fn(v) redis.map_ok(redis.value_int(v), fn(n) if n == 0 - 1 {
-				NotFound
-			} else if n == 1 {
-				Deleted
-			} else if n == 2 {
-				StillReferenced
-			} else {
-				Unknown(n)
-			})),
-		)
-	}
+	values <- result.then(redis.expect_values(reply))
+	redis.collect(
+		array.map(values, fn(v) result.map(redis.value_int(v), fn(n) if n == 0 - 1 {
+			NotFound
+		} else if n == 1 {
+			Deleted
+		} else if n == 2 {
+			StillReferenced
+		} else {
+			Unknown(n)
+		})),
+	)
 }
 
 // Delete entries, deciding explicitly what happens to group references —
@@ -777,4 +751,16 @@ pub fn xcfgset(
 			),
 		),
 	)
+}
+
+fn decode_consumer_count(item resp.Value) Result((String, Int), RedisError) {
+	parts <- result.then(redis.expect_values(Ok(item)))
+	match parts {
+		[name, count] -> {
+			n <- result.then(redis.value_text(name))
+			k <- result.then(redis.value_int(count))
+			Ok((n, k))
+		}
+		_ -> Err(redis.Protocol('expected a consumer and a count'))
+	}
 }

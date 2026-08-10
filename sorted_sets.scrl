@@ -7,6 +7,7 @@
 // types means a caller cannot forget the bracket.
 
 import scarlet/array
+import scarlet/result
 import ./number.{Finite, NegInf, PosInf, Score}
 import ./redis.{Conn, RedisError}
 import ./options.{Aggregate, Asc, Condition, Desc, Direction, Limit}
@@ -168,15 +169,15 @@ pub fn zmscore(
 	key String,
 	members Array(String),
 ) Result(Array(Option(Score)), RedisError) {
-	match redis.expect_values(redis.command(c, redis.parts([['ZMSCORE', key], members]))) {
-		Err(e) -> Err(e)
-		Ok(values) -> redis.collect(
-			array.map(values, fn(v) match v {
-				Null -> Ok(None)
-				other -> redis.map_ok(redis.value_score(other), fn(s) Some(s))
-			}),
-		)
-	}
+	values <- result.then(
+		redis.expect_values(redis.command(c, redis.parts([['ZMSCORE', key], members]))),
+	)
+	redis.collect(
+		array.map(values, fn(v) match v {
+			Null -> Ok(None)
+			other -> result.map(redis.value_score(other), fn(s) Some(s))
+		}),
+	)
 }
 
 // How many members fall inside a score range.
@@ -220,15 +221,15 @@ pub fn zrevrank_withscore(
 }
 
 fn ranked(reply Result(resp.Value, RedisError)) Result(Option((Int, Score)), RedisError) {
-	match redis.expect_opt_values(reply) {
-		Err(e) -> Err(e)
-		Ok(None) -> Ok(None)
-		Ok(Some([r, s])) -> match (redis.value_int(r), redis.value_score(s)) {
-			(Ok(rank), Ok(score)) -> Ok(Some((rank, score)))
-			(Err(e), _) -> Err(e)
-			(_, Err(e)) -> Err(e)
+	popped <- result.then(redis.expect_opt_values(reply))
+	match popped {
+		None -> Ok(None)
+		Some([r, s]) -> {
+			rank <- result.then(redis.value_int(r))
+			score <- result.then(redis.value_score(s))
+			Ok(Some((rank, score)))
 		}
-		Ok(Some(_)) -> Err(redis.Protocol('expected a rank and a score'))
+		Some(_) -> Err(redis.Protocol('expected a rank and a score'))
 	}
 }
 
@@ -516,7 +517,7 @@ fn timeout(seconds Float) String {
 }
 
 fn one_popped(reply Result(resp.Value, RedisError)) Result(Option((String, Score)), RedisError) {
-	redis.map_ok(redis.expect_scored(reply), fn(pairs) match pairs {
+	result.map(redis.expect_scored(reply), fn(pairs) match pairs {
 		[first, .._] -> Some(first)
 		[] -> None
 	})
@@ -530,13 +531,11 @@ fn triple(
 	match redis.expect_opt_values(reply) {
 		Err(e) -> Err(e)
 		Ok(None) -> Ok(None)
-		Ok(
-			Some([k, m, s]),
-		) -> match (redis.value_text(k), redis.value_text(m), redis.value_score(s)) {
-			(Ok(key), Ok(member), Ok(score)) -> Ok(Some((key, member, score)))
-			(Err(e), _, _) -> Err(e)
-			(_, Err(e), _) -> Err(e)
-			(_, _, Err(e)) -> Err(e)
+		Ok(Some([k, m, s])) -> {
+			key <- result.then(redis.value_text(k))
+			member <- result.then(redis.value_text(m))
+			score <- result.then(redis.value_score(s))
+			Ok(Some((key, member, score)))
 		}
 		Ok(Some(_)) -> Err(redis.Protocol('expected a key, member and score'))
 	}
@@ -545,35 +544,33 @@ fn triple(
 fn keyed(
 	reply Result(resp.Value, RedisError),
 ) Result(Option((String, Array((String, Score)))), RedisError) {
-	match redis.expect_opt_values(reply) {
-		Err(e) -> Err(e)
-		Ok(None) -> Ok(None)
-		Ok(Some([k, entries])) -> match (redis.value_text(k), scored_pairs(entries)) {
-			(Ok(key), Ok(members)) -> Ok(Some((key, members)))
-			(Err(e), _) -> Err(e)
-			(_, Err(e)) -> Err(e)
+	popped <- result.then(redis.expect_opt_values(reply))
+	match popped {
+		None -> Ok(None)
+		Some([k, entries]) -> {
+			key <- result.then(redis.value_text(k))
+			members <- result.then(scored_pairs(entries))
+			Ok(Some((key, members)))
 		}
-		Ok(Some(_)) -> Err(redis.Protocol('expected a key and an array of members'))
+		Some(_) -> Err(redis.Protocol('expected a key and an array of members'))
 	}
 }
 
 // ZMPOP nests each member as its own two-element array, unlike the flat
 // WITHSCORES form that `expect_scored` reads.
 fn scored_pairs(v resp.Value) Result(Array((String, Score)), RedisError) {
-	match redis.expect_values(Ok(v)) {
-		Err(e) -> Err(e)
-		Ok(entries) -> redis.collect(
-			array.map(entries, fn(entry) match redis.expect_values(Ok(entry)) {
-				Err(e) -> Err(e)
-				Ok([m, s]) -> match (redis.value_text(m), redis.value_score(s)) {
-					(Ok(member), Ok(score)) -> Ok((member, score))
-					(Err(e), _) -> Err(e)
-					(_, Err(e)) -> Err(e)
-				}
-				Ok(_) -> Err(redis.Protocol('expected a member and a score'))
-			}),
-		)
-	}
+	entries <- result.then(redis.expect_values(Ok(v)))
+	redis.collect(
+		array.map(entries, fn(entry) match redis.expect_values(Ok(entry)) {
+			Err(e) -> Err(e)
+			Ok([m, s]) -> {
+				member <- result.then(redis.value_text(m))
+				score <- result.then(redis.value_score(s))
+				Ok((member, score))
+			}
+			Ok(_) -> Err(redis.Protocol('expected a member and a score'))
+		}),
+	)
 }
 
 // ---------------------------------------------------------------------------
@@ -617,17 +614,17 @@ pub fn zscan(
 		),
 	) {
 		Err(e) -> Err(e)
-		Ok((next, flat)) -> redis.map_ok(flat_scores(flat), fn(ps) (next, ps))
+		Ok((next, flat)) -> result.map(flat_scores(flat), fn(ps) (next, ps))
 	}
 }
 
 fn flat_scores(flat Array(String)) Result(Array((String, Score)), RedisError) {
 	match flat {
 		[] -> Ok([])
-		[m, s, ..rest] -> match (redis.to_score(s), flat_scores(rest)) {
-			(Ok(score), Ok(more)) -> Ok(array.concat([(m, score)], more))
-			(Err(e), _) -> Err(e)
-			(_, Err(e)) -> Err(e)
+		[m, s, ..rest] -> {
+			score <- result.then(redis.to_score(s))
+			more <- result.then(flat_scores(rest))
+			Ok(array.concat([(m, score)], more))
 		}
 		_ -> Err(redis.Protocol('ZSCAN returned an odd number of elements'))
 	}

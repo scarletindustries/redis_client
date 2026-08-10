@@ -2,6 +2,7 @@
 // addressed a bit at a time — so these operate on ordinary string keys.
 
 import scarlet/array
+import scarlet/result
 import ./redis.{Conn, RedisError}
 
 // Whether an offset counts bytes or bits. BITCOUNT and BITPOS take ranges in
@@ -85,7 +86,7 @@ fn bit_arg(value Bool) String {
 
 // BITPOS says "not found" with -1 rather than a null.
 fn found(reply Result(resp.Value, RedisError)) Result(Option(Int), RedisError) {
-	redis.map_ok(redis.expect_int(reply), fn(n) if n < 0 {
+	result.map(redis.expect_int(reply), fn(n) if n < 0 {
 		None
 	} else {
 		Some(n)
@@ -240,13 +241,11 @@ fn render_ops(ops Array(BitFieldOp)) Array(String) {
 }
 
 fn results(reply Result(resp.Value, RedisError)) Result(Array(Option(Int)), RedisError) {
-	match redis.expect_values(reply) {
-		Err(e) -> Err(e)
-		Ok(values) -> redis.collect(
-			array.map(values, fn(v) match v {
-				Null -> Ok(None)
-				other -> redis.map_ok(redis.value_int(other), fn(n) Some(n))
-			}),
-		)
-	}
+	values <- result.then(redis.expect_values(reply))
+	redis.collect(
+		array.map(values, fn(v) match v {
+			Null -> Ok(None)
+			other -> result.map(redis.value_int(other), fn(n) Some(n))
+		}),
+	)
 }

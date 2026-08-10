@@ -8,6 +8,7 @@
 // `read_reply` would report that rather than let it corrupt later commands.
 
 import scarlet/array
+import scarlet/result
 import ./number
 import ./redis.{Conn, RedisError}
 
@@ -33,13 +34,13 @@ pub fn dbsize(c Conn) Result(Int, RedisError) {
 // The server's clock: seconds since the epoch, and microseconds within that
 // second.
 pub fn time(c Conn) Result((Int, Int), RedisError) {
-	match redis.expect_strings(redis.command(c, ['TIME'])) {
-		Err(e) -> Err(e)
-		Ok([seconds, micros]) -> match (number.parse_int(seconds), number.parse_int(micros)) {
+	parts <- result.then(redis.expect_strings(redis.command(c, ['TIME'])))
+	match parts {
+		[seconds, micros] -> match (number.parse_int(seconds), number.parse_int(micros)) {
 			(Ok(s), Ok(us)) -> Ok((s, us))
 			_ -> Err(redis.Protocol('TIME did not return two integers'))
 		}
-		Ok(_) -> Err(redis.Protocol('TIME did not return two elements'))
+		_ -> Err(redis.Protocol('TIME did not return two elements'))
 	}
 }
 

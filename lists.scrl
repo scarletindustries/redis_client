@@ -7,6 +7,7 @@
 // another command until it returns.
 
 import scarlet/array
+import scarlet/result
 import ./number
 import ./redis.{Conn, RedisError}
 
@@ -71,7 +72,7 @@ pub fn rpop_count(c Conn, key String, count Int) Result(Array(String), RedisErro
 }
 
 fn popped(reply Result(resp.Value, RedisError)) Result(Array(String), RedisError) {
-	redis.map_ok(redis.expect_opt_strings_or_nil(reply), fn(o) match o {
+	result.map(redis.expect_opt_strings_or_nil(reply), fn(o) match o {
 		Some(xs) -> xs
 		None -> []
 	})
@@ -359,28 +360,28 @@ pub fn blmpop(
 // BLPOP and BRPOP answer with a two-element array of key and element, so that
 // a caller waiting on several keys learns which one fired.
 fn pair(reply Result(resp.Value, RedisError)) Result(Option((String, String)), RedisError) {
-	match redis.expect_opt_values(reply) {
-		Err(e) -> Err(e)
-		Ok(None) -> Ok(None)
-		Ok(Some([k, v])) -> match (redis.value_text(k), redis.value_text(v)) {
-			(Ok(key), Ok(element)) -> Ok(Some((key, element)))
-			(Err(e), _) -> Err(e)
-			(_, Err(e)) -> Err(e)
+	found <- result.then(redis.expect_opt_values(reply))
+	match found {
+		None -> Ok(None)
+		Some([k, v]) -> {
+			key <- result.then(redis.value_text(k))
+			element <- result.then(redis.value_text(v))
+			Ok(Some((key, element)))
 		}
-		Ok(Some(_)) -> Err(redis.Protocol('expected a key and an element'))
+		Some(_) -> Err(redis.Protocol('expected a key and an element'))
 	}
 }
 
 // LMPOP and BLMPOP answer with the key and an array of elements.
 fn keyed(reply Result(resp.Value, RedisError)) Result(Option((String, Array(String))), RedisError) {
-	match redis.expect_opt_values(reply) {
-		Err(e) -> Err(e)
-		Ok(None) -> Ok(None)
-		Ok(Some([k, items])) -> match (redis.value_text(k), redis.expect_strings(Ok(items))) {
-			(Ok(key), Ok(elements)) -> Ok(Some((key, elements)))
-			(Err(e), _) -> Err(e)
-			(_, Err(e)) -> Err(e)
+	found <- result.then(redis.expect_opt_values(reply))
+	match found {
+		None -> Ok(None)
+		Some([k, items]) -> {
+			key <- result.then(redis.value_text(k))
+			elements <- result.then(redis.expect_strings(Ok(items)))
+			Ok(Some((key, elements)))
 		}
-		Ok(Some(_)) -> Err(redis.Protocol('expected a key and an array of elements'))
+		Some(_) -> Err(redis.Protocol('expected a key and an array of elements'))
 	}
 }

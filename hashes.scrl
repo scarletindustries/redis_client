@@ -1,6 +1,7 @@
 // Hash commands, including the per-field expiry family Redis added in 7.4.
 
 import scarlet/array
+import scarlet/result
 import ./number.{Score}
 import ./redis.{Conn, RedisError}
 import ./options.{Always, Condition, ExpireWhen, GetExpiry, IfExists, IfNotExists, SetExpiry}
@@ -12,7 +13,7 @@ import ./options.{Always, Condition, ExpireWhen, GetExpiry, IfExists, IfNotExist
 // Set one field. Returns True when the field was new, False when it replaced
 // an existing value — not whether the write happened, which it always does.
 pub fn hset(c Conn, key String, field String, value String) Result(Bool, RedisError) {
-	redis.map_ok(hset_many(c, key, [(field, value)]), fn(added) added > 0)
+	result.map(hset_many(c, key, [(field, value)]), fn(added) added > 0)
 }
 
 // Set several fields at once, returning how many of them were new.
@@ -111,9 +112,11 @@ pub fn hscan(
 	pattern Option(String),
 	count Option(Int),
 ) Result((Int, Array((String, String))), RedisError) {
-	match redis.expect_scan(redis.command(c, scan_args(key, cursor, pattern, count, False))) {
-		Err(e) -> Err(e)
-		Ok((next, flat)) -> redis.map_ok(pairs_of(flat), fn(ps) (next, ps))
+	page <- result.then(
+		redis.expect_scan(redis.command(c, scan_args(key, cursor, pattern, count, False))),
+	)
+	match page {
+		(next, flat) -> result.map(pairs_of(flat), fn(ps) (next, ps))
 	}
 }
 
@@ -149,7 +152,7 @@ fn scan_args(
 fn pairs_of(flat Array(String)) Result(Array((String, String)), RedisError) {
 	match flat {
 		[] -> Ok([])
-		[a, b, ..rest] -> redis.map_ok(pairs_of(rest), fn(ps) array.concat([(a, b)], ps))
+		[a, b, ..rest] -> result.map(pairs_of(rest), fn(ps) array.concat([(a, b)], ps))
 		_ -> Err(redis.Protocol('HSCAN returned an odd number of elements'))
 	}
 }
@@ -297,20 +300,18 @@ fn fields_block(fields Array(String)) Array(String) {
 }
 
 fn field_expiry(reply Result(resp.Value, RedisError)) Result(Array(FieldExpiry), RedisError) {
-	match redis.expect_values(reply) {
-		Err(e) -> Err(e)
-		Ok(values) -> redis.collect(
-			array.map(values, fn(v) redis.map_ok(redis.value_int(v), fn(n) if n == 0 - 2 {
-				NoField
-			} else if n == 0 {
-				NotApplied
-			} else if n == 2 {
-				FieldDeleted
-			} else {
-				Applied
-			})),
-		)
-	}
+	values <- result.then(redis.expect_values(reply))
+	redis.collect(
+		array.map(values, fn(v) result.map(redis.value_int(v), fn(n) if n == 0 - 2 {
+			NoField
+		} else if n == 0 {
+			NotApplied
+		} else if n == 2 {
+			FieldDeleted
+		} else {
+			Applied
+		})),
+	)
 }
 
 fn remaining(reply Result(resp.Value, RedisError)) Result(Array(redis.Remaining), RedisError) {
@@ -318,7 +319,7 @@ fn remaining(reply Result(resp.Value, RedisError)) Result(Array(redis.Remaining)
 		Err(e) -> Err(e)
 		Ok(values) ->
 			redis.collect(
-				array.map(values, fn(v) redis.map_ok(redis.value_int(v), redis.to_remaining)),
+				array.map(values, fn(v) result.map(redis.value_int(v), redis.to_remaining)),
 			)
 	}
 }

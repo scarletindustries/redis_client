@@ -2,6 +2,7 @@
 // everything that applies to a key whatever type of value it holds.
 
 import scarlet/array
+import scarlet/result
 import scarlet/binary
 import ./redis.{Conn, RedisError}
 import ./options.{Direction, ExpireWhen, Limit, Ttl}
@@ -59,7 +60,7 @@ pub type KeyType {
 }
 
 pub fn key_type(c Conn, key String) Result(KeyType, RedisError) {
-	redis.map_ok(redis.expect_status(redis.command(c, ['TYPE', key])), fn(name) match name {
+	result.map(redis.expect_status(redis.command(c, ['TYPE', key])), fn(name) match name {
 		'string' -> StringKey
 		'list' -> ListKey
 		'set' -> SetKey
@@ -213,9 +214,9 @@ fn scan_loop(
 	count Option(Int),
 	acc Array(String),
 ) Result(Array(String), RedisError) {
-	match scan(c, cursor, pattern, count, None) {
-		Err(e) -> Err(e)
-		Ok((next, batch)) -> {
+	step <- result.then(scan(c, cursor, pattern, count, None))
+	match step {
+		(next, batch) -> {
 			found = array.concat(acc, batch)
 			if next == 0 {
 				Ok(found)
@@ -359,10 +360,10 @@ pub fn waitaof(
 		redis.command(c, ['WAITAOF', redis.arg(local), redis.arg(replicas), redis.arg(timeout_ms)]),
 	) {
 		Err(e) -> Err(e)
-		Ok([l, r]) -> match (redis.value_int(l), redis.value_int(r)) {
-			(Ok(a), Ok(b)) -> Ok((a, b))
-			(Err(e), _) -> Err(e)
-			(_, Err(e)) -> Err(e)
+		Ok([l, r]) -> {
+			a <- result.then(redis.value_int(l))
+			b <- result.then(redis.value_int(r))
+			Ok((a, b))
 		}
 		Ok(_) -> Err(redis.Protocol('expected two counts from WAITAOF'))
 	}

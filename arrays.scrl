@@ -7,6 +7,7 @@
 // whenever there are gaps.
 
 import scarlet/array
+import scarlet/result
 import ./number.{Score}
 import ./redis.{Conn, RedisError}
 
@@ -270,18 +271,16 @@ pub fn arinfo(c Conn, key String) Result(Array((String, String)), RedisError) {
 // array, rather than flattening them the way HGETALL and ZSCAN do. The index
 // arrives as an integer reply, not as digits in a bulk string.
 fn indexed(reply Result(resp.Value, RedisError)) Result(Array((Int, String)), RedisError) {
-	match redis.expect_values(reply) {
-		Err(e) -> Err(e)
-		Ok(entries) -> redis.collect(
-			array.map(entries, fn(entry) match redis.expect_values(Ok(entry)) {
-				Err(e) -> Err(e)
-				Ok([index, value]) -> match (redis.value_int(index), redis.value_text(value)) {
-					(Ok(i), Ok(v)) -> Ok((i, v))
-					(Err(e), _) -> Err(e)
-					(_, Err(e)) -> Err(e)
-				}
-				Ok(_) -> Err(redis.Protocol('expected an index and a value'))
-			}),
-		)
-	}
+	entries <- result.then(redis.expect_values(reply))
+	redis.collect(
+		array.map(entries, fn(entry) match redis.expect_values(Ok(entry)) {
+			Err(e) -> Err(e)
+			Ok([index, value]) -> {
+				i <- result.then(redis.value_int(index))
+				v <- result.then(redis.value_text(value))
+				Ok((i, v))
+			}
+			Ok(_) -> Err(redis.Protocol('expected an index and a value'))
+		}),
+	)
 }

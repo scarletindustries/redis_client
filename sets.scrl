@@ -1,6 +1,7 @@
 // Set commands: membership, and the algebra over several sets.
 
 import scarlet/array
+import scarlet/result
 import ./redis.{Conn, RedisError}
 
 // ---------------------------------------------------------------------------
@@ -23,11 +24,10 @@ pub fn sismember(c Conn, key String, member String) Result(Bool, RedisError) {
 
 // Membership of several members at once. Positional: element i answers member i.
 pub fn smismember(c Conn, key String, members Array(String)) Result(Array(Bool), RedisError) {
-	match redis.expect_values(redis.command(c, redis.parts([['SMISMEMBER', key], members]))) {
-		Err(e) -> Err(e)
-		Ok(values) ->
-			redis.collect(array.map(values, fn(v) redis.map_ok(redis.value_int(v), fn(n) n != 0)))
-	}
+	values <- result.then(
+		redis.expect_values(redis.command(c, redis.parts([['SMISMEMBER', key], members]))),
+	)
+	redis.collect(array.map(values, fn(v) result.map(redis.value_int(v), fn(n) n != 0)))
 }
 
 // Every member. Unbounded — on a large set this is `keys`-shaped trouble, and

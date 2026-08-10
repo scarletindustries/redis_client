@@ -18,6 +18,7 @@
 // the same socket.
 
 import scarlet/array
+import scarlet/result
 import scarlet/binary
 import scarlet/net/error.{NetError, TimedOut, UnexpectedEof}
 import scarlet/net/socket.{Closed, Data, Socket}
@@ -95,24 +96,18 @@ pub fn shard_numsub(c Conn, of_channels Array(String)) Result(Array((String, Int
 
 // NUMSUB answers with a flat channel/count array.
 fn counts(reply Result(resp.Value, RedisError)) Result(Array((String, Int)), RedisError) {
-	match redis.expect_values(reply) {
-		Err(e) -> Err(e)
-		Ok(values) -> pair_counts(values)
-	}
+	values <- result.then(redis.expect_values(reply))
+	pair_counts(values)
 }
 
 fn pair_counts(values Array(resp.Value)) Result(Array((String, Int)), RedisError) {
 	match values {
 		[] -> Ok([])
-		[
-			name,
-			count,
-			..rest,
-		] -> match (redis.value_text(name), redis.value_int(count), pair_counts(rest)) {
-			(Ok(n), Ok(k), Ok(more)) -> Ok(array.concat([(n, k)], more))
-			(Err(e), _, _) -> Err(e)
-			(_, Err(e), _) -> Err(e)
-			(_, _, Err(e)) -> Err(e)
+		[name, count, ..rest] -> {
+			n <- result.then(redis.value_text(name))
+			k <- result.then(redis.value_int(count))
+			more <- result.then(pair_counts(rest))
+			Ok(array.concat([(n, k)], more))
 		}
 		_ -> Err(redis.Protocol('expected channel/count pairs'))
 	}
@@ -280,31 +275,31 @@ fn rest(buf Binary, from Int) Binary {
 
 // Every push is an array whose first element names the kind.
 fn decode(value resp.Value) Result(Push, RedisError) {
-	match redis.expect_values(Ok(value)) {
-		Err(e) -> Err(e)
-		Ok([kind, a, b]) -> match redis.value_text(kind) {
-			Err(e) -> Err(e)
-			Ok(name) -> two(name, a, b)
+	parts <- result.then(redis.expect_values(Ok(value)))
+	match parts {
+		[kind, a, b] -> {
+			name <- result.then(redis.value_text(kind))
+			two(name, a, b)
 		}
-		Ok([kind, a, b, c]) -> match redis.value_text(kind) {
-			Err(e) -> Err(e)
-			Ok(name) -> three(name, a, b, c)
+		[kind, a, b, c] -> {
+			name <- result.then(redis.value_text(kind))
+			three(name, a, b, c)
 		}
-		Ok(_) -> Err(redis.Protocol('unexpected pub/sub push shape'))
+		_ -> Err(redis.Protocol('unexpected pub/sub push shape'))
 	}
 }
 
 fn two(name String, a resp.Value, b resp.Value) Result(Push, RedisError) {
 	match name {
-		'message' -> match (redis.value_text(a), redis.value_text(b)) {
-			(Ok(channel), Ok(payload)) -> Ok(Message(channel, payload))
-			(Err(e), _) -> Err(e)
-			(_, Err(e)) -> Err(e)
+		'message' -> {
+			channel <- result.then(redis.value_text(a))
+			payload <- result.then(redis.value_text(b))
+			Ok(Message(channel, payload))
 		}
-		'smessage' -> match (redis.value_text(a), redis.value_text(b)) {
-			(Ok(channel), Ok(payload)) -> Ok(ShardMessage(channel, payload))
-			(Err(e), _) -> Err(e)
-			(_, Err(e)) -> Err(e)
+		'smessage' -> {
+			channel <- result.then(redis.value_text(a))
+			payload <- result.then(redis.value_text(b))
+			Ok(ShardMessage(channel, payload))
 		}
 		'subscribe' -> confirmation(a, b, True)
 		'psubscribe' -> confirmation(a, b, True)
@@ -318,11 +313,11 @@ fn two(name String, a resp.Value, b resp.Value) Result(Push, RedisError) {
 
 fn three(name String, a resp.Value, b resp.Value, c resp.Value) Result(Push, RedisError) {
 	match name {
-		'pmessage' -> match (redis.value_text(a), redis.value_text(b), redis.value_text(c)) {
-			(Ok(pattern), Ok(channel), Ok(payload)) -> Ok(PatternMessage(pattern, channel, payload))
-			(Err(e), _, _) -> Err(e)
-			(_, Err(e), _) -> Err(e)
-			(_, _, Err(e)) -> Err(e)
+		'pmessage' -> {
+			pattern <- result.then(redis.value_text(a))
+			channel <- result.then(redis.value_text(b))
+			payload <- result.then(redis.value_text(c))
+			Ok(PatternMessage(pattern, channel, payload))
 		}
 		other -> Err(redis.Protocol('unknown three-part pub/sub push: ${other}'))
 	}
@@ -334,12 +329,10 @@ fn confirmation(a resp.Value, b resp.Value, subscribed Bool) Result(Push, RedisE
 		Ok(name) -> name
 		Err(_) -> ''
 	}
-	match redis.value_int(b) {
-		Err(e) -> Err(e)
-		Ok(count) -> if subscribed {
-			Ok(Subscribed(channel, count))
-		} else {
-			Ok(Unsubscribed(channel, count))
-		}
+	count <- result.then(redis.value_int(b))
+	if subscribed {
+		Ok(Subscribed(channel, count))
+	} else {
+		Ok(Unsubscribed(channel, count))
 	}
 }

@@ -7,6 +7,7 @@
 // so the split is enforced by the signature here rather than left to habit.
 
 import scarlet/array
+import scarlet/result
 import scarlet/binary
 import ./redis.{Conn, RedisError}
 
@@ -92,11 +93,10 @@ pub fn script_load(c Conn, script String) Result(String, RedisError) {
 
 // Which of these digests the server already has cached.
 pub fn script_exists(c Conn, sha1s Array(String)) Result(Array(Bool), RedisError) {
-	match redis.expect_values(redis.command(c, redis.parts([['SCRIPT', 'EXISTS'], sha1s]))) {
-		Err(e) -> Err(e)
-		Ok(values) ->
-			redis.collect(array.map(values, fn(v) redis.map_ok(redis.value_int(v), fn(n) n != 0)))
-	}
+	values <- result.then(
+		redis.expect_values(redis.command(c, redis.parts([['SCRIPT', 'EXISTS'], sha1s]))),
+	)
+	redis.collect(array.map(values, fn(v) result.map(redis.value_int(v), fn(n) n != 0)))
 }
 
 pub fn script_flush(c Conn, async Bool) Result(Nil, RedisError) {

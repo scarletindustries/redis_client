@@ -28,6 +28,7 @@ import scarlet/array
 import scarlet/binary
 import scarlet/int
 import scarlet/net
+import scarlet/result
 import scarlet/net/error.{NetError, UnexpectedEof}
 import scarlet/net/socket.{Closed, Data, Socket}
 import scarlet/resource
@@ -114,13 +115,18 @@ pub fn command(c Conn, args Array(String)) Result(Value, RedisError) {
 // and values are binary-safe, and a caller storing a JPEG should not have to
 // pretend it is a String.
 pub fn command_raw(c Conn, args Array(Binary)) Result(Value, RedisError) {
-	match socket.write(c.sock, resp.encode_command(args)) {
-		Err(e) -> Err(Net(e))
-		Ok(Nil) -> match read_reply(c.sock, <<>>) {
-			Ok(RedisErr(message)) -> Err(server_error(message))
-			other -> other
-		}
+	_ <- result.then(net_err(socket.write(c.sock, resp.encode_command(args))))
+	match read_reply(c.sock, <<>>) {
+		Ok(RedisErr(message)) -> Err(server_error(message))
+		other -> other
 	}
+}
+
+// Lift a socket-level failure into the client's error type. Every `NetError`
+// this client reports passes through here, so the mapping is stated once
+// rather than at each call site.
+pub fn net_err(r Result(a, NetError)) Result(a, RedisError) {
+	result.map_err(r, Net)
 }
 
 // Parse from the front of the buffer, reading more bytes whenever the reply is
@@ -140,12 +146,14 @@ fn read_reply(sock Socket, buf Binary) Result(Value, RedisError) {
 				Err(Protocol('${trailing} bytes arrived past the end of the reply'))
 			}
 		}
-		NeedMore -> match socket.read(sock, READ_SIZE) {
-			Ok(Data(chunk)) -> read_reply(sock, binary.append(buf, chunk))
-			// The peer hung up mid-reply. Not a clean end: we were promised
-			// more bytes.
-			Ok(Closed) -> Err(Net(UnexpectedEof))
-			Err(e) -> Err(Net(e))
+		NeedMore -> {
+			read <- result.then(net_err(socket.read(sock, READ_SIZE)))
+			match read {
+				Data(chunk) -> read_reply(sock, binary.append(buf, chunk))
+				// The peer hung up mid-reply. Not a clean end: we were promised
+				// more bytes.
+				Closed -> Err(Net(UnexpectedEof))
+			}
 		}
 	}
 }
@@ -204,119 +212,111 @@ pub fn flatten_pairs(pairs Array((String, String))) Array(String) {
 // command re-matching the error case.
 
 pub fn expect_ok(reply Result(Value, RedisError)) Result(Nil, RedisError) {
-	match expect_status(reply) {
-		Ok('OK') -> Ok(Nil)
-		Ok(other) -> Err(Protocol('expected OK, got ${other}'))
-		Err(e) -> Err(e)
+	status <- result.then(expect_status(reply))
+	match status {
+		'OK' -> Ok(Nil)
+		other -> Err(Protocol('expected OK, got ${other}'))
 	}
 }
 
 // Discard the reply, keeping only success or failure.
 pub fn expect_any(reply Result(Value, RedisError)) Result(Nil, RedisError) {
-	match reply {
-		Ok(_) -> Ok(Nil)
-		Err(e) -> Err(e)
-	}
+	result.map(reply, fn(_) Nil)
 }
 
 pub fn expect_status(reply Result(Value, RedisError)) Result(String, RedisError) {
-	match reply {
-		Err(e) -> Err(e)
-		Ok(SimpleStr(bytes)) -> text(bytes)
-		Ok(Bulk(bytes)) -> text(bytes)
-		Ok(other) -> Err(Protocol('expected a status reply, got ${describe(other)}'))
+	value <- result.then(reply)
+	match value {
+		SimpleStr(bytes) -> text(bytes)
+		Bulk(bytes) -> text(bytes)
+		other -> Err(Protocol('expected a status reply, got ${describe(other)}'))
 	}
 }
 
 // A string that must be there. Use `expect_bulk` where the server may answer
 // null.
 pub fn expect_string(reply Result(Value, RedisError)) Result(String, RedisError) {
-	match reply {
-		Err(e) -> Err(e)
-		Ok(Null) -> Err(Protocol('expected a string, got null'))
-		other -> expect_status(other)
+	value <- result.then(reply)
+	match value {
+		Null -> Err(Protocol('expected a string, got null'))
+		other -> expect_status(Ok(other))
 	}
 }
 
 pub fn expect_bulk(reply Result(Value, RedisError)) Result(Option(String), RedisError) {
-	match reply {
-		Err(e) -> Err(e)
-		Ok(Null) -> Ok(None)
-		Ok(SimpleStr(bytes)) -> map_ok(text(bytes), fn(s) Some(s))
-		Ok(Bulk(bytes)) -> map_ok(text(bytes), fn(s) Some(s))
-		Ok(other) -> Err(Protocol('expected a bulk string, got ${describe(other)}'))
+	value <- result.then(reply)
+	match value {
+		Null -> Ok(None)
+		SimpleStr(bytes) -> result.map(text(bytes), Some)
+		Bulk(bytes) -> result.map(text(bytes), Some)
+		other -> Err(Protocol('expected a bulk string, got ${describe(other)}'))
 	}
 }
 
 // The bytes of a bulk reply, undecoded — for values that are not text.
 pub fn expect_binary(reply Result(Value, RedisError)) Result(Option(Binary), RedisError) {
-	match reply {
-		Err(e) -> Err(e)
-		Ok(Null) -> Ok(None)
-		Ok(Bulk(bytes)) -> Ok(Some(bytes))
-		Ok(SimpleStr(bytes)) -> Ok(Some(bytes))
-		Ok(other) -> Err(Protocol('expected a bulk string, got ${describe(other)}'))
+	value <- result.then(reply)
+	match value {
+		Null -> Ok(None)
+		Bulk(bytes) -> Ok(Some(bytes))
+		SimpleStr(bytes) -> Ok(Some(bytes))
+		other -> Err(Protocol('expected a bulk string, got ${describe(other)}'))
 	}
 }
 
 pub fn expect_int(reply Result(Value, RedisError)) Result(Int, RedisError) {
-	match reply {
-		Err(e) -> Err(e)
-		Ok(Num(n)) -> Ok(n)
-		Ok(other) -> Err(Protocol('expected an integer, got ${describe(other)}'))
+	value <- result.then(reply)
+	match value {
+		Num(n) -> Ok(n)
+		other -> Err(Protocol('expected an integer, got ${describe(other)}'))
 	}
 }
 
 // An integer that may be absent — a null reply, as several commands use for
 // "no such element" (ZRANK, LPOS, OBJECT FREQ).
 pub fn expect_opt_int(reply Result(Value, RedisError)) Result(Option(Int), RedisError) {
-	match reply {
-		Err(e) -> Err(e)
-		Ok(Null) -> Ok(None)
-		Ok(Num(n)) -> Ok(Some(n))
-		Ok(other) -> Err(Protocol('expected an integer or null, got ${describe(other)}'))
+	value <- result.then(reply)
+	match value {
+		Null -> Ok(None)
+		Num(n) -> Ok(Some(n))
+		other -> Err(Protocol('expected an integer or null, got ${describe(other)}'))
 	}
 }
 
 // Redis spells booleans as the integers 0 and 1.
 pub fn expect_bool(reply Result(Value, RedisError)) Result(Bool, RedisError) {
-	map_ok(expect_int(reply), fn(n) n != 0)
+	result.map(expect_int(reply), fn(n) n != 0)
 }
 
 // True when the command applied, False when a condition (NX/XX) prevented it.
 // The distinction arrives as OK versus null, not as an integer.
 pub fn expect_applied(reply Result(Value, RedisError)) Result(Bool, RedisError) {
-	match reply {
-		Err(e) -> Err(e)
-		Ok(Null) -> Ok(False)
-		Ok(SimpleStr(_)) -> Ok(True)
-		Ok(other) -> Err(Protocol('expected a status or null, got ${describe(other)}'))
+	value <- result.then(reply)
+	match value {
+		Null -> Ok(False)
+		SimpleStr(_) -> Ok(True)
+		other -> Err(Protocol('expected a status or null, got ${describe(other)}'))
 	}
 }
 
 // A double, which Redis sends as a bulk string.
 pub fn expect_score(reply Result(Value, RedisError)) Result(Score, RedisError) {
-	match expect_string(reply) {
-		Err(e) -> Err(e)
-		Ok(s) -> to_score(s)
-	}
+	result.then(expect_string(reply), to_score)
 }
 
 pub fn expect_opt_score(reply Result(Value, RedisError)) Result(Option(Score), RedisError) {
-	match expect_bulk(reply) {
-		Err(e) -> Err(e)
-		Ok(None) -> Ok(None)
-		Ok(Some(s)) -> map_ok(to_score(s), fn(v) Some(v))
+	raw <- result.then(expect_bulk(reply))
+	match raw {
+		None -> Ok(None)
+		Some(s) -> result.map(to_score(s), Some)
 	}
 }
 
 // An array whose every element is a string. A null element is an error here;
 // `expect_opt_strings` is for the commands that can return one.
 pub fn expect_strings(reply Result(Value, RedisError)) Result(Array(String), RedisError) {
-	match expect_values(reply) {
-		Err(e) -> Err(e)
-		Ok(values) -> collect(array.map(values, fn(v) value_text(v)))
-	}
+	values <- result.then(expect_values(reply))
+	collect(array.map(values, value_text))
 }
 
 // An array that may hold nulls, as MGET and HMGET do for missing keys and
@@ -325,15 +325,13 @@ pub fn expect_strings(reply Result(Value, RedisError)) Result(Array(String), Red
 pub fn expect_opt_strings(
 	reply Result(Value, RedisError),
 ) Result(Array(Option(String)), RedisError) {
-	match expect_values(reply) {
-		Err(e) -> Err(e)
-		Ok(values) -> collect(
-			array.map(values, fn(v) match v {
-				Null -> Ok(None)
-				other -> map_ok(value_text(other), fn(s) Some(s))
-			}),
-		)
-	}
+	values <- result.then(expect_values(reply))
+	collect(
+		array.map(values, fn(v) match v {
+			Null -> Ok(None)
+			other -> result.map(value_text(other), Some)
+		}),
+	)
 }
 
 // An array that is itself null — a blocking command that timed out, or a
@@ -342,20 +340,18 @@ pub fn expect_opt_strings(
 pub fn expect_opt_strings_or_nil(
 	reply Result(Value, RedisError),
 ) Result(Option(Array(String)), RedisError) {
-	match reply {
-		Err(e) -> Err(e)
-		Ok(Null) -> Ok(None)
-		other -> map_ok(expect_strings(other), fn(xs) Some(xs))
+	value <- result.then(reply)
+	match value {
+		Null -> Ok(None)
+		other -> result.map(expect_strings(Ok(other)), Some)
 	}
 }
 
 // A flat array read as pairs: HGETALL, CONFIG GET, and ZRANGE WITHSCORES all
 // send `[a, b, a, b, ...]` under RESP2 rather than a map or nested pairs.
 pub fn expect_pairs(reply Result(Value, RedisError)) Result(Array((String, String)), RedisError) {
-	match expect_strings(reply) {
-		Err(e) -> Err(e)
-		Ok(flat) -> pair_up(flat, [])
-	}
+	flat <- result.then(expect_strings(reply))
+	pair_up(flat, [])
 }
 
 // A flat map whose values are not all strings. HELLO is the case that forces
@@ -363,10 +359,8 @@ pub fn expect_pairs(reply Result(Value, RedisError)) Result(Array((String, Strin
 // the lot as strings fails on that one field. The keys are always text, so
 // only the values stay raw.
 pub fn expect_fields(reply Result(Value, RedisError)) Result(Array((String, Value)), RedisError) {
-	match expect_values(reply) {
-		Err(e) -> Err(e)
-		Ok(flat) -> field_pairs(flat, [])
-	}
+	flat <- result.then(expect_values(reply))
+	field_pairs(flat, [])
 }
 
 fn field_pairs(
@@ -375,9 +369,9 @@ fn field_pairs(
 ) Result(Array((String, Value)), RedisError) {
 	match flat {
 		[] -> Ok(acc)
-		[name, value, ..rest] -> match value_text(name) {
-			Err(e) -> Err(e)
-			Ok(field) -> field_pairs(rest, array.concat(acc, [(field, value)]))
+		[name, value, ..rest] -> {
+			field <- result.then(value_text(name))
+			field_pairs(rest, array.concat(acc, [(field, value)]))
 		}
 		_ -> Err(Protocol('expected an even number of elements'))
 	}
@@ -385,14 +379,12 @@ fn field_pairs(
 
 // The same shape, where the second of each pair is a score.
 pub fn expect_scored(reply Result(Value, RedisError)) Result(Array((String, Score)), RedisError) {
-	match expect_pairs(reply) {
-		Err(e) -> Err(e)
-		Ok(pairs) -> collect(
-			array.map(pairs, fn(p) match p {
-				(member, raw) -> map_ok(to_score(raw), fn(s) (member, s))
-			}),
-		)
-	}
+	pairs <- result.then(expect_pairs(reply))
+	collect(
+		array.map(pairs, fn(p) match p {
+			(member, raw) -> result.map(to_score(raw), fn(s) (member, s))
+		}),
+	)
 }
 
 // How long something has left to live. The two sentinels Redis uses — -1 for
@@ -417,41 +409,41 @@ pub fn to_remaining(n Int) Remaining {
 }
 
 pub fn expect_remaining(reply Result(Value, RedisError)) Result(Remaining, RedisError) {
-	map_ok(expect_int(reply), to_remaining)
+	result.map(expect_int(reply), to_remaining)
 }
 
 // A SCAN-family reply: the cursor to resume from, and this batch of elements.
 // A cursor of 0 means the iteration is complete.
 pub fn expect_scan(reply Result(Value, RedisError)) Result((Int, Array(String)), RedisError) {
-	match expect_values(reply) {
-		Err(e) -> Err(e)
-		Ok([cursor, elements]) -> match (value_text(cursor), expect_strings(Ok(elements))) {
-			(Ok(text), Ok(items)) -> match number.parse_int(text) {
+	values <- result.then(expect_values(reply))
+	match values {
+		[cursor, elements] -> {
+			text <- result.then(value_text(cursor))
+			items <- result.then(expect_strings(Ok(elements)))
+			match number.parse_int(text) {
 				Ok(n) -> Ok((n, items))
 				Err(Nil) -> Err(Protocol('scan cursor is not an integer: ${text}'))
 			}
-			(Err(e), _) -> Err(e)
-			(_, Err(e)) -> Err(e)
 		}
-		Ok(_) -> Err(Protocol('expected a scan reply of cursor and elements'))
+		_ -> Err(Protocol('expected a scan reply of cursor and elements'))
 	}
 }
 
 // The raw elements, for replies whose shape is nested or heterogeneous —
 // XRANGE, GEOPOS, EXEC. The command module that knows the shape decodes it.
 pub fn expect_values(reply Result(Value, RedisError)) Result(Array(Value), RedisError) {
-	match reply {
-		Err(e) -> Err(e)
-		Ok(List(items)) -> Ok(items)
-		Ok(other) -> Err(Protocol('expected an array, got ${describe(other)}'))
+	value <- result.then(reply)
+	match value {
+		List(items) -> Ok(items)
+		other -> Err(Protocol('expected an array, got ${describe(other)}'))
 	}
 }
 
 pub fn expect_opt_values(reply Result(Value, RedisError)) Result(Option(Array(Value)), RedisError) {
-	match reply {
-		Err(e) -> Err(e)
-		Ok(Null) -> Ok(None)
-		other -> map_ok(expect_values(other), fn(vs) Some(vs))
+	value <- result.then(reply)
+	match value {
+		Null -> Ok(None)
+		other -> result.map(expect_values(Ok(other)), Some)
 	}
 }
 
@@ -481,10 +473,8 @@ pub fn value_int(v Value) Result(Int, RedisError) {
 }
 
 pub fn value_score(v Value) Result(Score, RedisError) {
-	match value_text(v) {
-		Err(e) -> Err(e)
-		Ok(s) -> to_score(s)
-	}
+	s <- result.then(value_text(v))
+	to_score(s)
 }
 
 pub fn to_score(s String) Result(Score, RedisError) {
@@ -497,18 +487,11 @@ pub fn to_score(s String) Result(Score, RedisError) {
 // Turn an array of results into a result of an array, failing on the first
 // error. The shape every element-wise decoder above needs.
 pub fn collect(results Array(Result(a, RedisError))) Result(Array(a), RedisError) {
-	array.fold(results, Ok([]), fn(acc, r) match (acc, r) {
-		(Ok(items), Ok(v)) -> Ok(array.concat(items, [v]))
-		(Err(e), _) -> Err(e)
-		(_, Err(e)) -> Err(e)
+	array.fold(results, Ok([]), fn(acc, r) {
+		items <- result.then(acc)
+		v <- result.then(r)
+		Ok(array.concat(items, [v]))
 	})
-}
-
-pub fn map_ok(r Result(a, RedisError), f fn(a) b) Result(b, RedisError) {
-	match r {
-		Ok(v) -> Ok(f(v))
-		Err(e) -> Err(e)
-	}
 }
 
 fn pair_up(
