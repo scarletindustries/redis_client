@@ -2,7 +2,7 @@
 
 ### Redis client
 
-Talk to Redis from Scarlet. No bindings, no C, just sockets and bytes.
+Talk to Redis from the Scarlet programming language.
 
 [Documentation](https://scarlet.industries) • [Redis commands](https://redis.io/docs/latest/commands/)
 
