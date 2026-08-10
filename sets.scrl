@@ -1,0 +1,164 @@
+// Set commands: membership, and the algebra over several sets.
+
+import scarlet/array
+import ./redis.{Conn, RedisError}
+
+// ---------------------------------------------------------------------------
+// Membership.
+// ---------------------------------------------------------------------------
+
+// Add members, returning how many were not already there.
+pub fn sadd(c Conn, key String, members Array(String)) Result(Int, RedisError) {
+	redis.expect_int(redis.command(c, redis.parts([['SADD', key], members])))
+}
+
+// Remove members, returning how many were actually present.
+pub fn srem(c Conn, key String, members Array(String)) Result(Int, RedisError) {
+	redis.expect_int(redis.command(c, redis.parts([['SREM', key], members])))
+}
+
+pub fn sismember(c Conn, key String, member String) Result(Bool, RedisError) {
+	redis.expect_bool(redis.command(c, ['SISMEMBER', key, member]))
+}
+
+// Membership of several members at once. Positional: element i answers member i.
+pub fn smismember(c Conn, key String, members Array(String)) Result(Array(Bool), RedisError) {
+	match redis.expect_values(redis.command(c, redis.parts([['SMISMEMBER', key], members]))) {
+		Err(e) -> Err(e)
+		Ok(values) ->
+			redis.collect(array.map(values, fn(v) redis.map_ok(redis.value_int(v), fn(n) n != 0)))
+	}
+}
+
+// Every member. Unbounded — on a large set this is `keys`-shaped trouble, and
+// `sscan` is the incremental alternative.
+pub fn smembers(c Conn, key String) Result(Array(String), RedisError) {
+	redis.expect_strings(redis.command(c, ['SMEMBERS', key]))
+}
+
+pub fn scard(c Conn, key String) Result(Int, RedisError) {
+	redis.expect_int(redis.command(c, ['SCARD', key]))
+}
+
+// Move a member between sets atomically. False when it was not in the source.
+pub fn smove(
+	c Conn,
+	source String,
+	destination String,
+	member String,
+) Result(Bool, RedisError) {
+	redis.expect_bool(redis.command(c, ['SMOVE', source, destination, member]))
+}
+
+// ---------------------------------------------------------------------------
+// Sampling.
+// ---------------------------------------------------------------------------
+
+// Remove and return one random member.
+pub fn spop(c Conn, key String) Result(Option(String), RedisError) {
+	redis.expect_bulk(redis.command(c, ['SPOP', key]))
+}
+
+pub fn spop_count(c Conn, key String, count Int) Result(Array(String), RedisError) {
+	redis.expect_strings(redis.command(c, ['SPOP', key, redis.arg(count)]))
+}
+
+// Read a random member without removing it.
+pub fn srandmember(c Conn, key String) Result(Option(String), RedisError) {
+	redis.expect_bulk(redis.command(c, ['SRANDMEMBER', key]))
+}
+
+// A negative `count` allows repeats and always returns exactly that many; a
+// positive one returns distinct members, capped at the set's size.
+pub fn srandmember_count(c Conn, key String, count Int) Result(Array(String), RedisError) {
+	redis.expect_strings(redis.command(c, ['SRANDMEMBER', key, redis.arg(count)]))
+}
+
+// A cursored walk of the members.
+pub fn sscan(
+	c Conn,
+	key String,
+	cursor Int,
+	pattern Option(String),
+	count Option(Int),
+) Result((Int, Array(String)), RedisError) {
+	redis.expect_scan(
+		redis.command(
+			c,
+			redis.parts(
+				[
+					['SSCAN', key, redis.arg(cursor)],
+					redis.when_some(pattern, fn(p) ['MATCH', p]),
+					redis.when_some(count, fn(n) ['COUNT', redis.arg(n)]),
+				],
+			),
+		),
+	)
+}
+
+// ---------------------------------------------------------------------------
+// Set algebra.
+// ---------------------------------------------------------------------------
+//
+// Each operation comes in three forms: return the members, store them in a
+// destination key, or count them without transferring anything.
+
+pub fn sdiff(c Conn, keys Array(String)) Result(Array(String), RedisError) {
+	redis.expect_strings(redis.command(c, array.concat(['SDIFF'], keys)))
+}
+
+pub fn sinter(c Conn, keys Array(String)) Result(Array(String), RedisError) {
+	redis.expect_strings(redis.command(c, array.concat(['SINTER'], keys)))
+}
+
+pub fn sunion(c Conn, keys Array(String)) Result(Array(String), RedisError) {
+	redis.expect_strings(redis.command(c, array.concat(['SUNION'], keys)))
+}
+
+// Store the result, returning the size of the destination set.
+pub fn sdiffstore(c Conn, destination String, keys Array(String)) Result(Int, RedisError) {
+	redis.expect_int(redis.command(c, redis.parts([['SDIFFSTORE', destination], keys])))
+}
+
+pub fn sinterstore(c Conn, destination String, keys Array(String)) Result(Int, RedisError) {
+	redis.expect_int(redis.command(c, redis.parts([['SINTERSTORE', destination], keys])))
+}
+
+pub fn sunionstore(c Conn, destination String, keys Array(String)) Result(Int, RedisError) {
+	redis.expect_int(redis.command(c, redis.parts([['SUNIONSTORE', destination], keys])))
+}
+
+// Count the result without building it. `limit` stops counting once it is
+// reached — pass `None` to count them all, or a bound when the question is
+// really "are there at least N?".
+pub fn sintercard(c Conn, keys Array(String), limit Option(Int)) Result(Int, RedisError) {
+	cardinality('SINTERCARD', c, keys, limit)
+}
+
+pub fn sdiffcard(c Conn, keys Array(String), limit Option(Int)) Result(Int, RedisError) {
+	cardinality('SDIFFCARD', c, keys, limit)
+}
+
+pub fn sunioncard(c Conn, keys Array(String), limit Option(Int)) Result(Int, RedisError) {
+	cardinality('SUNIONCARD', c, keys, limit)
+}
+
+fn cardinality(
+	verb String,
+	c Conn,
+	keys Array(String),
+	limit Option(Int),
+) Result(Int, RedisError) {
+	redis.expect_int(
+		redis.command(
+			c,
+			redis.parts(
+				[
+					[verb, redis.arg(array.length(keys))],
+					keys,
+					redis.when_some(limit, fn(n) ['LIMIT', redis.arg(n)]),
+				],
+			),
+		),
+	)
+}

@@ -1,0 +1,413 @@
+// Server administration and introspection.
+//
+// The internal replication commands — PSYNC, SYNC, REPLCONF — and MONITOR are
+// deliberately absent. Each of them takes the connection out of
+// request/response mode and turns it into a one-way stream, which is the same
+// thing `Conn` cannot represent and pub/sub needed its own type for. Sending
+// one down a `Conn` would desync it, and the trailing-bytes check in
+// `read_reply` would report that rather than let it corrupt later commands.
+
+import scarlet/array
+import ./number
+import ./redis.{Conn, RedisError}
+
+// ---------------------------------------------------------------------------
+// State of the server.
+// ---------------------------------------------------------------------------
+
+// The INFO text, in the server's own sectioned `field:value` format.
+pub fn info(c Conn) Result(String, RedisError) {
+	redis.expect_string(redis.command(c, ['INFO']))
+}
+
+// One section of it — 'clients', 'memory', 'replication', 'stats', and so on.
+pub fn info_section(c Conn, section String) Result(String, RedisError) {
+	redis.expect_string(redis.command(c, ['INFO', section]))
+}
+
+// How many keys are in the current database.
+pub fn dbsize(c Conn) Result(Int, RedisError) {
+	redis.expect_int(redis.command(c, ['DBSIZE']))
+}
+
+// The server's clock: seconds since the epoch, and microseconds within that
+// second.
+pub fn time(c Conn) Result((Int, Int), RedisError) {
+	match redis.expect_strings(redis.command(c, ['TIME'])) {
+		Err(e) -> Err(e)
+		Ok([seconds, micros]) -> match (number.parse_int(seconds), number.parse_int(micros)) {
+			(Ok(s), Ok(us)) -> Ok((s, us))
+			_ -> Err(redis.Protocol('TIME did not return two integers'))
+		}
+		Ok(_) -> Err(redis.Protocol('TIME did not return two elements'))
+	}
+}
+
+// 'master' or 'replica', plus the role-specific detail the server reports.
+pub fn role(c Conn) Result(Array(resp.Value), RedisError) {
+	redis.expect_values(redis.command(c, ['ROLE']))
+}
+
+// Computer art, and a way to read the version off a server that is otherwise
+// locked down.
+pub fn lolwut(c Conn) Result(String, RedisError) {
+	redis.expect_string(redis.command(c, ['LOLWUT']))
+}
+
+// ---------------------------------------------------------------------------
+// Emptying and persistence.
+// ---------------------------------------------------------------------------
+
+// Remove every key in the current database. `async` hands the reclaim to a
+// background thread and returns at once — on a large database, the synchronous
+// form blocks the server for as long as the free takes.
+pub fn flushdb(c Conn, async Bool) Result(Nil, RedisError) {
+	redis.expect_ok(redis.command(c, ['FLUSHDB', sync_mode(async)]))
+}
+
+// The same, across every database on the server.
+pub fn flushall(c Conn, async Bool) Result(Nil, RedisError) {
+	redis.expect_ok(redis.command(c, ['FLUSHALL', sync_mode(async)]))
+}
+
+// Swap two databases, so every client watching one immediately sees the other.
+pub fn swapdb(c Conn, first Int, second Int) Result(Nil, RedisError) {
+	redis.expect_ok(redis.command(c, ['SWAPDB', redis.arg(first), redis.arg(second)]))
+}
+
+// Write an RDB snapshot, blocking the server until it is on disk. `bgsave` is
+// the form to use on anything with traffic.
+pub fn save(c Conn) Result(Nil, RedisError) {
+	redis.expect_ok(redis.command(c, ['SAVE']))
+}
+
+// Fork and snapshot in the background.
+pub fn bgsave(c Conn) Result(String, RedisError) {
+	redis.expect_status(redis.command(c, ['BGSAVE']))
+}
+
+pub fn bgrewriteaof(c Conn) Result(String, RedisError) {
+	redis.expect_status(redis.command(c, ['BGREWRITEAOF']))
+}
+
+// When the last successful save finished, as a Unix timestamp.
+pub fn lastsave(c Conn) Result(Int, RedisError) {
+	redis.expect_int(redis.command(c, ['LASTSAVE']))
+}
+
+// Make this server a replica of another.
+pub fn replicaof(c Conn, host String, port Int) Result(Nil, RedisError) {
+	redis.expect_ok(redis.command(c, ['REPLICAOF', host, redis.arg(port)]))
+}
+
+// Promote it back to a primary.
+pub fn replicaof_no_one(c Conn) Result(Nil, RedisError) {
+	redis.expect_ok(redis.command(c, ['REPLICAOF', 'NO', 'ONE']))
+}
+
+// The pre-5.0 spelling of `replicaof`, for servers that predate the rename.
+pub fn slaveof(c Conn, host String, port Int) Result(Nil, RedisError) {
+	redis.expect_ok(redis.command(c, ['SLAVEOF', host, redis.arg(port)]))
+}
+
+pub fn slaveof_no_one(c Conn) Result(Nil, RedisError) {
+	redis.expect_ok(redis.command(c, ['SLAVEOF', 'NO', 'ONE']))
+}
+
+// ---------------------------------------------------------------------------
+// Configuration.
+// ---------------------------------------------------------------------------
+
+// Configuration parameters matching a glob pattern, as name/value pairs.
+pub fn config_get(c Conn, patterns Array(String)) Result(Array((String, String)), RedisError) {
+	redis.expect_pairs(redis.command(c, redis.parts([['CONFIG', 'GET'], patterns])))
+}
+
+// Set parameters at runtime. Several at once are applied atomically — either
+// all of them take effect or none do, so a half-applied config is not a state
+// the server can be left in.
+pub fn config_set(c Conn, settings Array((String, String))) Result(Nil, RedisError) {
+	redis.expect_ok(
+		redis.command(c, redis.parts([['CONFIG', 'SET'], redis.flatten_pairs(settings)])),
+	)
+}
+
+// Write the running configuration back to the config file.
+pub fn config_rewrite(c Conn) Result(Nil, RedisError) {
+	redis.expect_ok(redis.command(c, ['CONFIG', 'REWRITE']))
+}
+
+// Zero the INFO statistics counters.
+pub fn config_resetstat(c Conn) Result(Nil, RedisError) {
+	redis.expect_ok(redis.command(c, ['CONFIG', 'RESETSTAT']))
+}
+
+// ---------------------------------------------------------------------------
+// Introspection of the command table.
+// ---------------------------------------------------------------------------
+
+pub fn command_count(c Conn) Result(Int, RedisError) {
+	redis.expect_int(redis.command(c, ['COMMAND', 'COUNT']))
+}
+
+// Every command name the server knows, including the ones modules added.
+pub fn command_list(c Conn) Result(Array(String), RedisError) {
+	redis.expect_strings(redis.command(c, ['COMMAND', 'LIST']))
+}
+
+// Arity, flags, and key positions per command. Deeply nested and
+// version-dependent, so it comes back raw.
+pub fn command_info(c Conn, names Array(String)) Result(Array(resp.Value), RedisError) {
+	redis.expect_values(redis.command(c, redis.parts([['COMMAND', 'INFO'], names])))
+}
+
+// Which arguments of a command are keys — the question a cluster-aware client
+// asks before routing a command it does not have built in.
+pub fn command_getkeys(c Conn, command Array(String)) Result(Array(String), RedisError) {
+	redis.expect_strings(redis.command(c, redis.parts([['COMMAND', 'GETKEYS'], command])))
+}
+
+pub fn command_docs(c Conn, names Array(String)) Result(Array(resp.Value), RedisError) {
+	redis.expect_values(redis.command(c, redis.parts([['COMMAND', 'DOCS'], names])))
+}
+
+// ---------------------------------------------------------------------------
+// Memory, latency, and the slow log.
+// ---------------------------------------------------------------------------
+
+// How many bytes a key's value occupies, `None` if it is not there. `samples`
+// bounds how much of a large aggregate is measured rather than estimated; 0
+// means all of it.
+pub fn memory_usage(
+	c Conn,
+	key String,
+	samples Option(Int),
+) Result(Option(Int), RedisError) {
+	redis.expect_opt_int(
+		redis.command(
+			c,
+			redis.parts(
+				[
+					['MEMORY', 'USAGE', key],
+					redis.when_some(samples, fn(n) ['SAMPLES', redis.arg(n)]),
+				],
+			),
+		),
+	)
+}
+
+pub fn memory_doctor(c Conn) Result(String, RedisError) {
+	redis.expect_string(redis.command(c, ['MEMORY', 'DOCTOR']))
+}
+
+pub fn memory_stats(c Conn) Result(Array(resp.Value), RedisError) {
+	redis.expect_values(redis.command(c, ['MEMORY', 'STATS']))
+}
+
+// Ask the allocator to return freed memory to the OS.
+pub fn memory_purge(c Conn) Result(Nil, RedisError) {
+	redis.expect_ok(redis.command(c, ['MEMORY', 'PURGE']))
+}
+
+// The slowest recent commands: each entry is id, timestamp, duration in
+// microseconds, the command's arguments, and the client that sent it.
+pub fn slowlog_get(c Conn, count Option(Int)) Result(Array(resp.Value), RedisError) {
+	redis.expect_values(
+		redis.command(
+			c,
+			redis.parts([['SLOWLOG', 'GET'], redis.when_some(count, fn(n) [redis.arg(n)])]),
+		),
+	)
+}
+
+pub fn slowlog_len(c Conn) Result(Int, RedisError) {
+	redis.expect_int(redis.command(c, ['SLOWLOG', 'LEN']))
+}
+
+pub fn slowlog_reset(c Conn) Result(Nil, RedisError) {
+	redis.expect_ok(redis.command(c, ['SLOWLOG', 'RESET']))
+}
+
+// The worst latency seen per monitored event since the last reset.
+pub fn latency_latest(c Conn) Result(Array(resp.Value), RedisError) {
+	redis.expect_values(redis.command(c, ['LATENCY', 'LATEST']))
+}
+
+pub fn latency_history(c Conn, event String) Result(Array(resp.Value), RedisError) {
+	redis.expect_values(redis.command(c, ['LATENCY', 'HISTORY', event]))
+}
+
+pub fn latency_reset(c Conn, events Array(String)) Result(Int, RedisError) {
+	redis.expect_int(redis.command(c, redis.parts([['LATENCY', 'RESET'], events])))
+}
+
+// ---------------------------------------------------------------------------
+// Access control.
+// ---------------------------------------------------------------------------
+
+// The ACL user this connection is authenticated as.
+pub fn acl_whoami(c Conn) Result(String, RedisError) {
+	redis.expect_string(redis.command(c, ['ACL', 'WHOAMI']))
+}
+
+pub fn acl_users(c Conn) Result(Array(String), RedisError) {
+	redis.expect_strings(redis.command(c, ['ACL', 'USERS']))
+}
+
+// The rule lines, in the same syntax `acl_setuser` takes.
+pub fn acl_list(c Conn) Result(Array(String), RedisError) {
+	redis.expect_strings(redis.command(c, ['ACL', 'LIST']))
+}
+
+// The command categories, or the commands inside one of them.
+pub fn acl_cat(c Conn, category Option(String)) Result(Array(String), RedisError) {
+	redis.expect_strings(
+		redis.command(c, redis.parts([['ACL', 'CAT'], redis.when_some(category, fn(name) [name])])),
+	)
+}
+
+pub fn acl_getuser(c Conn, username String) Result(Array(resp.Value), RedisError) {
+	redis.expect_values(redis.command(c, ['ACL', 'GETUSER', username]))
+}
+
+// Create or modify a user from rule strings such as `on`, `>password`,
+// `~key:*`, `+@read`.
+pub fn acl_setuser(
+	c Conn,
+	username String,
+	rules Array(String),
+) Result(Nil, RedisError) {
+	redis.expect_ok(redis.command(c, redis.parts([['ACL', 'SETUSER', username], rules])))
+}
+
+pub fn acl_deluser(c Conn, usernames Array(String)) Result(Int, RedisError) {
+	redis.expect_int(redis.command(c, redis.parts([['ACL', 'DELUSER'], usernames])))
+}
+
+// Recent authentication and permission failures.
+pub fn acl_log(c Conn, count Option(Int)) Result(Array(resp.Value), RedisError) {
+	redis.expect_values(
+		redis.command(
+			c,
+			redis.parts([['ACL', 'LOG'], redis.when_some(count, fn(n) [redis.arg(n)])]),
+		),
+	)
+}
+
+pub fn acl_log_reset(c Conn) Result(Nil, RedisError) {
+	redis.expect_ok(redis.command(c, ['ACL', 'LOG', 'RESET']))
+}
+
+// A password strong enough to use as an ACL secret, generated by the server.
+pub fn acl_genpass(c Conn, bits Option(Int)) Result(String, RedisError) {
+	redis.expect_string(
+		redis.command(
+			c,
+			redis.parts([['ACL', 'GENPASS'], redis.when_some(bits, fn(n) [redis.arg(n)])]),
+		),
+	)
+}
+
+fn sync_mode(async Bool) String {
+	if async { 'ASYNC' } else { 'SYNC' }
+}
+
+// ---------------------------------------------------------------------------
+// Modules.
+// ---------------------------------------------------------------------------
+
+// The loaded modules, as name/version pairs per module. Raw because each entry
+// is itself a map.
+pub fn module_list(c Conn) Result(Array(resp.Value), RedisError) {
+	redis.expect_values(redis.command(c, ['MODULE', 'LIST']))
+}
+
+pub fn module_load(c Conn, path String, args Array(String)) Result(Nil, RedisError) {
+	redis.expect_ok(redis.command(c, redis.parts([['MODULE', 'LOAD', path], args])))
+}
+
+// LOADEX, which passes CONFIG settings to the module before it initializes.
+pub fn module_loadex(
+	c Conn,
+	path String,
+	settings Array((String, String)),
+	args Array(String),
+) Result(Nil, RedisError) {
+	redis.expect_ok(
+		redis.command(
+			c,
+			redis.parts(
+				[
+					['MODULE', 'LOADEX', path],
+					array.fold(settings, [], fn(acc, s) match s {
+						(name, value) -> array.concat(acc, ['CONFIG', name, value])
+					}),
+					redis.when(array.length(args) > 0, redis.parts([['ARGS'], args])),
+				],
+			),
+		),
+	)
+}
+
+pub fn module_unload(c Conn, name String) Result(Nil, RedisError) {
+	redis.expect_ok(redis.command(c, ['MODULE', 'UNLOAD', name]))
+}
+
+// ---------------------------------------------------------------------------
+// Failover and shutdown.
+// ---------------------------------------------------------------------------
+
+// Hand primary status to a replica, coordinated so no writes are lost. With no
+// host, the server picks a replica itself.
+pub fn failover(
+	c Conn,
+	to Option((String, Int)),
+	force Bool,
+	timeout_ms Option(Int),
+) Result(Nil, RedisError) {
+	redis.expect_ok(
+		redis.command(
+			c,
+			redis.parts(
+				[
+					['FAILOVER'],
+					redis.when_some(to, fn(target) match target {
+						(host, port) -> ['TO', host, redis.arg(port)]
+					}),
+					redis.when(force, ['FORCE']),
+					redis.when_some(timeout_ms, fn(n) ['TIMEOUT', redis.arg(n)]),
+				],
+			),
+		),
+	)
+}
+
+// Cancel a failover already in progress.
+pub fn failover_abort(c Conn) Result(Nil, RedisError) {
+	redis.expect_ok(redis.command(c, ['FAILOVER', 'ABORT']))
+}
+
+// Stop the server.
+//
+// On success this never returns a reply — the process is gone and the socket
+// closes — so a clean shutdown surfaces here as `Err(Net(UnexpectedEof))`,
+// which is the expected outcome rather than a failure. A reply only arrives
+// when the shutdown was *refused*, and then it is a `Server` error explaining
+// why. `Ok(Nil)` is therefore unreachable, and the type says so by not
+// promising it.
+pub fn shutdown(c Conn, save Bool, now Bool, force Bool) Result(Nil, RedisError) {
+	mode = if save { 'SAVE' } else { 'NOSAVE' }
+	redis.expect_ok(
+		redis.command(
+			c,
+			redis.parts(
+				[['SHUTDOWN', mode], redis.when(now, ['NOW']), redis.when(force, ['FORCE'])],
+			),
+		),
+	)
+}
+
+// Cancel a shutdown that is waiting on replicas to catch up.
+pub fn shutdown_abort(c Conn) Result(Nil, RedisError) {
+	redis.expect_ok(redis.command(c, ['SHUTDOWN', 'ABORT']))
+}

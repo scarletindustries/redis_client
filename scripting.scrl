@@ -1,0 +1,197 @@
+// Server-side scripting: Lua scripts (EVAL) and the persistent functions
+// registered by FUNCTION LOAD.
+//
+// Keys are passed separately from arguments, and it matters: the key list is
+// what tells Redis Cluster which node a script touches. A script that reaches
+// a key not in its key list works on a single server and breaks on a cluster,
+// so the split is enforced by the signature here rather than left to habit.
+
+import scarlet/array
+import scarlet/binary
+import ./redis.{Conn, RedisError}
+
+// Run a script. Returns whatever the script returned, converted by Redis's own
+// Lua-to-RESP rules — a Lua number becomes an integer (truncated), a Lua table
+// becomes an array, `false` becomes null.
+pub fn eval(
+	c Conn,
+	script String,
+	keys Array(String),
+	args Array(String),
+) Result(resp.Value, RedisError) {
+	redis.command(c, call_args('EVAL', script, keys, args))
+}
+
+// The read-only form, which a replica will accept and which is rejected if the
+// script tries to write.
+pub fn eval_ro(
+	c Conn,
+	script String,
+	keys Array(String),
+	args Array(String),
+) Result(resp.Value, RedisError) {
+	redis.command(c, call_args('EVAL_RO', script, keys, args))
+}
+
+// Run an already-loaded script by its SHA1. The normal path in production:
+// send the digest, and fall back to `eval` only on NOSCRIPT.
+pub fn evalsha(
+	c Conn,
+	sha1 String,
+	keys Array(String),
+	args Array(String),
+) Result(resp.Value, RedisError) {
+	redis.command(c, call_args('EVALSHA', sha1, keys, args))
+}
+
+pub fn evalsha_ro(
+	c Conn,
+	sha1 String,
+	keys Array(String),
+	args Array(String),
+) Result(resp.Value, RedisError) {
+	redis.command(c, call_args('EVALSHA_RO', sha1, keys, args))
+}
+
+// Call a function from a loaded library.
+pub fn fcall(
+	c Conn,
+	function String,
+	keys Array(String),
+	args Array(String),
+) Result(resp.Value, RedisError) {
+	redis.command(c, call_args('FCALL', function, keys, args))
+}
+
+pub fn fcall_ro(
+	c Conn,
+	function String,
+	keys Array(String),
+	args Array(String),
+) Result(resp.Value, RedisError) {
+	redis.command(c, call_args('FCALL_RO', function, keys, args))
+}
+
+fn call_args(
+	verb String,
+	body String,
+	keys Array(String),
+	args Array(String),
+) Array(String) {
+	redis.parts([[verb, body, redis.arg(array.length(keys))], keys, args])
+}
+
+// ---------------------------------------------------------------------------
+// Managing scripts.
+// ---------------------------------------------------------------------------
+
+// Compile and cache a script without running it, returning its SHA1.
+pub fn script_load(c Conn, script String) Result(String, RedisError) {
+	redis.expect_string(redis.command(c, ['SCRIPT', 'LOAD', script]))
+}
+
+// Which of these digests the server already has cached.
+pub fn script_exists(c Conn, sha1s Array(String)) Result(Array(Bool), RedisError) {
+	match redis.expect_values(redis.command(c, redis.parts([['SCRIPT', 'EXISTS'], sha1s]))) {
+		Err(e) -> Err(e)
+		Ok(values) ->
+			redis.collect(array.map(values, fn(v) redis.map_ok(redis.value_int(v), fn(n) n != 0)))
+	}
+}
+
+pub fn script_flush(c Conn, async Bool) Result(Nil, RedisError) {
+	redis.expect_ok(redis.command(c, ['SCRIPT', 'FLUSH', sync_mode(async)]))
+}
+
+// Stop a script that is still running. Only works if it has not yet written
+// anything — once it has, the only way out is `SHUTDOWN NOSAVE`, because
+// killing it midway would leave a half-applied change behind.
+pub fn script_kill(c Conn) Result(Nil, RedisError) {
+	redis.expect_ok(redis.command(c, ['SCRIPT', 'KILL']))
+}
+
+// ---------------------------------------------------------------------------
+// Functions.
+// ---------------------------------------------------------------------------
+
+// Load a library, returning its name. The source must start with a shebang
+// naming the engine, e.g. `#!lua name=mylib`.
+pub fn function_load(c Conn, code String, replace Bool) Result(String, RedisError) {
+	redis.expect_string(
+		redis.command(
+			c,
+			redis.parts([['FUNCTION', 'LOAD'], redis.when(replace, ['REPLACE']), [code]]),
+		),
+	)
+}
+
+pub fn function_delete(c Conn, library String) Result(Nil, RedisError) {
+	redis.expect_ok(redis.command(c, ['FUNCTION', 'DELETE', library]))
+}
+
+pub fn function_flush(c Conn, async Bool) Result(Nil, RedisError) {
+	redis.expect_ok(redis.command(c, ['FUNCTION', 'FLUSH', sync_mode(async)]))
+}
+
+pub fn function_kill(c Conn) Result(Nil, RedisError) {
+	redis.expect_ok(redis.command(c, ['FUNCTION', 'KILL']))
+}
+
+// The loaded libraries. The reply nests library metadata inside function
+// metadata and its shape tracks the server version, so it is handed back raw.
+pub fn function_list(
+	c Conn,
+	library Option(String),
+	withcode Bool,
+) Result(Array(resp.Value), RedisError) {
+	redis.expect_values(
+		redis.command(
+			c,
+			redis.parts(
+				[
+					['FUNCTION', 'LIST'],
+					redis.when_some(library, fn(name) ['LIBRARYNAME', name]),
+					redis.when(withcode, ['WITHCODE']),
+				],
+			),
+		),
+	)
+}
+
+// A serialized payload of every loaded library, for `function_restore`.
+pub fn function_dump(c Conn) Result(Option(Binary), RedisError) {
+	redis.expect_binary(redis.command(c, ['FUNCTION', 'DUMP']))
+}
+
+// How a restore treats libraries that are already present.
+pub type RestorePolicy {
+	// Fail if any library in the payload already exists.
+	Append
+	// Delete everything first.
+	Flush
+	// Overwrite conflicting libraries, keep the rest.
+	Replace
+}
+
+pub fn function_restore(
+	c Conn,
+	payload Binary,
+	policy RestorePolicy,
+) Result(Nil, RedisError) {
+	name = match policy {
+		Append -> 'APPEND'
+		Flush -> 'FLUSH'
+		Replace -> 'REPLACE'
+	}
+	redis.expect_ok(
+		redis.command_raw(c, [<<'FUNCTION'>>, <<'RESTORE'>>, payload, binary.from_string(name)]),
+	)
+}
+
+pub fn function_stats(c Conn) Result(Array(resp.Value), RedisError) {
+	redis.expect_values(redis.command(c, ['FUNCTION', 'STATS']))
+}
+
+fn sync_mode(async Bool) String {
+	if async { 'ASYNC' } else { 'SYNC' }
+}

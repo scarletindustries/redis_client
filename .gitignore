@@ -1,0 +1,3 @@
+# The compiler binary, kept locally for running the example and the test suite.
+# Anchored so it cannot match a source file or directory of the same name.
+/scarlet

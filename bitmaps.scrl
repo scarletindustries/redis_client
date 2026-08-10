@@ -1,0 +1,252 @@
+// Bitmap commands. A bitmap is not its own type in Redis — it is a String,
+// addressed a bit at a time — so these operate on ordinary string keys.
+
+import scarlet/array
+import ./redis.{Conn, RedisError}
+
+// Whether an offset counts bytes or bits. BITCOUNT and BITPOS take ranges in
+// either, and the default is bytes.
+pub type Indexing {
+	ByByte
+	ByBit
+}
+
+fn render_indexing(i Indexing) Array(String) {
+	match i {
+		ByByte -> ['BYTE']
+		ByBit -> ['BIT']
+	}
+}
+
+// Set one bit, returning what it was before. The string grows to fit, padded
+// with zero bytes.
+pub fn setbit(c Conn, key String, offset Int, value Bool) Result(Bool, RedisError) {
+	bit = if value { '1' } else { '0' }
+	redis.expect_bool(redis.command(c, ['SETBIT', key, redis.arg(offset), bit]))
+}
+
+pub fn getbit(c Conn, key String, offset Int) Result(Bool, RedisError) {
+	redis.expect_bool(redis.command(c, ['GETBIT', key, redis.arg(offset)]))
+}
+
+// How many bits are set, over the whole string or a range of it.
+pub fn bitcount(c Conn, key String) Result(Int, RedisError) {
+	redis.expect_int(redis.command(c, ['BITCOUNT', key]))
+}
+
+pub fn bitcount_range(
+	c Conn,
+	key String,
+	start Int,
+	end Int,
+	indexing Indexing,
+) Result(Int, RedisError) {
+	redis.expect_int(
+		redis.command(
+			c,
+			redis.parts(
+				[['BITCOUNT', key, redis.arg(start), redis.arg(end)], render_indexing(indexing)],
+			),
+		),
+	)
+}
+
+// The position of the first bit with the given value. `None` when there is
+// none — which for a search for 0 within an explicit range is a real answer,
+// and for a search past the end of the string is not.
+pub fn bitpos(c Conn, key String, value Bool) Result(Option(Int), RedisError) {
+	found(redis.command(c, ['BITPOS', key, bit_arg(value)]))
+}
+
+pub fn bitpos_range(
+	c Conn,
+	key String,
+	value Bool,
+	start Int,
+	end Int,
+	indexing Indexing,
+) Result(Option(Int), RedisError) {
+	found(
+		redis.command(
+			c,
+			redis.parts(
+				[
+					['BITPOS', key, bit_arg(value), redis.arg(start), redis.arg(end)],
+					render_indexing(indexing),
+				],
+			),
+		),
+	)
+}
+
+fn bit_arg(value Bool) String {
+	if value { '1' } else { '0' }
+}
+
+// BITPOS says "not found" with -1 rather than a null.
+fn found(reply Result(resp.Value, RedisError)) Result(Option(Int), RedisError) {
+	redis.map_ok(redis.expect_int(reply), fn(n) if n < 0 {
+		None
+	} else {
+		Some(n)
+	})
+}
+
+// ---------------------------------------------------------------------------
+// Bitwise operations between keys.
+// ---------------------------------------------------------------------------
+
+// The operations BITOP can perform. `Not` takes exactly one source key; the
+// rest take one or more. `Diff`, `Diff1`, `AndOr` and `One` were added in
+// Redis 8.2.
+pub type BitOp {
+	And
+	Or
+	Xor
+	Not
+	// Members of the first key that are in none of the rest.
+	Diff
+	// Members of the first key that are not in all of the rest.
+	Diff1
+	// Members of the first key that are in at least one of the rest.
+	AndOr
+	// Members that appear in exactly one of the keys.
+	One
+}
+
+fn render_op(op BitOp) String {
+	match op {
+		And -> 'AND'
+		Or -> 'OR'
+		Xor -> 'XOR'
+		Not -> 'NOT'
+		Diff -> 'DIFF'
+		Diff1 -> 'DIFF1'
+		AndOr -> 'ANDOR'
+		One -> 'ONE'
+	}
+}
+
+// Combine bitmaps into a destination key, returning the size of the result in
+// bytes. Shorter inputs are treated as zero-padded to the longest.
+pub fn bitop(
+	c Conn,
+	op BitOp,
+	destination String,
+	keys Array(String),
+) Result(Int, RedisError) {
+	redis.expect_int(redis.command(c, redis.parts([['BITOP', render_op(op), destination], keys])))
+}
+
+// ---------------------------------------------------------------------------
+// BITFIELD.
+// ---------------------------------------------------------------------------
+//
+// BITFIELD treats the string as a row of packed integers of arbitrary width,
+// and applies a list of operations in one atomic pass.
+
+// An integer width and signedness: `Signed(8)` is BITFIELD's `i8`,
+// `Unsigned(4)` is `u4`. Signed fields go up to 64 bits, unsigned to 63.
+pub type FieldType {
+	Signed(bits Int)
+	Unsigned(bits Int)
+}
+
+fn render_type(t FieldType) String {
+	match t {
+		Signed(bits) -> 'i${redis.arg(bits)}'
+		Unsigned(bits) -> 'u${redis.arg(bits)}'
+	}
+}
+
+// What to do when an INCRBY runs past the end of the field's range.
+pub type Overflow {
+	// Modular arithmetic — the default.
+	Wrap
+	// Stick at the minimum or maximum.
+	Saturate
+	// Refuse the operation, which answers with null for that field.
+	Fail
+}
+
+fn render_overflow(o Overflow) String {
+	match o {
+		Wrap -> 'WRAP'
+		Saturate -> 'SAT'
+		Fail -> 'FAIL'
+	}
+}
+
+// One operation in a BITFIELD call. `offset` is in bits; prefixing it with `#`
+// — which `at_field` does — multiplies it by the field width instead, so the
+// fields tile the string.
+pub type BitFieldOp {
+	Get(field FieldType, offset String)
+	Set(field FieldType, offset String, value Int)
+	IncrBy(field FieldType, offset String, by Int)
+	// Applies to every INCRBY after it in the same call.
+	SetOverflow(behaviour Overflow)
+}
+
+// A bit offset, used as-is.
+pub fn at_bit(offset Int) String {
+	redis.arg(offset)
+}
+
+// The nth field of this width, rather than the nth bit.
+pub fn at_field(index Int) String {
+	'#${redis.arg(index)}'
+}
+
+// Run the operations in order. The result has one element per GET, SET and
+// INCRBY — `SetOverflow` produces none — and an element is `None` where a
+// `Fail` overflow refused the write.
+pub fn bitfield(
+	c Conn,
+	key String,
+	ops Array(BitFieldOp),
+) Result(Array(Option(Int)), RedisError) {
+	results(redis.command(c, redis.parts([['BITFIELD', key], render_ops(ops)])))
+}
+
+// The read-only form, which a replica will accept. Only `Get` is allowed.
+pub fn bitfield_ro(
+	c Conn,
+	key String,
+	gets Array((FieldType, String)),
+) Result(Array(Option(Int)), RedisError) {
+	results(
+		redis.command(
+			c,
+			redis.parts(
+				[
+					['BITFIELD_RO', key],
+					array.fold(gets, [], fn(acc, g) match g {
+						(field, offset) -> array.concat(acc, ['GET', render_type(field), offset])
+					}),
+				],
+			),
+		),
+	)
+}
+
+fn render_ops(ops Array(BitFieldOp)) Array(String) {
+	array.fold(ops, [], fn(acc, op) array.concat(acc, match op {
+		Get(field, offset) -> ['GET', render_type(field), offset]
+		Set(field, offset, value) -> ['SET', render_type(field), offset, redis.arg(value)]
+		IncrBy(field, offset, by) -> ['INCRBY', render_type(field), offset, redis.arg(by)]
+		SetOverflow(behaviour) -> ['OVERFLOW', render_overflow(behaviour)]
+	}))
+}
+
+fn results(reply Result(resp.Value, RedisError)) Result(Array(Option(Int)), RedisError) {
+	match redis.expect_values(reply) {
+		Err(e) -> Err(e)
+		Ok(values) -> redis.collect(
+			array.map(values, fn(v) match v {
+				Null -> Ok(None)
+				other -> redis.map_ok(redis.value_int(other), fn(n) Some(n))
+			}),
+		)
+	}
+}

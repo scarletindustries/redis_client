@@ -1,0 +1,287 @@
+// The array type Redis 8.10 added: a sparse, index-addressed sequence.
+//
+// Unlike a list, an array is addressed by index rather than by position from
+// an end, and the indices are sparse — writing at 1000 does not create the
+// thousand slots before it. `arlen` is the highest index plus one, while
+// `arcount` is how many slots actually hold something, and the two differ
+// whenever there are gaps.
+
+import scarlet/array
+import ./number.{Score}
+import ./redis.{Conn, RedisError}
+
+// Write one or more consecutive values starting at `index`. Returns how many
+// were set.
+pub fn arset(c Conn, key String, index Int, values Array(String)) Result(Int, RedisError) {
+	redis.expect_int(redis.command(c, redis.parts([['ARSET', key, redis.arg(index)], values])))
+}
+
+// Write values at arbitrary, non-consecutive indices.
+pub fn armset(c Conn, key String, entries Array((Int, String))) Result(Int, RedisError) {
+	redis.expect_int(
+		redis.command(
+			c,
+			redis.parts(
+				[
+					['ARMSET', key],
+					array.fold(entries, [], fn(acc, e) match e {
+						(index, value) -> array.concat(acc, [redis.arg(index), value])
+					}),
+				],
+			),
+		),
+	)
+}
+
+// The value at an index, `None` for an empty slot.
+pub fn arget(c Conn, key String, index Int) Result(Option(String), RedisError) {
+	redis.expect_bulk(redis.command(c, ['ARGET', key, redis.arg(index)]))
+}
+
+// Values at several indices. Positional: element i answers index i.
+pub fn armget(c Conn, key String, indices Array(Int)) Result(Array(Option(String)), RedisError) {
+	redis.expect_opt_strings(
+		redis.command(c, redis.parts([['ARMGET', key], array.map(indices, redis.arg)])),
+	)
+}
+
+// An inclusive range of values.
+pub fn argetrange(
+	c Conn,
+	key String,
+	start Int,
+	end Int,
+) Result(Array(Option(String)), RedisError) {
+	redis.expect_opt_strings(
+		redis.command(c, ['ARGETRANGE', key, redis.arg(start), redis.arg(end)]),
+	)
+}
+
+// The highest index in use, plus one. Counts gaps; `arcount` does not.
+pub fn arlen(c Conn, key String) Result(Int, RedisError) {
+	redis.expect_int(redis.command(c, ['ARLEN', key]))
+}
+
+// How many slots actually hold a value.
+pub fn arcount(c Conn, key String) Result(Int, RedisError) {
+	redis.expect_int(redis.command(c, ['ARCOUNT', key]))
+}
+
+// ---------------------------------------------------------------------------
+// The insertion cursor.
+// ---------------------------------------------------------------------------
+//
+// An array keeps its own cursor, so a producer can append without tracking
+// where it got to.
+
+// Append at the cursor, returning the index the first value went to.
+pub fn arinsert(c Conn, key String, values Array(String)) Result(Int, RedisError) {
+	redis.expect_int(redis.command(c, redis.parts([['ARINSERT', key], values])))
+}
+
+// Where the next `arinsert` will write.
+pub fn arnext(c Conn, key String) Result(Int, RedisError) {
+	redis.expect_int(redis.command(c, ['ARNEXT', key]))
+}
+
+// Move the cursor.
+pub fn arseek(c Conn, key String, index Int) Result(Int, RedisError) {
+	redis.expect_int(redis.command(c, ['ARSEEK', key, redis.arg(index)]))
+}
+
+// Append into a fixed-size ring, overwriting the oldest entries once it is
+// full — a bounded log that never needs trimming.
+pub fn arring(c Conn, key String, size Int, values Array(String)) Result(Int, RedisError) {
+	redis.expect_int(redis.command(c, redis.parts([['ARRING', key, redis.arg(size)], values])))
+}
+
+// The most recently inserted values, newest last.
+pub fn arlastitems(c Conn, key String, count Int) Result(Array(Option(String)), RedisError) {
+	redis.expect_opt_strings(redis.command(c, ['ARLASTITEMS', key, redis.arg(count)]))
+}
+
+// ---------------------------------------------------------------------------
+// Removing.
+// ---------------------------------------------------------------------------
+
+// Clear specific slots, returning how many held a value.
+pub fn ardel(c Conn, key String, indices Array(Int)) Result(Int, RedisError) {
+	redis.expect_int(redis.command(c, redis.parts([['ARDEL', key], array.map(indices, redis.arg)])))
+}
+
+// Clear whole inclusive ranges.
+pub fn ardelrange(c Conn, key String, ranges Array((Int, Int))) Result(Int, RedisError) {
+	redis.expect_int(
+		redis.command(
+			c,
+			redis.parts(
+				[
+					['ARDELRANGE', key],
+					array.fold(ranges, [], fn(acc, r) match r {
+						(start, end) -> array.concat(acc, [redis.arg(start), redis.arg(end)])
+					}),
+				],
+			),
+		),
+	)
+}
+
+// ---------------------------------------------------------------------------
+// Scanning, aggregating, searching.
+// ---------------------------------------------------------------------------
+
+// The non-empty slots in a range, as index/value pairs — gaps are skipped
+// rather than reported as nulls.
+pub fn arscan(
+	c Conn,
+	key String,
+	start Int,
+	end Int,
+	limit Option(Int),
+) Result(Array((Int, String)), RedisError) {
+	indexed(
+		redis.command(
+			c,
+			redis.parts(
+				[
+					['ARSCAN', key, redis.arg(start), redis.arg(end)],
+					redis.when_some(limit, fn(n) ['LIMIT', redis.arg(n)]),
+				],
+			),
+		),
+	)
+}
+
+// What `arop` computes over a range.
+pub type Reduce {
+	Sum
+	Min
+	Max
+	And
+	Or
+	Xor
+	// How many slots in the range equal this value.
+	MatchCount(value String)
+	// How many slots in the range hold anything.
+	Used
+}
+
+fn render_reduce(r Reduce) Array(String) {
+	match r {
+		Sum -> ['SUM']
+		Min -> ['MIN']
+		Max -> ['MAX']
+		And -> ['AND']
+		Or -> ['OR']
+		Xor -> ['XOR']
+		MatchCount(v) -> ['MATCH', v]
+		Used -> ['USED']
+	}
+}
+
+// Aggregate over a range, server-side. The result is a `Score` because SUM of
+// values that are not integers is a double.
+pub fn arop(c Conn, key String, start Int, end Int, op Reduce) Result(Score, RedisError) {
+	match redis.command(
+		c,
+		redis.parts([['AROP', key, redis.arg(start), redis.arg(end)], render_reduce(op)]),
+	) {
+		Err(e) -> Err(e)
+		Ok(value) -> redis.value_score(value)
+	}
+}
+
+// How values are matched by `argrep`.
+pub type Match {
+	Exact(value String)
+	// A substring search.
+	Contains(value String)
+	Glob(pattern String)
+	Regex(pattern String)
+}
+
+fn render_match(m Match) Array(String) {
+	match m {
+		Exact(v) -> ['EXACT', v]
+		Contains(v) -> ['MATCH', v]
+		Glob(p) -> ['GLOB', p]
+		Regex(p) -> ['RE', p]
+	}
+}
+
+// Search a range for matching values, returning their indices.
+pub fn argrep(
+	c Conn,
+	key String,
+	start Int,
+	end Int,
+	predicate Match,
+	nocase Bool,
+	limit Option(Int),
+) Result(Array(Int), RedisError) {
+	match redis.expect_values(
+		redis.command(c, grep_args(key, start, end, predicate, nocase, limit, False)),
+	) {
+		Err(e) -> Err(e)
+		Ok(values) -> redis.collect(array.map(values, redis.value_int))
+	}
+}
+
+// The same search, returning the matching values alongside their indices.
+pub fn argrep_with_values(
+	c Conn,
+	key String,
+	start Int,
+	end Int,
+	predicate Match,
+	nocase Bool,
+	limit Option(Int),
+) Result(Array((Int, String)), RedisError) {
+	indexed(redis.command(c, grep_args(key, start, end, predicate, nocase, limit, True)))
+}
+
+fn grep_args(
+	key String,
+	start Int,
+	end Int,
+	predicate Match,
+	nocase Bool,
+	limit Option(Int),
+	with_values Bool,
+) Array(String) {
+	redis.parts(
+		[
+			['ARGREP', key, redis.arg(start), redis.arg(end)],
+			render_match(predicate),
+			redis.when(nocase, ['NOCASE']),
+			redis.when_some(limit, fn(n) ['LIMIT', redis.arg(n)]),
+			redis.when(with_values, ['WITHVALUES']),
+		],
+	)
+}
+
+// Internal metadata — slice count, directory size, slot size. Diagnostic, and
+// its fields track the implementation rather than any stable contract.
+pub fn arinfo(c Conn, key String) Result(Array((String, String)), RedisError) {
+	redis.expect_pairs(redis.command(c, ['ARINFO', key]))
+}
+
+// ARSCAN and ARGREP WITHVALUES nest each result as its own `[index, value]`
+// array, rather than flattening them the way HGETALL and ZSCAN do. The index
+// arrives as an integer reply, not as digits in a bulk string.
+fn indexed(reply Result(resp.Value, RedisError)) Result(Array((Int, String)), RedisError) {
+	match redis.expect_values(reply) {
+		Err(e) -> Err(e)
+		Ok(entries) -> redis.collect(
+			array.map(entries, fn(entry) match redis.expect_values(Ok(entry)) {
+				Err(e) -> Err(e)
+				Ok([index, value]) -> match (redis.value_int(index), redis.value_text(value)) {
+					(Ok(i), Ok(v)) -> Ok((i, v))
+					(Err(e), _) -> Err(e)
+					(_, Err(e)) -> Err(e)
+				}
+				Ok(_) -> Err(redis.Protocol('expected an index and a value'))
+			}),
+		)
+	}
+}

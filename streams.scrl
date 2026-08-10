@@ -1,0 +1,780 @@
+// Stream commands.
+//
+// A stream is an append-only log of entries, each with an ID and a set of
+// field/value pairs. IDs are `<milliseconds>-<sequence>` and sort in that
+// order, which is what makes ranges and "everything after X" cheap.
+//
+// The replies here nest further than anywhere else in Redis — an XREAD answer
+// is streams containing entries containing field lists — so this module does
+// most of its own decoding on top of `redis.expect_values`.
+
+import scarlet/array
+import ./redis.{Conn, RedisError}
+
+// One entry: its ID and its fields, in the order the server returned them.
+pub type Entry {
+	id String
+	fields Array((String, String))
+}
+
+// Entries from one stream, as XREAD reports them when several were asked for.
+pub type StreamEntries {
+	stream String
+	entries Array(Entry)
+}
+
+// ---------------------------------------------------------------------------
+// Appending and trimming.
+// ---------------------------------------------------------------------------
+
+// How to bound a stream's length.
+pub type Trim {
+	// Keep at most this many entries.
+	MaxLen(count Int)
+	// Drop entries with IDs below this one.
+	MinId(id String)
+}
+
+// Exact trimming can be arbitrarily expensive; approximate trimming stops at a
+// macro-node boundary and is what production callers almost always want. The
+// distinction is a whole `~` character on the wire and a large difference in
+// worst-case latency, so it is not defaulted.
+pub type Accuracy {
+	Exact
+	Approximate
+}
+
+fn render_trim(t Trim, accuracy Accuracy, limit Option(Int)) Array(String) {
+	(verb, threshold) = match t {
+		MaxLen(n) -> ('MAXLEN', redis.arg(n))
+		MinId(id) -> ('MINID', id)
+	}
+	marker = match accuracy {
+		Exact -> '='
+		Approximate -> '~'
+	}
+	redis.parts([[verb, marker, threshold], redis.when_some(limit, fn(n) ['LIMIT', redis.arg(n)])])
+}
+
+// Append an entry, returning its ID. Pass `None` for `id` to let the server
+// assign one from the clock, which is what almost every caller wants.
+pub fn xadd(
+	c Conn,
+	key String,
+	id Option(String),
+	fields Array((String, String)),
+) Result(String, RedisError) {
+	xadd_opts(c, key, id, fields, False, None, Approximate, None)
+}
+
+// XADD with its modifiers. With `nomkstream` the entry is dropped rather than
+// creating a stream that does not exist yet.
+pub fn xadd_opts(
+	c Conn,
+	key String,
+	id Option(String),
+	fields Array((String, String)),
+	nomkstream Bool,
+	trim Option(Trim),
+	accuracy Accuracy,
+	limit Option(Int),
+) Result(String, RedisError) {
+	redis.expect_string(
+		redis.command(
+			c,
+			redis.parts(
+				[
+					['XADD', key],
+					redis.when(nomkstream, ['NOMKSTREAM']),
+					redis.when_some(trim, fn(t) render_trim(t, accuracy, limit)),
+					[
+						match id {
+							Some(explicit) -> explicit
+							None -> '*'
+						},
+					],
+					redis.flatten_pairs(fields),
+				],
+			),
+		),
+	)
+}
+
+// Trim an existing stream, returning how many entries were removed.
+pub fn xtrim(
+	c Conn,
+	key String,
+	trim Trim,
+	accuracy Accuracy,
+	limit Option(Int),
+) Result(Int, RedisError) {
+	redis.expect_int(
+		redis.command(c, redis.parts([['XTRIM', key], render_trim(trim, accuracy, limit)])),
+	)
+}
+
+// Remove specific entries by ID. Returns how many existed.
+pub fn xdel(c Conn, key String, ids Array(String)) Result(Int, RedisError) {
+	redis.expect_int(redis.command(c, redis.parts([['XDEL', key], ids])))
+}
+
+pub fn xlen(c Conn, key String) Result(Int, RedisError) {
+	redis.expect_int(redis.command(c, ['XLEN', key]))
+}
+
+// Set the stream's last-ID, which decides what the next generated ID will be.
+pub fn xsetid(
+	c Conn,
+	key String,
+	id String,
+	entries_added Option(Int),
+	max_deleted_id Option(String),
+) Result(Nil, RedisError) {
+	redis.expect_ok(
+		redis.command(
+			c,
+			redis.parts(
+				[
+					['XSETID', key, id],
+					redis.when_some(entries_added, fn(n) ['ENTRIESADDED', redis.arg(n)]),
+					redis.when_some(max_deleted_id, fn(v) ['MAXDELETEDID', v]),
+				],
+			),
+		),
+	)
+}
+
+// ---------------------------------------------------------------------------
+// Reading by range.
+// ---------------------------------------------------------------------------
+//
+// `-` and `+` are the smallest and largest possible IDs, so `xrange(c, k, '-',
+// '+', None)` is the whole stream. A bare `<ms>` works as an ID too, and an
+// exclusive bound is written `(<id>`.
+
+pub fn xrange(
+	c Conn,
+	key String,
+	start String,
+	end String,
+	count Option(Int),
+) Result(Array(Entry), RedisError) {
+	entries(
+		redis.command(
+			c,
+			redis.parts(
+				[['XRANGE', key, start, end], redis.when_some(count, fn(n) ['COUNT', redis.arg(n)])],
+			),
+		),
+	)
+}
+
+// The same range, newest first. Note the bounds swap: `end` comes before
+// `start`, which is Redis's own argument order rather than an accident here.
+pub fn xrevrange(
+	c Conn,
+	key String,
+	end String,
+	start String,
+	count Option(Int),
+) Result(Array(Entry), RedisError) {
+	entries(
+		redis.command(
+			c,
+			redis.parts(
+				[
+					['XREVRANGE', key, end, start],
+					redis.when_some(count, fn(n) ['COUNT', redis.arg(n)]),
+				],
+			),
+		),
+	)
+}
+
+// ---------------------------------------------------------------------------
+// Reading as a follower.
+// ---------------------------------------------------------------------------
+
+// Read entries newer than the given ID in each stream. `$` means "only what
+// arrives after this call", which is only useful with `block`.
+//
+// `block` is a timeout in milliseconds — 0 waits indefinitely. `None` returns
+// straight away, and `Ok(None)` is "nothing new", which for a blocking call
+// means the timeout passed.
+pub fn xread(
+	c Conn,
+	streams Array((String, String)),
+	count Option(Int),
+	block_ms Option(Int),
+) Result(Option(Array(StreamEntries)), RedisError) {
+	streams_reply(
+		redis.command(
+			c,
+			redis.parts(
+				[
+					['XREAD'],
+					redis.when_some(count, fn(n) ['COUNT', redis.arg(n)]),
+					redis.when_some(block_ms, fn(n) ['BLOCK', redis.arg(n)]),
+					['STREAMS'],
+					array.map(streams, fn(s) match s {
+						(name, _) -> name
+					}),
+					array.map(streams, fn(s) match s {
+						(_, id) -> id
+					}),
+				],
+			),
+		),
+	)
+}
+
+// Read as a member of a consumer group. `>` asks for entries no one in the
+// group has taken yet; any other ID re-reads that consumer's own pending
+// entries, which is how a restarted worker recovers its unfinished work.
+pub fn xreadgroup(
+	c Conn,
+	group String,
+	consumer String,
+	streams Array((String, String)),
+	count Option(Int),
+	block_ms Option(Int),
+	noack Bool,
+) Result(Option(Array(StreamEntries)), RedisError) {
+	streams_reply(
+		redis.command(
+			c,
+			redis.parts(
+				[
+					['XREADGROUP', 'GROUP', group, consumer],
+					redis.when_some(count, fn(n) ['COUNT', redis.arg(n)]),
+					redis.when_some(block_ms, fn(n) ['BLOCK', redis.arg(n)]),
+					redis.when(noack, ['NOACK']),
+					['STREAMS'],
+					array.map(streams, fn(s) match s {
+						(name, _) -> name
+					}),
+					array.map(streams, fn(s) match s {
+						(_, id) -> id
+					}),
+				],
+			),
+		),
+	)
+}
+
+// ---------------------------------------------------------------------------
+// Consumer groups.
+// ---------------------------------------------------------------------------
+
+// Create a group. `id` is where it starts reading: `0` for the whole stream,
+// `$` for only new entries. `mkstream` creates the stream if it is absent,
+// without which this errs on a stream that does not exist yet.
+pub fn xgroup_create(
+	c Conn,
+	key String,
+	group String,
+	id String,
+	mkstream Bool,
+) Result(Nil, RedisError) {
+	redis.expect_ok(
+		redis.command(
+			c,
+			redis.parts([['XGROUP', 'CREATE', key, group, id], redis.when(mkstream, ['MKSTREAM'])]),
+		),
+	)
+}
+
+pub fn xgroup_destroy(c Conn, key String, group String) Result(Bool, RedisError) {
+	redis.expect_bool(redis.command(c, ['XGROUP', 'DESTROY', key, group]))
+}
+
+// Move a group's cursor, so it re-reads from `id` onward.
+pub fn xgroup_setid(c Conn, key String, group String, id String) Result(Nil, RedisError) {
+	redis.expect_ok(redis.command(c, ['XGROUP', 'SETID', key, group, id]))
+}
+
+pub fn xgroup_createconsumer(
+	c Conn,
+	key String,
+	group String,
+	consumer String,
+) Result(Bool, RedisError) {
+	redis.expect_bool(redis.command(c, ['XGROUP', 'CREATECONSUMER', key, group, consumer]))
+}
+
+// Remove a consumer, returning how many pending entries it still held — those
+// become unclaimed and need `xclaim` or `xautoclaim` to be picked up again.
+pub fn xgroup_delconsumer(
+	c Conn,
+	key String,
+	group String,
+	consumer String,
+) Result(Int, RedisError) {
+	redis.expect_int(redis.command(c, ['XGROUP', 'DELCONSUMER', key, group, consumer]))
+}
+
+// Acknowledge entries, removing them from the group's pending list.
+pub fn xack(
+	c Conn,
+	key String,
+	group String,
+	ids Array(String),
+) Result(Int, RedisError) {
+	redis.expect_int(redis.command(c, redis.parts([['XACK', key, group], ids])))
+}
+
+// ---------------------------------------------------------------------------
+// Pending entries and claiming.
+// ---------------------------------------------------------------------------
+
+// The overview form of XPENDING: how many entries are pending, the ID range
+// they span, and the count per consumer.
+pub type PendingSummary {
+	count Int
+	min_id Option(String)
+	max_id Option(String)
+	consumers Array((String, Int))
+}
+
+pub fn xpending(c Conn, key String, group String) Result(PendingSummary, RedisError) {
+	match redis.expect_values(redis.command(c, ['XPENDING', key, group])) {
+		Err(e) -> Err(e)
+		Ok([count, lo, hi, per_consumer]) -> match redis.value_int(count) {
+			Err(e) -> Err(e)
+			Ok(n) -> match consumer_counts(per_consumer) {
+				Err(e) -> Err(e)
+				Ok(consumers) -> Ok(PendingSummary(n, opt_text(lo), opt_text(hi), consumers))
+			}
+		}
+		Ok(_) -> Err(redis.Protocol('unexpected XPENDING summary shape'))
+	}
+}
+
+// One pending entry, from the detail form of XPENDING.
+pub type PendingEntry {
+	id String
+	consumer String
+	idle_ms Int
+	delivery_count Int
+}
+
+// The detail form: which entries are pending, who holds them, and for how
+// long. `min_idle_ms` filters to entries whose holder has been quiet at least
+// that long — the way to find work abandoned by a dead worker.
+pub fn xpending_range(
+	c Conn,
+	key String,
+	group String,
+	start String,
+	end String,
+	count Int,
+	consumer Option(String),
+	min_idle_ms Option(Int),
+) Result(Array(PendingEntry), RedisError) {
+	match redis.expect_values(
+		redis.command(
+			c,
+			redis.parts(
+				[
+					['XPENDING', key, group],
+					redis.when_some(min_idle_ms, fn(n) ['IDLE', redis.arg(n)]),
+					[start, end, redis.arg(count)],
+					redis.when_some(consumer, fn(name) [name]),
+				],
+			),
+		),
+	) {
+		Err(e) -> Err(e)
+		Ok(rows) -> redis.collect(array.map(rows, decode_pending))
+	}
+}
+
+fn decode_pending(row resp.Value) Result(PendingEntry, RedisError) {
+	match redis.expect_values(Ok(row)) {
+		Err(e) -> Err(e)
+		Ok(
+			[id, consumer, idle, deliveries],
+		) -> match (
+			redis.value_text(id),
+			redis.value_text(consumer),
+			redis.value_int(idle),
+			redis.value_int(deliveries),
+		) {
+			(Ok(i), Ok(c), Ok(ms), Ok(n)) -> Ok(PendingEntry(i, c, ms, n))
+			(Err(e), _, _, _) -> Err(e)
+			(_, Err(e), _, _) -> Err(e)
+			(_, _, Err(e), _) -> Err(e)
+			(_, _, _, Err(e)) -> Err(e)
+		}
+		Ok(_) -> Err(redis.Protocol('unexpected XPENDING entry shape'))
+	}
+}
+
+// Take ownership of specific pending entries, but only if their current holder
+// has been idle at least `min_idle_ms` — the guard that stops two workers
+// claiming the same entry in a race.
+pub fn xclaim(
+	c Conn,
+	key String,
+	group String,
+	consumer String,
+	min_idle_ms Int,
+	ids Array(String),
+	force Bool,
+) Result(Array(Entry), RedisError) {
+	entries(
+		redis.command(
+			c,
+			redis.parts(
+				[
+					['XCLAIM', key, group, consumer, redis.arg(min_idle_ms)],
+					ids,
+					redis.when(force, ['FORCE']),
+				],
+			),
+		),
+	)
+}
+
+// The IDs only, without transferring the entries' fields.
+pub fn xclaim_justid(
+	c Conn,
+	key String,
+	group String,
+	consumer String,
+	min_idle_ms Int,
+	ids Array(String),
+	force Bool,
+) Result(Array(String), RedisError) {
+	redis.expect_strings(
+		redis.command(
+			c,
+			redis.parts(
+				[
+					['XCLAIM', key, group, consumer, redis.arg(min_idle_ms)],
+					ids,
+					redis.when(force, ['FORCE']),
+					['JUSTID'],
+				],
+			),
+		),
+	)
+}
+
+// Scan the pending list and claim what has gone stale, a page at a time.
+// Returns the cursor to resume from, the entries claimed, and the IDs that
+// turned out to no longer exist in the stream.
+pub fn xautoclaim(
+	c Conn,
+	key String,
+	group String,
+	consumer String,
+	min_idle_ms Int,
+	start String,
+	count Option(Int),
+) Result((String, Array(Entry), Array(String)), RedisError) {
+	match redis.expect_values(
+		redis.command(
+			c,
+			redis.parts(
+				[
+					['XAUTOCLAIM', key, group, consumer, redis.arg(min_idle_ms), start],
+					redis.when_some(count, fn(n) ['COUNT', redis.arg(n)]),
+				],
+			),
+		),
+	) {
+		Err(e) -> Err(e)
+		Ok(
+			[cursor, claimed, deleted],
+		) -> match (
+			redis.value_text(cursor),
+			entries(Ok(claimed)),
+			redis.expect_strings(Ok(deleted)),
+		) {
+			(Ok(next), Ok(es), Ok(gone)) -> Ok((next, es, gone))
+			(Err(e), _, _) -> Err(e)
+			(_, Err(e), _) -> Err(e)
+			(_, _, Err(e)) -> Err(e)
+		}
+		// Redis before 7.0 omitted the deleted-IDs element.
+		Ok([cursor, claimed]) -> match (redis.value_text(cursor), entries(Ok(claimed))) {
+			(Ok(next), Ok(es)) -> Ok((next, es, []))
+			(Err(e), _) -> Err(e)
+			(_, Err(e)) -> Err(e)
+		}
+		Ok(_) -> Err(redis.Protocol('unexpected XAUTOCLAIM shape'))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Introspection.
+// ---------------------------------------------------------------------------
+//
+// The XINFO replies are maps whose keys vary by server version, so they come
+// back as field/value pairs rather than a record this client would have to
+// keep in step with Redis.
+
+pub fn xinfo_stream(c Conn, key String) Result(Array((String, String)), RedisError) {
+	redis.expect_pairs(redis.command(c, ['XINFO', 'STREAM', key]))
+}
+
+pub fn xinfo_groups(c Conn, key String) Result(Array(Array((String, String))), RedisError) {
+	rows(redis.command(c, ['XINFO', 'GROUPS', key]))
+}
+
+pub fn xinfo_consumers(
+	c Conn,
+	key String,
+	group String,
+) Result(Array(Array((String, String))), RedisError) {
+	rows(redis.command(c, ['XINFO', 'CONSUMERS', key, group]))
+}
+
+fn rows(reply Result(resp.Value, RedisError)) Result(Array(Array((String, String))), RedisError) {
+	match redis.expect_values(reply) {
+		Err(e) -> Err(e)
+		Ok(items) -> redis.collect(array.map(items, fn(item) redis.expect_pairs(Ok(item))))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Decoding.
+// ---------------------------------------------------------------------------
+
+// An entry is `[id, [field, value, field, value, ...]]` — the fields flat, as
+// everything is under RESP2.
+fn entries(reply Result(resp.Value, RedisError)) Result(Array(Entry), RedisError) {
+	match redis.expect_values(reply) {
+		Err(e) -> Err(e)
+		Ok(items) -> redis.collect(array.map(items, decode_entry))
+	}
+}
+
+fn decode_entry(item resp.Value) Result(Entry, RedisError) {
+	match item {
+		// XCLAIM skips entries that vanished from the stream by leaving a null
+		// in their place; there is nothing to decode, and dropping it silently
+		// would misalign the result with the IDs asked for.
+		Null -> Err(redis.Protocol('stream entry no longer exists'))
+		other -> match redis.expect_values(Ok(other)) {
+			Err(e) -> Err(e)
+			Ok([id, fields]) -> match (redis.value_text(id), redis.expect_pairs(Ok(fields))) {
+				(Ok(i), Ok(fs)) -> Ok(Entry(i, fs))
+				(Err(e), _) -> Err(e)
+				(_, Err(e)) -> Err(e)
+			}
+			Ok(_) -> Err(redis.Protocol('expected an id and a field list'))
+		}
+	}
+}
+
+// XREAD answers with one `[stream-name, entries]` pair per stream that had
+// anything, or null when none did.
+fn streams_reply(
+	reply Result(resp.Value, RedisError),
+) Result(Option(Array(StreamEntries)), RedisError) {
+	match redis.expect_opt_values(reply) {
+		Err(e) -> Err(e)
+		Ok(None) -> Ok(None)
+		Ok(Some(items)) ->
+			redis.map_ok(redis.collect(array.map(items, decode_stream)), fn(ss) Some(ss))
+	}
+}
+
+fn decode_stream(item resp.Value) Result(StreamEntries, RedisError) {
+	match redis.expect_values(Ok(item)) {
+		Err(e) -> Err(e)
+		Ok([name, es]) -> match (redis.value_text(name), entries(Ok(es))) {
+			(Ok(stream), Ok(decoded)) -> Ok(StreamEntries(stream, decoded))
+			(Err(e), _) -> Err(e)
+			(_, Err(e)) -> Err(e)
+		}
+		Ok(_) -> Err(redis.Protocol('expected a stream name and its entries'))
+	}
+}
+
+fn consumer_counts(v resp.Value) Result(Array((String, Int)), RedisError) {
+	match v {
+		Null -> Ok([])
+		other -> match redis.expect_values(Ok(other)) {
+			Err(e) -> Err(e)
+			Ok(items) -> redis.collect(
+				array.map(items, fn(item) match redis.expect_values(Ok(item)) {
+					Err(e) -> Err(e)
+					Ok([name, count]) -> match (redis.value_text(name), redis.value_int(count)) {
+						(Ok(n), Ok(k)) -> Ok((n, k))
+						(Err(e), _) -> Err(e)
+						(_, Err(e)) -> Err(e)
+					}
+					Ok(_) -> Err(redis.Protocol('expected a consumer and a count'))
+				}),
+			)
+		}
+	}
+}
+
+fn opt_text(v resp.Value) Option(String) {
+	match redis.value_text(v) {
+		Ok(s) -> Some(s)
+		Err(_) -> None
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Reference-aware deletion (Redis 8.2+).
+// ---------------------------------------------------------------------------
+
+// What to do about consumer-group references to an entry being deleted. The
+// default, `KeepReferences`, is how XDEL has always behaved: the entry goes
+// but the pending-list entries pointing at it stay, and a consumer later finds
+// them dangling.
+pub type References {
+	KeepReferences
+	DeleteReferences
+	// Delete only if every group has already acknowledged it.
+	OnlyIfAcked
+}
+
+fn render_references(r References) String {
+	match r {
+		KeepReferences -> 'KEEPREF'
+		DeleteReferences -> 'DELREF'
+		OnlyIfAcked -> 'ACKED'
+	}
+}
+
+// What happened to one entry in an XDELEX or XACKDEL call.
+pub type DeleteOutcome {
+	NotFound
+	Deleted
+	// Still referenced by a group's pending list, so it was left alone.
+	StillReferenced
+	Unknown(code Int)
+}
+
+fn outcomes(reply Result(resp.Value, RedisError)) Result(Array(DeleteOutcome), RedisError) {
+	match redis.expect_values(reply) {
+		Err(e) -> Err(e)
+		Ok(values) -> redis.collect(
+			array.map(values, fn(v) redis.map_ok(redis.value_int(v), fn(n) if n == 0 - 1 {
+				NotFound
+			} else if n == 1 {
+				Deleted
+			} else if n == 2 {
+				StillReferenced
+			} else {
+				Unknown(n)
+			})),
+		)
+	}
+}
+
+// Delete entries, deciding explicitly what happens to group references —
+// answering per entry rather than with a single count, as XDEL does.
+pub fn xdelex(
+	c Conn,
+	key String,
+	references References,
+	ids Array(String),
+) Result(Array(DeleteOutcome), RedisError) {
+	outcomes(
+		redis.command(
+			c,
+			redis.parts(
+				[
+					['XDELEX', key, render_references(references)],
+					['IDS', redis.arg(array.length(ids))],
+					ids,
+				],
+			),
+		),
+	)
+}
+
+// Acknowledge and delete in one step.
+pub fn xackdel(
+	c Conn,
+	key String,
+	group String,
+	references References,
+	ids Array(String),
+) Result(Array(DeleteOutcome), RedisError) {
+	outcomes(
+		redis.command(
+			c,
+			redis.parts(
+				[
+					['XACKDEL', key, group, render_references(references)],
+					['IDS', redis.arg(array.length(ids))],
+					ids,
+				],
+			),
+		),
+	)
+}
+
+// How a released entry's delivery counter is treated.
+pub type NackMode {
+	// Leave the retry count alone.
+	Silent
+	// Count this as a failed delivery.
+	Failed
+	// Count it as fatal, so the entry is not redelivered.
+	Fatal
+}
+
+// Release claimed entries back to the group's pending list without
+// acknowledging them — the explicit "I could not process this" that would
+// otherwise mean waiting for the idle timeout.
+pub fn xnack(
+	c Conn,
+	key String,
+	group String,
+	mode NackMode,
+	ids Array(String),
+	retry_count Option(Int),
+	force Bool,
+) Result(Array(DeleteOutcome), RedisError) {
+	name = match mode {
+		Silent -> 'SILENT'
+		Failed -> 'FAIL'
+		Fatal -> 'FATAL'
+	}
+	outcomes(
+		redis.command(
+			c,
+			redis.parts(
+				[
+					['XNACK', key, group, name],
+					['IDS', redis.arg(array.length(ids))],
+					ids,
+					redis.when_some(retry_count, fn(n) ['RETRYCOUNT', redis.arg(n)]),
+					redis.when(force, ['FORCE']),
+				],
+			),
+		),
+	)
+}
+
+// Idempotency settings for a stream: how long a producer ID is remembered, and
+// how many are kept.
+pub fn xcfgset(
+	c Conn,
+	key String,
+	idmp_duration Option(Int),
+	idmp_maxsize Option(Int),
+) Result(Nil, RedisError) {
+	redis.expect_ok(
+		redis.command(
+			c,
+			redis.parts(
+				[
+					['XCFGSET', key],
+					redis.when_some(idmp_duration, fn(n) ['IDMP-DURATION', redis.arg(n)]),
+					redis.when_some(idmp_maxsize, fn(n) ['IDMP-MAXSIZE', redis.arg(n)]),
+				],
+			),
+		),
+	)
+}

@@ -1,0 +1,386 @@
+// List commands, including the blocking family.
+//
+// The blocking commands park the calling process until something arrives or
+// the timeout passes. That parks only that process — the scheduler keeps
+// running everything else — so a blocking read here costs a process, not a
+// thread. Give it its own connection: a `Conn` sitting in BLPOP cannot carry
+// another command until it returns.
+
+import scarlet/array
+import ./number
+import ./redis.{Conn, RedisError}
+
+// Which end of the list an operation works on.
+pub type Side {
+	Left
+	Right
+}
+
+fn side(s Side) String {
+	match s {
+		Left -> 'LEFT'
+		Right -> 'RIGHT'
+	}
+}
+
+// A blocking timeout in seconds. 0 waits forever; fractions are allowed.
+fn timeout(seconds Float) String {
+	number.score_to_string(number.Finite(seconds))
+}
+
+// ---------------------------------------------------------------------------
+// Pushing and popping.
+// ---------------------------------------------------------------------------
+
+// Prepend elements, returning the list's new length. Multiple elements are
+// pushed one after another, so `lpush(c, k, ['a', 'b'])` leaves 'b' at the head.
+pub fn lpush(c Conn, key String, elements Array(String)) Result(Int, RedisError) {
+	redis.expect_int(redis.command(c, redis.parts([['LPUSH', key], elements])))
+}
+
+pub fn rpush(c Conn, key String, elements Array(String)) Result(Int, RedisError) {
+	redis.expect_int(redis.command(c, redis.parts([['RPUSH', key], elements])))
+}
+
+// Push only onto a list that already exists. Returns 0 without creating one.
+pub fn lpushx(c Conn, key String, elements Array(String)) Result(Int, RedisError) {
+	redis.expect_int(redis.command(c, redis.parts([['LPUSHX', key], elements])))
+}
+
+pub fn rpushx(c Conn, key String, elements Array(String)) Result(Int, RedisError) {
+	redis.expect_int(redis.command(c, redis.parts([['RPUSHX', key], elements])))
+}
+
+pub fn lpop(c Conn, key String) Result(Option(String), RedisError) {
+	redis.expect_bulk(redis.command(c, ['LPOP', key]))
+}
+
+pub fn rpop(c Conn, key String) Result(Option(String), RedisError) {
+	redis.expect_bulk(redis.command(c, ['RPOP', key]))
+}
+
+// Pop up to `count` elements at once. An empty array means the list was empty;
+// Redis answers null there, which is flattened to `[]` because "no elements"
+// and "the list is gone" are the same thing to a caller draining a queue.
+pub fn lpop_count(c Conn, key String, count Int) Result(Array(String), RedisError) {
+	popped(redis.command(c, ['LPOP', key, redis.arg(count)]))
+}
+
+pub fn rpop_count(c Conn, key String, count Int) Result(Array(String), RedisError) {
+	popped(redis.command(c, ['RPOP', key, redis.arg(count)]))
+}
+
+fn popped(reply Result(resp.Value, RedisError)) Result(Array(String), RedisError) {
+	redis.map_ok(redis.expect_opt_strings_or_nil(reply), fn(o) match o {
+		Some(xs) -> xs
+		None -> []
+	})
+}
+
+// ---------------------------------------------------------------------------
+// Reading.
+// ---------------------------------------------------------------------------
+
+// An inclusive range; negative indices count back from the end, so `0, -1` is
+// the whole list.
+pub fn lrange(c Conn, key String, start Int, stop Int) Result(Array(String), RedisError) {
+	redis.expect_strings(redis.command(c, ['LRANGE', key, redis.arg(start), redis.arg(stop)]))
+}
+
+pub fn llen(c Conn, key String) Result(Int, RedisError) {
+	redis.expect_int(redis.command(c, ['LLEN', key]))
+}
+
+pub fn lindex(c Conn, key String, index Int) Result(Option(String), RedisError) {
+	redis.expect_bulk(redis.command(c, ['LINDEX', key, redis.arg(index)]))
+}
+
+// The index of the first element equal to `element`. `rank` picks which match:
+// 1 is the first from the head, -1 the first from the tail.
+pub fn lpos(
+	c Conn,
+	key String,
+	element String,
+	rank Option(Int),
+	maxlen Option(Int),
+) Result(Option(Int), RedisError) {
+	redis.expect_opt_int(
+		redis.command(
+			c,
+			redis.parts(
+				[
+					['LPOS', key, element],
+					redis.when_some(rank, fn(n) ['RANK', redis.arg(n)]),
+					redis.when_some(maxlen, fn(n) ['MAXLEN', redis.arg(n)]),
+				],
+			),
+		),
+	)
+}
+
+// Up to `count` matching indices. A `count` of 0 means every match.
+pub fn lpos_count(
+	c Conn,
+	key String,
+	element String,
+	count Int,
+	rank Option(Int),
+	maxlen Option(Int),
+) Result(Array(Int), RedisError) {
+	match redis.expect_values(
+		redis.command(
+			c,
+			redis.parts(
+				[
+					['LPOS', key, element],
+					redis.when_some(rank, fn(n) ['RANK', redis.arg(n)]),
+					['COUNT', redis.arg(count)],
+					redis.when_some(maxlen, fn(n) ['MAXLEN', redis.arg(n)]),
+				],
+			),
+		),
+	) {
+		Err(e) -> Err(e)
+		Ok(values) -> redis.collect(array.map(values, redis.value_int))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Modifying in place.
+// ---------------------------------------------------------------------------
+
+pub fn lset(c Conn, key String, index Int, element String) Result(Nil, RedisError) {
+	redis.expect_ok(redis.command(c, ['LSET', key, redis.arg(index), element]))
+}
+
+// Insert relative to the first occurrence of `pivot`. The reply is the new
+// length, -1 when the pivot is not in the list, and 0 when the key is absent.
+pub fn linsert(
+	c Conn,
+	key String,
+	before Bool,
+	pivot String,
+	element String,
+) Result(Int, RedisError) {
+	where = if before { 'BEFORE' } else { 'AFTER' }
+	redis.expect_int(redis.command(c, ['LINSERT', key, where, pivot, element]))
+}
+
+// Remove elements equal to `element`. A positive `count` removes that many
+// from the head, a negative one from the tail, and 0 removes every match.
+pub fn lrem(c Conn, key String, count Int, element String) Result(Int, RedisError) {
+	redis.expect_int(redis.command(c, ['LREM', key, redis.arg(count), element]))
+}
+
+// Keep only the given inclusive range, discarding the rest.
+pub fn ltrim(c Conn, key String, start Int, stop Int) Result(Nil, RedisError) {
+	redis.expect_ok(redis.command(c, ['LTRIM', key, redis.arg(start), redis.arg(stop)]))
+}
+
+// ---------------------------------------------------------------------------
+// Moving between lists.
+// ---------------------------------------------------------------------------
+
+// Pop from one list and push onto another atomically, returning the element
+// moved. The reliable-queue primitive: the element is never in neither list.
+pub fn lmove(
+	c Conn,
+	source String,
+	destination String,
+	from Side,
+	to Side,
+) Result(Option(String), RedisError) {
+	redis.expect_bulk(redis.command(c, ['LMOVE', source, destination, side(from), side(to)]))
+}
+
+// The older spelling of `lmove(c, src, dst, Right, Left)`.
+pub fn rpoplpush(c Conn, source String, destination String) Result(Option(String), RedisError) {
+	redis.expect_bulk(redis.command(c, ['RPOPLPUSH', source, destination]))
+}
+
+// Move up to `count` elements in one call (Redis 8.0+). With `exactly`, the
+// move happens only if that many are available.
+pub fn lmovem(
+	c Conn,
+	source String,
+	destination String,
+	from Side,
+	to Side,
+	count Int,
+	exactly Bool,
+) Result(Array(String), RedisError) {
+	popped(
+		redis.command(
+			c,
+			redis.parts(
+				[
+					['LMOVEM', source, destination, side(from), side(to)],
+					count_or_exactly(count, exactly),
+				],
+			),
+		),
+	)
+}
+
+fn count_or_exactly(count Int, exactly Bool) Array(String) {
+	if exactly {
+		['EXACTLY', redis.arg(count)]
+	} else {
+		['COUNT', redis.arg(count)]
+	}
+}
+
+// Pop from the first of several lists that has anything, returning which key
+// it came from along with the elements.
+pub fn lmpop(
+	c Conn,
+	keys Array(String),
+	from Side,
+	count Option(Int),
+) Result(Option((String, Array(String))), RedisError) {
+	keyed(
+		redis.command(
+			c,
+			redis.parts(
+				[
+					['LMPOP', redis.arg(array.length(keys))],
+					keys,
+					[side(from)],
+					redis.when_some(count, fn(n) ['COUNT', redis.arg(n)]),
+				],
+			),
+		),
+	)
+}
+
+// ---------------------------------------------------------------------------
+// Blocking.
+// ---------------------------------------------------------------------------
+//
+// Each of these returns `None` when the timeout passed with nothing to take.
+
+// Pop from the head of the first non-empty list, waiting if they are all
+// empty. Returns which key supplied the element.
+pub fn blpop(
+	c Conn,
+	keys Array(String),
+	timeout_seconds Float,
+) Result(Option((String, String)), RedisError) {
+	pair(redis.command(c, redis.parts([['BLPOP'], keys, [timeout(timeout_seconds)]])))
+}
+
+pub fn brpop(
+	c Conn,
+	keys Array(String),
+	timeout_seconds Float,
+) Result(Option((String, String)), RedisError) {
+	pair(redis.command(c, redis.parts([['BRPOP'], keys, [timeout(timeout_seconds)]])))
+}
+
+pub fn blmove(
+	c Conn,
+	source String,
+	destination String,
+	from Side,
+	to Side,
+	timeout_seconds Float,
+) Result(Option(String), RedisError) {
+	redis.expect_bulk(
+		redis.command(
+			c,
+			['BLMOVE', source, destination, side(from), side(to), timeout(timeout_seconds)],
+		),
+	)
+}
+
+pub fn brpoplpush(
+	c Conn,
+	source String,
+	destination String,
+	timeout_seconds Float,
+) Result(Option(String), RedisError) {
+	redis.expect_bulk(
+		redis.command(c, ['BRPOPLPUSH', source, destination, timeout(timeout_seconds)]),
+	)
+}
+
+pub fn blmovem(
+	c Conn,
+	source String,
+	destination String,
+	from Side,
+	to Side,
+	timeout_seconds Float,
+	count Int,
+	exactly Bool,
+) Result(Array(String), RedisError) {
+	popped(
+		redis.command(
+			c,
+			redis.parts(
+				[
+					[
+						'BLMOVEM',
+						source,
+						destination,
+						side(from),
+						side(to),
+						timeout(timeout_seconds),
+					],
+					count_or_exactly(count, exactly),
+				],
+			),
+		),
+	)
+}
+
+pub fn blmpop(
+	c Conn,
+	keys Array(String),
+	from Side,
+	timeout_seconds Float,
+	count Option(Int),
+) Result(Option((String, Array(String))), RedisError) {
+	keyed(
+		redis.command(
+			c,
+			redis.parts(
+				[
+					['BLMPOP', timeout(timeout_seconds), redis.arg(array.length(keys))],
+					keys,
+					[side(from)],
+					redis.when_some(count, fn(n) ['COUNT', redis.arg(n)]),
+				],
+			),
+		),
+	)
+}
+
+// BLPOP and BRPOP answer with a two-element array of key and element, so that
+// a caller waiting on several keys learns which one fired.
+fn pair(reply Result(resp.Value, RedisError)) Result(Option((String, String)), RedisError) {
+	match redis.expect_opt_values(reply) {
+		Err(e) -> Err(e)
+		Ok(None) -> Ok(None)
+		Ok(Some([k, v])) -> match (redis.value_text(k), redis.value_text(v)) {
+			(Ok(key), Ok(element)) -> Ok(Some((key, element)))
+			(Err(e), _) -> Err(e)
+			(_, Err(e)) -> Err(e)
+		}
+		Ok(Some(_)) -> Err(redis.Protocol('expected a key and an element'))
+	}
+}
+
+// LMPOP and BLMPOP answer with the key and an array of elements.
+fn keyed(reply Result(resp.Value, RedisError)) Result(Option((String, Array(String))), RedisError) {
+	match redis.expect_opt_values(reply) {
+		Err(e) -> Err(e)
+		Ok(None) -> Ok(None)
+		Ok(Some([k, items])) -> match (redis.value_text(k), redis.expect_strings(Ok(items))) {
+			(Ok(key), Ok(elements)) -> Ok(Some((key, elements)))
+			(Err(e), _) -> Err(e)
+			(_, Err(e)) -> Err(e)
+		}
+		Ok(Some(_)) -> Err(redis.Protocol('expected a key and an array of elements'))
+	}
+}

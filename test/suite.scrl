@@ -1,0 +1,888 @@
+// Integration tests, run against a live Redis.
+//
+//	scarlet run test/suite.scrl [host] [port]
+//
+// Every check asserts a value rather than printing one, so a regression fails
+// the run instead of scrolling past. The suite cleans up after itself and is
+// safe to run repeatedly; all its keys live under the `scrl:test:` prefix.
+
+import scarlet/array
+import scarlet/int
+import scarlet/process
+import scarlet/result
+import scarlet/scheduler
+import scarlet/string
+import ../number.{Finite, PosInf}
+import ../redis.{Conn, Expires, Missing, NoExpiry, RedisError, Server}
+import ../arrays
+import ../bitmaps.{ByBit, Or, Signed, Unsigned}
+import ../connection
+import ../geo.{Point, WithCoordinates, WithDistance}
+import ../hashes.{Applied}
+import ../hyperloglog
+import ../keys.{NoKey, StringKey}
+import ../lists.{Left, Right}
+import ../options.{Always, Asc, IfGreater, IfNotExists, Kilometers, Seconds, SetFor, Whenever}
+import ../pubsub
+import ../scripting
+import ../server
+import ../sets
+import ../sorted_sets.{HIGHEST, LOWEST}
+import ../streams.{Exact, MaxLen}
+import ../strings
+import ../transactions
+import ../resp.{Num}
+
+const PREFIX = 'scrl:test:'
+
+fn k(name String) String {
+	'${PREFIX}${name}'
+}
+
+// ---------------------------------------------------------------------------
+// Assertions.
+// ---------------------------------------------------------------------------
+
+type Check {
+	name String
+	ok Bool
+	detail String
+}
+
+// Compared through `string.inspect` so one helper covers every type — records,
+// enums, tuples and arrays alike — without needing equality at each one.
+fn eq(name String, actual a, expected a) Check {
+	got = string.inspect(actual)
+	want = string.inspect(expected)
+	Check(name, got == want, 'expected ${want}, got ${got}')
+}
+
+fn that(name String, ok Bool) Check {
+	Check(name, ok, 'expected True')
+}
+
+// ---------------------------------------------------------------------------
+// Strings.
+// ---------------------------------------------------------------------------
+
+fn test_strings(c Conn) Result(Array(Check), RedisError) {
+	key = k('str')
+	_ <- result.then(keys.del(c, [key, k('str2'), k('ctr'), k('f')]))
+
+	_ <- result.then(strings.set(c, key, 'hello'))
+	got <- result.then(strings.get(c, key))
+	missing <- result.then(strings.get(c, k('nope')))
+	length <- result.then(strings.append(c, key, ' world'))
+	slice <- result.then(strings.getrange(c, key, 0, 4))
+	nx <- result.then(strings.set_opts(c, key, 'blocked', IfNotExists, None))
+	prev <- result.then(strings.set_and_get(c, key, 'replaced', Always, Some(SetFor(Seconds(60)))))
+	ttl <- result.then(keys.ttl(c, key))
+
+	_ <- result.then(strings.mset(c, [(k('str2'), 'two'), (key, 'one')]))
+	many <- result.then(strings.mget(c, [key, k('str2'), k('nope')]))
+
+	counted <- result.then(strings.incrby(c, k('ctr'), 41))
+	bumped <- result.then(strings.incr(c, k('ctr')))
+	floated <- result.then(strings.incrbyfloat(c, k('f'), 1.5))
+	floated2 <- result.then(strings.incrbyfloat(c, k('f'), 0.25))
+
+	// An empty value is a real value, and must not read back as absent.
+	_ <- result.then(strings.set(c, k('empty'), ''))
+	empty <- result.then(strings.get(c, k('empty')))
+
+	_ <- result.then(keys.del(c, [key, k('str2'), k('ctr'), k('f'), k('empty')]))
+	Ok(
+		[
+			eq('get', got, Some('hello')),
+			eq('get missing', missing, None),
+			eq('append length', length, 11),
+			eq('getrange', slice, 'hello'),
+			eq('set NX on existing', nx, False),
+			eq('set GET returns previous', prev, Some('hello world')),
+			that('set EX armed a ttl', match ttl {
+				Expires(_) -> True
+				_ -> False
+			}),
+			eq('mget', many, [Some('one'), Some('two'), None]),
+			eq('incrby', counted, 41),
+			eq('incr', bumped, 42),
+			eq('incrbyfloat', floated, Finite(1.5)),
+			eq('incrbyfloat again', floated2, Finite(1.75)),
+			eq('empty string is not absent', empty, Some('')),
+		],
+	)
+}
+
+// ---------------------------------------------------------------------------
+// Keys.
+// ---------------------------------------------------------------------------
+
+fn test_keys(c Conn) Result(Array(Check), RedisError) {
+	key = k('gen')
+	_ <- result.then(keys.del(c, [key, k('gen2'), k('gen3')]))
+
+	_ <- result.then(strings.set(c, key, 'v'))
+	present <- result.then(keys.has(c, key))
+	kind <- result.then(keys.key_type(c, key))
+	absent_kind <- result.then(keys.key_type(c, k('nope')))
+	no_ttl <- result.then(keys.ttl(c, key))
+	missing_ttl <- result.then(keys.ttl(c, k('nope')))
+	armed <- result.then(keys.expire(c, key, Seconds(100), Whenever))
+	// GT never lowers an expiry, so a shorter one must be refused.
+	lowered <- result.then(keys.expire(c, key, Seconds(10), IfGreater))
+	after <- result.then(keys.ttl(c, key))
+	cleared <- result.then(keys.persist(c, key))
+
+	_ <- result.then(keys.rename(c, key, k('gen2')))
+	renamed <- result.then(strings.get(c, k('gen2')))
+	copied <- result.then(keys.copy(c, k('gen2'), k('gen3'), None, False))
+	found <- result.then(keys.scan_all(c, Some('${PREFIX}gen*'), Some(10)))
+	removed <- result.then(keys.del(c, [k('gen2'), k('gen3'), k('never')]))
+
+	Ok(
+		[
+			eq('exists', present, True),
+			eq('type', kind, StringKey),
+			eq('type of missing key', absent_kind, NoKey),
+			eq('ttl with no expiry', no_ttl, NoExpiry),
+			eq('ttl of missing key', missing_ttl, Missing),
+			eq('expire', armed, True),
+			eq('expire GT refuses a shorter ttl', lowered, False),
+			eq('ttl after expire', after, Expires(100)),
+			eq('persist', cleared, True),
+			eq('rename', renamed, Some('v')),
+			eq('copy', copied, True),
+			eq('scan found both keys', array.length(found), 2),
+			eq('del counts only what existed', removed, 2),
+		],
+	)
+}
+
+// ---------------------------------------------------------------------------
+// Hashes.
+// ---------------------------------------------------------------------------
+
+fn test_hashes(c Conn) Result(Array(Check), RedisError) {
+	key = k('hash')
+	_ <- result.then(keys.del(c, [key]))
+
+	added <- result.then(hashes.hset_many(c, key, [('a', '1'), ('b', '2')]))
+	again <- result.then(hashes.hset(c, key, 'a', '9'))
+	all <- result.then(hashes.hgetall(c, key))
+	one <- result.then(hashes.hget(c, key, 'b'))
+	absent <- result.then(hashes.hget(c, key, 'zz'))
+	multi <- result.then(hashes.hmget(c, key, ['a', 'zz']))
+	size <- result.then(hashes.hlen(c, key))
+	bumped <- result.then(hashes.hincrby(c, key, 'b', 10))
+
+	_ <- result.then(hashes.hexpire(c, key, Seconds(100), Whenever, ['a']))
+	ttls <- result.then(hashes.httl(c, key, ['a', 'b', 'missing-field']))
+	persisted <- result.then(hashes.hpersist(c, key, ['a']))
+
+	scanned <- result.then(hashes.hscan(c, key, 0, None, None))
+	(cursor, page) = scanned
+	deleted <- result.then(hashes.hdel(c, key, ['a', 'not-there']))
+
+	_ <- result.then(keys.del(c, [key]))
+	Ok(
+		[
+			eq('hset new fields', added, 2),
+			eq('hset overwrite is not new', again, False),
+			eq('hgetall', all, [('a', '9'), ('b', '2')]),
+			eq('hget', one, Some('2')),
+			eq('hget missing field', absent, None),
+			eq('hmget keeps position', multi, [Some('9'), None]),
+			eq('hlen', size, 2),
+			eq('hincrby', bumped, 12),
+			eq('httl per field', ttls, [Expires(100), NoExpiry, Missing]),
+			eq('hpersist', persisted, [Applied]),
+			eq('hscan completed', cursor, 0),
+			eq('hscan returned both fields', array.length(page), 2),
+			eq('hdel counts only what existed', deleted, 1),
+		],
+	)
+}
+
+// ---------------------------------------------------------------------------
+// Lists.
+// ---------------------------------------------------------------------------
+
+fn test_lists(c Conn) Result(Array(Check), RedisError) {
+	key = k('list')
+	other = k('list2')
+	_ <- result.then(keys.del(c, [key, other]))
+
+	length <- result.then(lists.rpush(c, key, ['a', 'b', 'c', 'b']))
+	all <- result.then(lists.lrange(c, key, 0, 0 - 1))
+	at <- result.then(lists.lindex(c, key, 1))
+	first_b <- result.then(lists.lpos(c, key, 'b', None, None))
+	last_b <- result.then(lists.lpos(c, key, 'b', Some(0 - 1), None))
+	every_b <- result.then(lists.lpos_count(c, key, 'b', 0, None, None))
+	no_such <- result.then(lists.lpos(c, key, 'zzz', None, None))
+	two <- result.then(lists.lpop_count(c, key, 2))
+	moved <- result.then(lists.lmove(c, key, other, Left, Right))
+	drained <- result.then(lists.lpop(c, k('empty-list')))
+	// A blocking pop on an empty list must time out rather than hang.
+	waited <- result.then(lists.blpop(c, [k('empty-list')], 0.05))
+
+	_ <- result.then(keys.del(c, [key, other]))
+	Ok(
+		[
+			eq('rpush length', length, 4),
+			eq('lrange', all, ['a', 'b', 'c', 'b']),
+			eq('lindex', at, Some('b')),
+			eq('lpos first match', first_b, Some(1)),
+			eq('lpos from the tail', last_b, Some(3)),
+			eq('lpos every match', every_b, [1, 3]),
+			eq('lpos no match', no_such, None),
+			eq('lpop count', two, ['a', 'b']),
+			eq('lmove', moved, Some('c')),
+			eq('lpop on empty list', drained, None),
+			eq('blpop timeout', waited, None),
+		],
+	)
+}
+
+// ---------------------------------------------------------------------------
+// Sets.
+// ---------------------------------------------------------------------------
+
+fn test_sets(c Conn) Result(Array(Check), RedisError) {
+	a = k('set')
+	b = k('set2')
+	_ <- result.then(keys.del(c, [a, b, k('set3')]))
+
+	added <- result.then(sets.sadd(c, a, ['x', 'y', 'z']))
+	dup <- result.then(sets.sadd(c, a, ['x']))
+	_ <- result.then(sets.sadd(c, b, ['y', 'z', 'w']))
+	size <- result.then(sets.scard(c, a))
+	member <- result.then(sets.sismember(c, a, 'x'))
+	several <- result.then(sets.smismember(c, a, ['x', 'nope']))
+	both <- result.then(sets.sinter(c, [a, b]))
+	count <- result.then(sets.sintercard(c, [a, b], None))
+	capped <- result.then(sets.sintercard(c, [a, b], Some(1)))
+	only_a <- result.then(sets.sdiff(c, [a, b]))
+	stored <- result.then(sets.sunionstore(c, k('set3'), [a, b]))
+
+	_ <- result.then(keys.del(c, [a, b, k('set3')]))
+	Ok(
+		[
+			eq('sadd', added, 3),
+			eq('sadd of an existing member', dup, 0),
+			eq('scard', size, 3),
+			eq('sismember', member, True),
+			eq('smismember', several, [True, False]),
+			that(
+				'sinter is exactly {y, z}',
+				array.length(both) == 2 && array.contains(both, 'y') && array.contains(both, 'z'),
+			),
+			eq('sintercard', count, 2),
+			eq('sintercard honours limit', capped, 1),
+			eq('sdiff', only_a, ['x']),
+			eq('sunionstore', stored, 4),
+		],
+	)
+}
+
+// ---------------------------------------------------------------------------
+// Sorted sets.
+// ---------------------------------------------------------------------------
+
+fn test_sorted_sets(c Conn) Result(Array(Check), RedisError) {
+	key = k('zset')
+	_ <- result.then(keys.del(c, [key]))
+
+	added <- result.then(
+		sorted_sets.zadd(c, key, [('a', Finite(1.0)), ('b', Finite(2.5)), ('c', Finite(10.0))]),
+	)
+	size <- result.then(sorted_sets.zcard(c, key))
+	score <- result.then(sorted_sets.zscore(c, key, 'b'))
+	absent <- result.then(sorted_sets.zscore(c, key, 'zz'))
+	scores <- result.then(sorted_sets.zmscore(c, key, ['a', 'zz']))
+	by_rank <- result.then(sorted_sets.zrange(c, key, 0, 0 - 1, False))
+	reversed <- result.then(sorted_sets.zrange(c, key, 0, 0 - 1, True))
+	with_scores <- result.then(sorted_sets.zrange_withscores(c, key, 0, 1, False))
+	// The bounds stay low-then-high even reversed; the module swaps them.
+	ranged <- result.then(
+		sorted_sets.zrange_by_score(c, key, sorted_sets.at_least(2.0), HIGHEST, False, None),
+	)
+	ranged_rev <- result.then(sorted_sets.zrange_by_score(c, key, LOWEST, HIGHEST, True, None))
+	exclusive <- result.then(
+		sorted_sets.zrange_by_score(c, key, sorted_sets.above(2.5), HIGHEST, False, None),
+	)
+	counted <- result.then(sorted_sets.zcount(c, key, LOWEST, HIGHEST))
+	rank <- result.then(sorted_sets.zrank(c, key, 'b'))
+	rank_score <- result.then(sorted_sets.zrank_withscore(c, key, 'b'))
+	bumped <- result.then(sorted_sets.zincrby(c, key, 'a', Finite(0.5)))
+
+	// An infinite score is a real score and must survive the round trip.
+	_ <- result.then(sorted_sets.zadd(c, key, [('inf', PosInf)]))
+	infinite <- result.then(sorted_sets.zscore(c, key, 'inf'))
+	_ <- result.then(sorted_sets.zrem(c, key, ['inf']))
+
+	popped <- result.then(sorted_sets.zpopmin(c, key))
+	removed <- result.then(sorted_sets.zrem(c, key, ['c', 'not-there']))
+
+	_ <- result.then(keys.del(c, [key]))
+	Ok(
+		[
+			eq('zadd', added, 3),
+			eq('zcard', size, 3),
+			eq('zscore', score, Some(Finite(2.5))),
+			eq('zscore of a missing member', absent, None),
+			eq('zmscore keeps position', scores, [Some(Finite(1.0)), None]),
+			eq('zrange by rank', by_rank, ['a', 'b', 'c']),
+			eq('zrange reversed', reversed, ['c', 'b', 'a']),
+			eq('zrange withscores', with_scores, [('a', Finite(1.0)), ('b', Finite(2.5))]),
+			eq('zrangebyscore', ranged, ['b', 'c']),
+			eq('zrangebyscore reversed', ranged_rev, ['c', 'b', 'a']),
+			eq('zrangebyscore exclusive bound', exclusive, ['c']),
+			eq('zcount over an infinite range', counted, 3),
+			eq('zrank', rank, Some(1)),
+			eq('zrank withscore', rank_score, Some((1, Finite(2.5)))),
+			eq('zincrby', bumped, Finite(1.5)),
+			eq('an infinite score round-trips', infinite, Some(PosInf)),
+			eq('zpopmin takes the lowest', popped, Some(('a', Finite(1.5)))),
+			eq('zrem counts only what existed', removed, 1),
+		],
+	)
+}
+
+// ---------------------------------------------------------------------------
+// Bitmaps, HyperLogLog, geo.
+// ---------------------------------------------------------------------------
+
+fn test_bitmaps(c Conn) Result(Array(Check), RedisError) {
+	key = k('bits')
+	_ <- result.then(keys.del(c, [key, k('bits2'), k('bits-or')]))
+
+	was <- result.then(bitmaps.setbit(c, key, 7, True))
+	now <- result.then(bitmaps.getbit(c, key, 7))
+	count <- result.then(bitmaps.bitcount(c, key))
+	first <- result.then(bitmaps.bitpos(c, key, True))
+	in_bits <- result.then(bitmaps.bitcount_range(c, key, 0, 7, ByBit))
+
+	_ <- result.then(bitmaps.setbit(c, k('bits2'), 6, True))
+	combined <- result.then(bitmaps.bitop(c, Or, k('bits-or'), [key, k('bits2')]))
+	or_count <- result.then(bitmaps.bitcount(c, k('bits-or')))
+
+	fields <- result.then(
+		bitmaps.bitfield(
+			c,
+			k('bf'),
+			[
+				bitmaps.Set(Unsigned(8), bitmaps.at_field(0), 255),
+				bitmaps.Get(Unsigned(8), bitmaps.at_field(0)),
+				bitmaps.SetOverflow(bitmaps.Saturate),
+				bitmaps.IncrBy(Signed(8), bitmaps.at_field(1), 127),
+				bitmaps.IncrBy(Signed(8), bitmaps.at_field(1), 127),
+			],
+		),
+	)
+
+	_ <- result.then(keys.del(c, [key, k('bits2'), k('bits-or'), k('bf')]))
+	Ok(
+		[
+			eq('setbit returns the old bit', was, False),
+			eq('getbit', now, True),
+			eq('bitcount', count, 1),
+			eq('bitpos', first, Some(7)),
+			eq('bitcount over a bit range', in_bits, 1),
+			eq('bitop OR size in bytes', combined, 1),
+			eq('bitop OR set both bits', or_count, 2),
+			eq('bitfield', fields, [Some(0), Some(255), Some(127), Some(127)]),
+		],
+	)
+}
+
+fn test_hyperloglog(c Conn) Result(Array(Check), RedisError) {
+	key = k('hll')
+	_ <- result.then(keys.del(c, [key, k('hll2'), k('hll-merged')]))
+
+	_ <- result.then(hyperloglog.pfadd(c, key, ['a', 'b', 'c']))
+	count <- result.then(hyperloglog.pfcount(c, [key]))
+	_ <- result.then(hyperloglog.pfadd(c, k('hll2'), ['c', 'd']))
+	union <- result.then(hyperloglog.pfcount(c, [key, k('hll2')]))
+	_ <- result.then(hyperloglog.pfmerge(c, k('hll-merged'), [key, k('hll2')]))
+	merged <- result.then(hyperloglog.pfcount(c, [k('hll-merged')]))
+
+	_ <- result.then(keys.del(c, [key, k('hll2'), k('hll-merged')]))
+	Ok(
+		[
+			eq('pfcount', count, 3),
+			eq('pfcount of a union counts distinct', union, 4),
+			eq('pfmerge', merged, 4),
+		],
+	)
+}
+
+fn test_geo(c Conn) Result(Array(Check), RedisError) {
+	key = k('geo')
+	_ <- result.then(keys.del(c, [key]))
+
+	added <- result.then(
+		geo.geoadd(
+			c,
+			key,
+			[('palermo', Point(13.361389, 38.115556)), ('catania', Point(15.087269, 37.502669))],
+			Always,
+			False,
+		),
+	)
+	distance <- result.then(geo.geodist(c, key, 'palermo', 'catania', Kilometers))
+	missing <- result.then(geo.geodist(c, key, 'palermo', 'nowhere', Kilometers))
+	hashes_ <- result.then(geo.geohash(c, key, ['palermo']))
+	positions <- result.then(geo.geopos(c, key, ['palermo', 'nowhere']))
+	near <- result.then(
+		geo.geosearch(
+			c,
+			key,
+			geo.FromPoint(Point(15.0, 37.0)),
+			geo.ByRadius(200.0, Kilometers),
+			Some(Asc),
+			None,
+			False,
+			[],
+		),
+	)
+	detailed <- result.then(
+		geo.geosearch(
+			c,
+			key,
+			geo.FromMember('palermo'),
+			geo.ByRadius(200.0, Kilometers),
+			Some(Asc),
+			None,
+			False,
+			[WithDistance, WithCoordinates],
+		),
+	)
+
+	_ <- result.then(keys.del(c, [key]))
+	// The stored position is a 52-bit geohash, so it round-trips approximately
+	// — the check is that it decoded to the right place, not to the bit.
+	round_tripped = match positions {
+		[Some(Point(lon, lat)), None] -> lon > 13.36 && lon < 13.37 && lat > 38.11 && lat < 38.12
+		_ -> False
+	}
+	distance_sane = match distance {
+		Some(Finite(km)) -> km > 166.0 && km < 167.0
+		_ -> False
+	}
+	Ok(
+		[
+			eq('geoadd', added, 2),
+			that('geodist is about 166km', distance_sane),
+			eq('geodist for a missing member', missing, None),
+			eq('geohash', hashes_, [Some('sqc8b49rny0')]),
+			that('geopos round-trips within tolerance', round_tripped),
+			eq('geosearch found both', array.length(near), 2),
+			that('geosearch with details carries distance and point', match detailed {
+				[geo.Found(_, Some(_), None, Some(_)), .._] -> True
+				_ -> False
+			}),
+		],
+	)
+}
+
+// ---------------------------------------------------------------------------
+// Streams.
+// ---------------------------------------------------------------------------
+
+fn test_streams(c Conn) Result(Array(Check), RedisError) {
+	key = k('stream')
+	_ <- result.then(keys.del(c, [key]))
+
+	first <- result.then(streams.xadd(c, key, Some('1-1'), [('sensor', 'a'), ('value', '1')]))
+	_ <- result.then(streams.xadd(c, key, Some('1-2'), [('sensor', 'b'), ('value', '2')]))
+	generated <- result.then(streams.xadd(c, key, None, [('sensor', 'c')]))
+	length <- result.then(streams.xlen(c, key))
+	all <- result.then(streams.xrange(c, key, '-', '+', None))
+	limited <- result.then(streams.xrange(c, key, '-', '+', Some(1)))
+	backwards <- result.then(streams.xrevrange(c, key, '+', '-', Some(1)))
+	read <- result.then(streams.xread(c, [(key, '0')], Some(2), None))
+	nothing <- result.then(streams.xread(c, [(key, '${generated}')], None, None))
+
+	_ <- result.then(streams.xgroup_create(c, key, 'g1', '0', False))
+	claimed <- result.then(
+		streams.xreadgroup(c, 'g1', 'worker-1', [(key, '>')], Some(1), None, False),
+	)
+	pending <- result.then(streams.xpending(c, key, 'g1'))
+	acked <- result.then(streams.xack(c, key, 'g1', ['1-1']))
+	after_ack <- result.then(streams.xpending(c, key, 'g1'))
+
+	trimmed <- result.then(streams.xtrim(c, key, MaxLen(1), Exact, None))
+	deleted <- result.then(streams.xdel(c, key, ['1-1']))
+
+	_ <- result.then(keys.del(c, [key]))
+	Ok(
+		[
+			eq('xadd with an explicit id', first, '1-1'),
+			that('xadd generated an id', string.contains(generated, '-')),
+			eq('xlen', length, 3),
+			eq('xrange returned every entry', array.length(all), 3),
+			eq(
+				'xrange first entry',
+				match all {
+					[streams.Entry(id, fields), .._] -> (id, fields)
+					[] -> ('', [])
+				},
+				('1-1', [('sensor', 'a'), ('value', '1')]),
+			),
+			eq('xrange COUNT', array.length(limited), 1),
+			eq(
+				'xrevrange starts at the newest',
+				match backwards {
+					[streams.Entry(id, _), .._] -> id
+					[] -> ''
+				},
+				generated,
+			),
+			that('xread returned the stream', match read {
+				Some([streams.StreamEntries(name, entries)]) ->
+					name == key && array.length(entries) == 2
+				_ -> False
+			}),
+			eq('xread past the end is empty', nothing, None),
+			that('xreadgroup delivered one entry', match claimed {
+				Some([streams.StreamEntries(_, [_])]) -> True
+				_ -> False
+			}),
+			eq(
+				'xpending counts the unacked entry',
+				match pending {
+					streams.PendingSummary(n, _, _, _) -> n
+				},
+				1,
+			),
+			eq('xack', acked, 1),
+			eq(
+				'xpending after ack',
+				match after_ack {
+					streams.PendingSummary(n, _, _, _) -> n
+				},
+				0,
+			),
+			eq('xtrim removed two', trimmed, 2),
+			eq('xdel on an already-trimmed id', deleted, 0),
+		],
+	)
+}
+
+// ---------------------------------------------------------------------------
+// Transactions and scripting.
+// ---------------------------------------------------------------------------
+
+fn test_transactions(c Conn) Result(Array(Check), RedisError) {
+	key = k('tx')
+	_ <- result.then(keys.del(c, [key]))
+
+	replies <- result.then(
+		transactions.transaction(c, [['SET', key, '1'], ['INCR', key], ['GET', key]]),
+	)
+	value <- result.then(strings.get(c, key))
+
+	// A watched key changed by someone else must abort the EXEC.
+	_ <- result.then(transactions.watch(c, [key]))
+	_ <- result.then(strings.set(c, key, 'changed-by-someone-else'))
+	_ <- result.then(transactions.multi(c))
+	_ <- result.then(transactions.queue(c, ['SET', key, 'from-transaction']))
+	aborted <- result.then(transactions.exec(c))
+	after <- result.then(strings.get(c, key))
+
+	_ <- result.then(keys.del(c, [key]))
+	Ok(
+		[
+			eq(
+				'transaction ran every command',
+				match replies {
+					Some(vs) -> array.length(vs)
+					None -> 0 - 1
+				},
+				3,
+			),
+			eq('transaction applied', value, Some('2')),
+			eq('a touched WATCH aborts EXEC', aborted, None),
+			eq('the aborted write did not happen', after, Some('changed-by-someone-else')),
+		],
+	)
+}
+
+fn test_scripting(c Conn) Result(Array(Check), RedisError) {
+	key = k('script')
+	_ <- result.then(keys.del(c, [key]))
+
+	sha <- result.then(scripting.script_load(c, 'return redis.call("SET", KEYS[1], ARGV[1])'))
+	cached <- result.then(
+		scripting.script_exists(c, [sha, '0000000000000000000000000000000000000000']),
+	)
+	_ <- result.then(scripting.evalsha(c, sha, [key], ['from-lua']))
+	stored <- result.then(strings.get(c, key))
+	sum <- result.then(
+		scripting.eval(c, 'return tonumber(ARGV[1]) + tonumber(ARGV[2])', [], ['2', '3']),
+	)
+
+	_ <- result.then(keys.del(c, [key]))
+	Ok(
+		[
+			eq('script_exists', cached, [True, False]),
+			eq('evalsha ran the script', stored, Some('from-lua')),
+			eq(
+				'eval returned an integer',
+				match sum {
+					Num(n) -> n
+					_ -> 0 - 1
+				},
+				5,
+			),
+		],
+	)
+}
+
+// ---------------------------------------------------------------------------
+// Redis 8 arrays.
+// ---------------------------------------------------------------------------
+
+fn test_arrays(c Conn) Result(Array(Check), RedisError) {
+	key = k('arr')
+	_ <- result.then(keys.del(c, [key]))
+
+	set <- result.then(arrays.arset(c, key, 0, ['a', 'b', 'c']))
+	got <- result.then(arrays.arget(c, key, 1))
+	gap <- result.then(arrays.arget(c, key, 50))
+	length <- result.then(arrays.arlen(c, key))
+	count <- result.then(arrays.arcount(c, key))
+	several <- result.then(arrays.armget(c, key, [0, 50, 2]))
+	scanned <- result.then(arrays.arscan(c, key, 0, 10, None))
+	// A sparse write leaves a gap: `arlen` counts it, `arcount` does not.
+	_ <- result.then(arrays.armset(c, key, [(20, 'far')]))
+	sparse_len <- result.then(arrays.arlen(c, key))
+	sparse_count <- result.then(arrays.arcount(c, key))
+	matches <- result.then(arrays.argrep(c, key, 0, 30, arrays.Exact('b'), False, None))
+	deleted <- result.then(arrays.ardel(c, key, [0]))
+
+	_ <- result.then(keys.del(c, [key, k('nums')]))
+	_ <- result.then(arrays.arset(c, k('nums'), 0, ['1', '2', '3']))
+	total <- result.then(arrays.arop(c, k('nums'), 0, 2, arrays.Sum))
+
+	_ <- result.then(keys.del(c, [key, k('nums')]))
+	Ok(
+		[
+			eq('arset', set, 3),
+			eq('arget', got, Some('b')),
+			eq('arget on an empty slot', gap, None),
+			eq('arlen', length, 3),
+			eq('arcount', count, 3),
+			eq('armget keeps position', several, [Some('a'), None, Some('c')]),
+			eq('arscan yields index/value pairs', scanned, [(0, 'a'), (1, 'b'), (2, 'c')]),
+			eq('arlen counts the gap', sparse_len, 21),
+			eq('arcount skips the gap', sparse_count, 4),
+			eq('argrep', matches, [1]),
+			eq('ardel', deleted, 1),
+			eq('arop SUM', total, Finite(6.0)),
+		],
+	)
+}
+
+// ---------------------------------------------------------------------------
+// Connection and server.
+// ---------------------------------------------------------------------------
+
+fn test_connection(c Conn) Result(Array(Check), RedisError) {
+	pong <- result.then(connection.ping(c))
+	echoed <- result.then(connection.echo(c, 'hello'))
+	greeting <- result.then(connection.hello(c))
+	_ <- result.then(connection.client_setname(c, 'scarlet-test'))
+	name <- result.then(connection.client_getname(c))
+	id <- result.then(connection.client_id(c))
+
+	size <- result.then(server.dbsize(c))
+	clock <- result.then(server.time(c))
+	(seconds, _) = clock
+	count <- result.then(server.command_count(c))
+	config <- result.then(server.config_get(c, ['maxmemory-policy']))
+	usage <- result.then(server.memory_usage(c, k('does-not-exist'), None))
+
+	Ok(
+		[
+			eq('ping', pong, 'PONG'),
+			eq('echo', echoed, 'hello'),
+			that(
+				'hello reports a version',
+				array.any(greeting, fn(p) match p {
+					(field, _) -> field == 'version'
+				}),
+			),
+			eq('client setname/getname', name, Some('scarlet-test')),
+			that('client id is positive', id > 0),
+			that('dbsize is not negative', size >= 0),
+			that('server time looks like a unix timestamp', seconds > 1700000000),
+			that('command count is plausible', count > 100),
+			eq('config get returns one setting', array.length(config), 1),
+			eq('memory usage of a missing key', usage, None),
+		],
+	)
+}
+
+// ---------------------------------------------------------------------------
+// Pub/Sub.
+// ---------------------------------------------------------------------------
+//
+// Needs two connections: the subscriber's is in subscriber mode and cannot
+// carry a PUBLISH. The publisher runs in its own process, which is exactly the
+// one-connection-per-process rule the client documents.
+
+fn test_pubsub(host String, port Int) Array(Check) {
+	channel = k('channel')
+	match redis.connect(host, port) {
+		Err(e) -> [Check('pubsub connect', False, redis.show_error(e))]
+		Ok(c) -> match pubsub.subscribe(c, [channel]) {
+			Err(e) -> [Check('subscribe', False, redis.show_error(e))]
+			Ok(sub) -> {
+				scheduler.spawn(fn() publish_later(host, port, channel))
+				// A generous timeout: this asserts a message arrives, not how
+				// fast the scheduler got to the publisher.
+				(sub1, first) = pubsub.next_message_within(sub, 3000)
+				(sub2, _) = pubsub.unsubscribe(sub1, [])
+				pubsub.close(sub2)
+				[
+					eq(
+						'subscriber received the published message',
+						first,
+						Ok(Some(pubsub.Message(channel, 'ping'))),
+					),
+				]
+			}
+		}
+	}
+}
+
+fn publish_later(host String, port Int, channel String) Nil {
+	// Long enough that the subscriber is parked in a read before this fires.
+	scheduler.sleep(100)
+	match redis.with_conn(host, port, fn(c) pubsub.publish(c, channel, 'ping')) {
+		Ok(_) -> Nil
+		Err(e) -> println('publisher failed: ${redis.show_error(e)}')
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Error handling.
+// ---------------------------------------------------------------------------
+
+fn test_errors(c Conn) Result(Array(Check), RedisError) {
+	key = k('wrongtype')
+	_ <- result.then(keys.del(c, [key]))
+	_ <- result.then(lists.rpush(c, key, ['a']))
+
+	wrong_type = match strings.get(c, key) {
+		Err(Server(message)) -> string.contains(message, 'WRONGTYPE')
+		_ -> False
+	}
+	bad_arity = match redis.command(c, ['SET', 'only-one-arg']) {
+		Err(Server(_)) -> True
+		_ -> False
+	}
+	unknown = match redis.command(c, ['NOSUCHCOMMAND']) {
+		Err(Server(_)) -> True
+		_ -> False
+	}
+	// The connection must still work after all three refusals.
+	alive <- result.then(connection.ping(c))
+
+	_ <- result.then(keys.del(c, [key]))
+	Ok(
+		[
+			that('a wrong-type operation is a Server error', wrong_type),
+			that('a bad arity is a Server error', bad_arity),
+			that('an unknown command is a Server error', unknown),
+			eq('the connection survives refused commands', alive, 'PONG'),
+		],
+	)
+}
+
+// ---------------------------------------------------------------------------
+// Running.
+// ---------------------------------------------------------------------------
+
+fn run(
+	name String,
+	c Conn,
+	body fn(Conn) Result(Array(Check), RedisError),
+) Array(Check) {
+	match body(c) {
+		Ok(checks) -> checks
+		// A group that died partway still reports — as one failure naming the
+		// group, rather than vanishing from the count.
+		Err(e) -> [Check('${name} (group aborted)', False, redis.show_error(e))]
+	}
+}
+
+fn report(checks Array(Check)) Int {
+	array.each(checks, fn(ch) match ch {
+		Check(name, True, _) -> println('  ok    ${name}')
+		Check(name, False, detail) -> println('  FAIL  ${name}: ${detail}')
+	})
+	array.length(
+		array.filter(checks, fn(ch) match ch {
+			Check(_, ok, _) -> ok == False
+		}),
+	)
+}
+
+fn main(host String, port Int) Nil {
+	outcome = redis.with_conn(host, port, fn(c) {
+		checks = array.fold(
+			[
+				('strings', test_strings),
+				('keys', test_keys),
+				('hashes', test_hashes),
+				('lists', test_lists),
+				('sets', test_sets),
+				('sorted sets', test_sorted_sets),
+				('bitmaps', test_bitmaps),
+				('hyperloglog', test_hyperloglog),
+				('geo', test_geo),
+				('streams', test_streams),
+				('transactions', test_transactions),
+				('scripting', test_scripting),
+				('arrays', test_arrays),
+				('connection and server', test_connection),
+				('errors', test_errors),
+			],
+			[],
+			fn(acc, group) match group {
+				(name, body) -> {
+					println('${name}:')
+					found = run(name, c, body)
+					array.concat(acc, found)
+				}
+			},
+		)
+		println('pub/sub:')
+		Ok(array.concat(checks, test_pubsub(host, port)))
+	})
+	match outcome {
+		Err(e) -> println('suite could not run: ${redis.show_error(e)}')
+		Ok(checks) -> {
+			failures = report(checks)
+			total = array.length(checks)
+			println('')
+			if failures == 0 {
+				println('${int.to_string(total)} checks, all passed')
+			} else {
+				println('${int.to_string(total)} checks, ${int.to_string(failures)} FAILED')
+			}
+		}
+	}
+}
+
+// Defaults match the docker-compose in this repo.
+match process.argv() {
+	[_, host, port] -> match number.parse_int(port) {
+		Ok(p) -> main(host, p)
+		Err(Nil) -> println('port must be a number')
+	}
+	[_, host] -> main(host, 5379)
+	_ -> main('127.0.0.1', 5379)
+}

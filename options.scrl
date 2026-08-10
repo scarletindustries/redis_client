@@ -1,0 +1,170 @@
+// Option types shared by more than one command group.
+//
+// These are sum types rather than bags of nullable fields so that mutually
+// exclusive choices cannot both be made: `SET key v EX 60 KEEPTTL` is a server
+// error, and `SetExpiry` makes it unwritable instead of merely ill-advised.
+
+import ./redis
+
+// A time-to-live, in either unit and either form: relative from now, or an
+// absolute Unix timestamp.
+pub type Ttl {
+	Seconds(n Int)
+	Millis(n Int)
+	AtSeconds(unix Int)
+	AtMillis(unix Int)
+}
+
+pub fn render_ttl(t Ttl) Array(String) {
+	match t {
+		Seconds(n) -> ['EX', redis.arg(n)]
+		Millis(n) -> ['PX', redis.arg(n)]
+		AtSeconds(n) -> ['EXAT', redis.arg(n)]
+		AtMillis(n) -> ['PXAT', redis.arg(n)]
+	}
+}
+
+// EXPIRE / PEXPIRE / EXPIREAT / PEXPIREAT are one operation with four
+// spellings, and the unit-and-form choice `Ttl` already carries is exactly
+// what picks between them. The hash-field versions are the same four names
+// with an H in front, so they reuse this.
+pub fn ttl_verb(t Ttl) String {
+	match t {
+		Seconds(_) -> 'EXPIRE'
+		Millis(_) -> 'PEXPIRE'
+		AtSeconds(_) -> 'EXPIREAT'
+		AtMillis(_) -> 'PEXPIREAT'
+	}
+}
+
+pub fn ttl_amount(t Ttl) String {
+	match t {
+		Seconds(n) -> redis.arg(n)
+		Millis(n) -> redis.arg(n)
+		AtSeconds(n) -> redis.arg(n)
+		AtMillis(n) -> redis.arg(n)
+	}
+}
+
+// When an expiry may be changed. GT and LT compare against the current expiry,
+// and a key with no expiry counts as infinite — so GT never sets one on a
+// persistent key, and LT always does.
+pub type ExpireWhen {
+	Whenever
+	IfNoExpiry
+	IfHasExpiry
+	IfGreater
+	IfLess
+}
+
+pub fn render_expire_when(w ExpireWhen) Array(String) {
+	match w {
+		Whenever -> []
+		IfNoExpiry -> ['NX']
+		IfHasExpiry -> ['XX']
+		IfGreater -> ['GT']
+		IfLess -> ['LT']
+	}
+}
+
+// What a write should do with the key's existing expiry: replace it, or leave
+// it exactly as it was. Commands that write (SET, MSETEX, HSETEX) take this.
+pub type SetExpiry {
+	SetFor(ttl Ttl)
+	KeepTtl
+}
+
+pub fn render_set_expiry(e SetExpiry) Array(String) {
+	match e {
+		SetFor(t) -> render_ttl(t)
+		KeepTtl -> ['KEEPTTL']
+	}
+}
+
+// The same choice for commands that read and may re-arm the expiry (GETEX,
+// HGETEX): set a new one, or clear it entirely.
+pub type GetExpiry {
+	GetFor(ttl Ttl)
+	Persist
+}
+
+pub fn render_get_expiry(e GetExpiry) Array(String) {
+	match e {
+		GetFor(t) -> render_ttl(t)
+		Persist -> ['PERSIST']
+	}
+}
+
+// The existence precondition on a write.
+pub type Condition {
+	Always
+	IfNotExists
+	IfExists
+}
+
+pub fn render_condition(c Condition) Array(String) {
+	match c {
+		Always -> []
+		IfNotExists -> ['NX']
+		IfExists -> ['XX']
+	}
+}
+
+// Which way a range runs, or which direction to sort. Not `Order` — that is a
+// prelude type (Lt/Eq/Gt) and cannot be redefined.
+pub type Direction {
+	Asc
+	Desc
+}
+
+pub fn render_direction(d Direction) Array(String) {
+	match d {
+		Asc -> ['ASC']
+		Desc -> ['DESC']
+	}
+}
+
+// How ZUNIONSTORE / ZINTERSTORE combine the scores of a member that appears in
+// more than one input set.
+pub type Aggregate {
+	Sum
+	Min
+	Max
+}
+
+pub fn render_aggregate(a Aggregate) Array(String) {
+	match a {
+		Sum -> ['AGGREGATE', 'SUM']
+		Min -> ['AGGREGATE', 'MIN']
+		Max -> ['AGGREGATE', 'MAX']
+	}
+}
+
+// The distance unit for the geo commands.
+pub type Unit {
+	Meters
+	Kilometers
+	Miles
+	Feet
+}
+
+pub fn render_unit(u Unit) String {
+	match u {
+		Meters -> 'm'
+		Kilometers -> 'km'
+		Miles -> 'mi'
+		Feet -> 'ft'
+	}
+}
+
+// LIMIT offset count, shared by the range and geo queries.
+pub type Limit {
+	offset Int
+	count Int
+}
+
+pub fn render_limit(l Limit) Array(String) {
+	match l {
+		Limit(offset, count) -> ['LIMIT', redis.arg(offset), redis.arg(count)]
+	}
+}

@@ -1,0 +1,345 @@
+// Pub/Sub.
+//
+// Publishing is an ordinary command and works on an ordinary `Conn`.
+// Subscribing is not: SUBSCRIBE puts the connection into a mode where the
+// server sends messages nobody asked for, whenever they happen. That breaks
+// the one assumption `Conn` is built on — that a reply arrives only in answer
+// to a command — so a subscriber gets its own type.
+//
+// `Subscription` is threaded through each call, returning a new one alongside
+// each message, because here the leftover read buffer is real state: several
+// messages can arrive in a single TCP segment, and a subscriber that dropped
+// the tail of a read would lose every message that shared a packet with
+// another. This is exactly the buffer `Conn` was able to prove empty and
+// therefore does not carry.
+//
+// A `Subscription` takes over the socket of the `Conn` it was made from. That
+// connection must not be used for commands again, and closing either closes
+// the same socket.
+
+import scarlet/array
+import scarlet/binary
+import scarlet/net/error.{NetError, TimedOut, UnexpectedEof}
+import scarlet/net/socket.{Closed, Data, Socket}
+import ./redis.{Conn, Net, RedisError}
+import ./resp.{Bad, Done, NeedMore}
+
+const READ_SIZE = 65536
+
+pub opaque type Subscription {
+	sock Socket
+	// Bytes received but not yet consumed by a message.
+	buf Binary
+}
+
+// What the server can send to a subscriber.
+pub type Push {
+	// A message on a channel subscribed to by name.
+	Message(channel String, payload String)
+	// A message on a channel that matched a pattern subscription. Both the
+	// pattern and the actual channel are reported, since one pattern can match
+	// many channels.
+	PatternMessage(pattern String, channel String, payload String)
+	// A message on a shard channel (SSUBSCRIBE).
+	ShardMessage(channel String, payload String)
+	// Confirmation of a subscription change, with the number of subscriptions
+	// this connection now holds. When that count reaches zero the connection
+	// leaves subscriber mode and can be used for commands again.
+	Subscribed(channel String, count Int)
+	Unsubscribed(channel String, count Int)
+}
+
+// ---------------------------------------------------------------------------
+// Publishing — ordinary commands on an ordinary connection.
+// ---------------------------------------------------------------------------
+
+// Post a message, returning how many subscribers received it. That count does
+// not include subscribers on other shards of a cluster.
+pub fn publish(c Conn, channel String, payload String) Result(Int, RedisError) {
+	redis.expect_int(redis.command(c, ['PUBLISH', channel, payload]))
+}
+
+pub fn spublish(c Conn, channel String, payload String) Result(Int, RedisError) {
+	redis.expect_int(redis.command(c, ['SPUBLISH', channel, payload]))
+}
+
+// Channels with at least one subscriber, optionally filtered by a glob
+// pattern. Pattern subscriptions are not counted here — `numpat` reports those.
+pub fn channels(c Conn, pattern Option(String)) Result(Array(String), RedisError) {
+	redis.expect_strings(
+		redis.command(c, redis.parts([['PUBSUB', 'CHANNELS'], redis.when_some(pattern, fn(p) [p])])),
+	)
+}
+
+pub fn numsub(c Conn, of_channels Array(String)) Result(Array((String, Int)), RedisError) {
+	counts(redis.command(c, redis.parts([['PUBSUB', 'NUMSUB'], of_channels])))
+}
+
+// How many pattern subscriptions exist across the server.
+pub fn numpat(c Conn) Result(Int, RedisError) {
+	redis.expect_int(redis.command(c, ['PUBSUB', 'NUMPAT']))
+}
+
+pub fn shard_channels(c Conn, pattern Option(String)) Result(Array(String), RedisError) {
+	redis.expect_strings(
+		redis.command(
+			c,
+			redis.parts([['PUBSUB', 'SHARDCHANNELS'], redis.when_some(pattern, fn(p) [p])]),
+		),
+	)
+}
+
+pub fn shard_numsub(c Conn, of_channels Array(String)) Result(Array((String, Int)), RedisError) {
+	counts(redis.command(c, redis.parts([['PUBSUB', 'SHARDNUMSUB'], of_channels])))
+}
+
+// NUMSUB answers with a flat channel/count array.
+fn counts(reply Result(resp.Value, RedisError)) Result(Array((String, Int)), RedisError) {
+	match redis.expect_values(reply) {
+		Err(e) -> Err(e)
+		Ok(values) -> pair_counts(values)
+	}
+}
+
+fn pair_counts(values Array(resp.Value)) Result(Array((String, Int)), RedisError) {
+	match values {
+		[] -> Ok([])
+		[
+			name,
+			count,
+			..rest,
+		] -> match (redis.value_text(name), redis.value_int(count), pair_counts(rest)) {
+			(Ok(n), Ok(k), Ok(more)) -> Ok(array.concat([(n, k)], more))
+			(Err(e), _, _) -> Err(e)
+			(_, Err(e), _) -> Err(e)
+			(_, _, Err(e)) -> Err(e)
+		}
+		_ -> Err(redis.Protocol('expected channel/count pairs'))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Subscribing.
+// ---------------------------------------------------------------------------
+
+// Take a connection into subscriber mode. The confirmations the server sends —
+// one per channel — are consumed here, so the first message from
+// `next_message` is real traffic rather than bookkeeping.
+pub fn subscribe(c Conn, to_channels Array(String)) Result(Subscription, RedisError) {
+	start(c, 'SUBSCRIBE', to_channels)
+}
+
+// Subscribe by glob pattern. `news.*` catches every channel under `news.`.
+pub fn psubscribe(c Conn, patterns Array(String)) Result(Subscription, RedisError) {
+	start(c, 'PSUBSCRIBE', patterns)
+}
+
+// Subscribe to shard channels, which in a cluster stay on one shard rather
+// than being broadcast to every node.
+pub fn ssubscribe(c Conn, to_channels Array(String)) Result(Subscription, RedisError) {
+	start(c, 'SSUBSCRIBE', to_channels)
+}
+
+fn start(c Conn, verb String, names Array(String)) Result(Subscription, RedisError) {
+	sock = redis.socket_of(c)
+	match socket.write(
+		sock,
+		resp.encode_command(array.map(array.concat([verb], names), binary.from_string)),
+	) {
+		Err(e) -> Err(Net(e))
+		Ok(Nil) -> drain(Subscription(sock: sock, buf: <<>>), array.length(names))
+	}
+}
+
+// Consume exactly one confirmation per name asked for, so the subscription is
+// fully established before it is handed back.
+fn drain(s Subscription, remaining Int) Result(Subscription, RedisError) {
+	if remaining <= 0 {
+		Ok(s)
+	} else {
+		match next_message(s) {
+			(next, Ok(Subscribed(_, _))) -> drain(next, remaining - 1)
+			(next, Ok(Unsubscribed(_, _))) -> drain(next, remaining - 1)
+			(_, Ok(_)) -> Err(redis.Protocol('expected a subscription confirmation'))
+			(_, Err(e)) -> Err(e)
+		}
+	}
+}
+
+// Add channels to an existing subscription.
+pub fn subscribe_more(
+	s Subscription,
+	to_channels Array(String),
+) (Subscription, Result(Nil, RedisError)) {
+	send(s, 'SUBSCRIBE', to_channels)
+}
+
+// Stop listening. With an empty list, every channel is dropped. The
+// confirmations arrive as ordinary `Unsubscribed` pushes from `next_message`,
+// and once their count reaches 0 the connection is out of subscriber mode.
+pub fn unsubscribe(
+	s Subscription,
+	from_channels Array(String),
+) (Subscription, Result(Nil, RedisError)) {
+	send(s, 'UNSUBSCRIBE', from_channels)
+}
+
+pub fn punsubscribe(
+	s Subscription,
+	patterns Array(String),
+) (Subscription, Result(Nil, RedisError)) {
+	send(s, 'PUNSUBSCRIBE', patterns)
+}
+
+pub fn sunsubscribe(
+	s Subscription,
+	from_channels Array(String),
+) (Subscription, Result(Nil, RedisError)) {
+	send(s, 'SUNSUBSCRIBE', from_channels)
+}
+
+fn send(s Subscription, verb String, names Array(String)) (Subscription, Result(Nil, RedisError)) {
+	request = resp.encode_command(array.map(array.concat([verb], names), binary.from_string))
+	match socket.write(s.sock, request) {
+		Ok(Nil) -> (s, Ok(Nil))
+		Err(e) -> (s, Err(Net(e)))
+	}
+}
+
+pub fn close(s Subscription) Nil {
+	socket.close(s.sock) or Nil
+}
+
+// ---------------------------------------------------------------------------
+// Receiving.
+// ---------------------------------------------------------------------------
+
+// Wait for the next message, parking this process until one arrives. Other
+// processes keep running; this one is idle, not spinning.
+pub fn next_message(s Subscription) (Subscription, Result(Push, RedisError)) {
+	match take(s) {
+		(next, Ok(value)) -> (next, decode(value))
+		(next, Err(e)) -> (next, Err(e))
+	}
+}
+
+// The same, but giving up after `timeout_ms` with `Ok(None)`. For a loop that
+// has to do something else periodically — check a shutdown flag, emit a
+// heartbeat — rather than block for ever.
+pub fn next_message_within(
+	s Subscription,
+	timeout_ms Int,
+) (Subscription, Result(Option(Push), RedisError)) {
+	match take_within(s, timeout_ms) {
+		(next, Ok(None)) -> (next, Ok(None))
+		(next, Ok(Some(value))) -> match decode(value) {
+			Ok(push) -> (next, Ok(Some(push)))
+			Err(e) -> (next, Err(e))
+		}
+		(next, Err(e)) -> (next, Err(e))
+	}
+}
+
+// Parse one message out of the buffer, reading more only when what is there is
+// not yet a whole one. The leftover is kept: it may already hold the next
+// message in full.
+fn take(s Subscription) (Subscription, Result(resp.Value, RedisError)) {
+	match resp.parse(s.buf, 0) {
+		Done(value, next) -> (Subscription(..s, buf: rest(s.buf, next)), Ok(value))
+		Bad(why) -> (s, Err(redis.Protocol(why)))
+		NeedMore -> match socket.read(s.sock, READ_SIZE) {
+			Ok(Data(chunk)) -> take(Subscription(..s, buf: binary.append(s.buf, chunk)))
+			Ok(Closed) -> (s, Err(Net(UnexpectedEof)))
+			Err(e) -> (s, Err(Net(e)))
+		}
+	}
+}
+
+fn take_within(
+	s Subscription,
+	timeout_ms Int,
+) (Subscription, Result(Option(resp.Value), RedisError)) {
+	match resp.parse(s.buf, 0) {
+		Done(value, next) -> (Subscription(..s, buf: rest(s.buf, next)), Ok(Some(value)))
+		Bad(why) -> (s, Err(redis.Protocol(why)))
+		NeedMore -> match socket.read_within(s.sock, READ_SIZE, timeout_ms) {
+			Ok(Data(chunk)) ->
+				take_within(Subscription(..s, buf: binary.append(s.buf, chunk)), timeout_ms)
+			Ok(Closed) -> (s, Err(Net(UnexpectedEof)))
+			// Not a failure: the deadline passed with nothing to report. Any
+			// partial message already read stays in the buffer for next time.
+			Err(TimedOut) -> (s, Ok(None))
+			Err(e) -> (s, Err(Net(e)))
+		}
+	}
+}
+
+fn rest(buf Binary, from Int) Binary {
+	binary.slice_bytes(buf, from, binary.byte_size(buf) - from)
+}
+
+// Every push is an array whose first element names the kind.
+fn decode(value resp.Value) Result(Push, RedisError) {
+	match redis.expect_values(Ok(value)) {
+		Err(e) -> Err(e)
+		Ok([kind, a, b]) -> match redis.value_text(kind) {
+			Err(e) -> Err(e)
+			Ok(name) -> two(name, a, b)
+		}
+		Ok([kind, a, b, c]) -> match redis.value_text(kind) {
+			Err(e) -> Err(e)
+			Ok(name) -> three(name, a, b, c)
+		}
+		Ok(_) -> Err(redis.Protocol('unexpected pub/sub push shape'))
+	}
+}
+
+fn two(name String, a resp.Value, b resp.Value) Result(Push, RedisError) {
+	match name {
+		'message' -> match (redis.value_text(a), redis.value_text(b)) {
+			(Ok(channel), Ok(payload)) -> Ok(Message(channel, payload))
+			(Err(e), _) -> Err(e)
+			(_, Err(e)) -> Err(e)
+		}
+		'smessage' -> match (redis.value_text(a), redis.value_text(b)) {
+			(Ok(channel), Ok(payload)) -> Ok(ShardMessage(channel, payload))
+			(Err(e), _) -> Err(e)
+			(_, Err(e)) -> Err(e)
+		}
+		'subscribe' -> confirmation(a, b, True)
+		'psubscribe' -> confirmation(a, b, True)
+		'ssubscribe' -> confirmation(a, b, True)
+		'unsubscribe' -> confirmation(a, b, False)
+		'punsubscribe' -> confirmation(a, b, False)
+		'sunsubscribe' -> confirmation(a, b, False)
+		other -> Err(redis.Protocol('unknown pub/sub push: ${other}'))
+	}
+}
+
+fn three(name String, a resp.Value, b resp.Value, c resp.Value) Result(Push, RedisError) {
+	match name {
+		'pmessage' -> match (redis.value_text(a), redis.value_text(b), redis.value_text(c)) {
+			(Ok(pattern), Ok(channel), Ok(payload)) -> Ok(PatternMessage(pattern, channel, payload))
+			(Err(e), _, _) -> Err(e)
+			(_, Err(e), _) -> Err(e)
+			(_, _, Err(e)) -> Err(e)
+		}
+		other -> Err(redis.Protocol('unknown three-part pub/sub push: ${other}'))
+	}
+}
+
+// An unsubscribe-all reports a null channel, since it names no one channel.
+fn confirmation(a resp.Value, b resp.Value, subscribed Bool) Result(Push, RedisError) {
+	channel = match redis.value_text(a) {
+		Ok(name) -> name
+		Err(_) -> ''
+	}
+	match redis.value_int(b) {
+		Err(e) -> Err(e)
+		Ok(count) -> if subscribed {
+			Ok(Subscribed(channel, count))
+		} else {
+			Ok(Unsubscribed(channel, count))
+		}
+	}
+}

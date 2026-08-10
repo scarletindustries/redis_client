@@ -1,0 +1,184 @@
+// A tour of the client.
+//
+//	scarlet run src/main.scrl [host] [port]
+//
+// `conn <- redis.with_conn(..)` hands the rest of the block to `with_conn` as a
+// callback, so the connection closes on the way out however the block ends, and
+// `value <- result.then(..)` binds on Ok and short-circuits the whole script on
+// Err. Between them a sequence of commands reads as a sequence of commands.
+
+import scarlet/array
+import scarlet/process
+import scarlet/result
+import scarlet/scheduler
+import scarlet/string
+import ../number.{Finite}
+import ../redis.{Conn, RedisError}
+import ../hashes
+import ../keys
+import ../lists.{Left, Right}
+import ../options.{Always, Seconds, SetFor}
+import ../pubsub.{Message}
+import ../server
+import ../sets
+import ../sorted_sets
+import ../streams
+import ../strings
+import ../transactions
+
+const PREFIX = 'scrl:demo:'
+
+fn k(name String) String {
+	'${PREFIX}${name}'
+}
+
+fn tour(c Conn) Result(Nil, RedisError) {
+	version <- result.then(server.info_section(c, 'server'))
+	println('connected to redis ${field(version, 'redis_version:')}')
+	_ <- result.then(keys.del(c, [k('greeting'), k('user'), k('queue'), k('board'), k('events')]))
+
+	// Strings, with an expiry attached to the same write.
+	_ <- result.then(
+		strings.set_opts(c, k('greeting'), 'hello from scarlet', Always, Some(SetFor(Seconds(60)))),
+	)
+	greeting <- result.then(strings.get(c, k('greeting')))
+	left <- result.then(keys.ttl(c, k('greeting')))
+	println('string  GET -> ${show(greeting)}, ttl ${string.inspect(left)}')
+
+	// Hashes.
+	_ <- result.then(hashes.hset_many(c, k('user'), [('name', 'ada'), ('logins', '0')]))
+	logins <- result.then(hashes.hincrby(c, k('user'), 'logins', 1))
+	user <- result.then(hashes.hgetall(c, k('user')))
+	println('hash    HGETALL -> ${string.inspect(user)} (logins now ${logins})')
+
+	// Lists as a queue.
+	_ <- result.then(lists.rpush(c, k('queue'), ['job-1', 'job-2', 'job-3']))
+	taken <- result.then(lists.lmove(c, k('queue'), k('queue:working'), Left, Right))
+	depth <- result.then(lists.llen(c, k('queue')))
+	println('list    LMOVE took ${show(taken)}, ${depth} left to do')
+
+	// Sorted sets as a leaderboard.
+	_ <- result.then(
+		sorted_sets.zadd(
+			c,
+			k('board'),
+			[('ada', Finite(120.0)), ('grace', Finite(310.0)), ('alan', Finite(95.0))],
+		),
+	)
+	top <- result.then(sorted_sets.zrange_withscores(c, k('board'), 0, 1, True))
+	rank <- result.then(sorted_sets.zrank_withscore(c, k('board'), 'ada'))
+	println('zset    top two -> ${string.inspect(top)}, ada is ${string.inspect(rank)}')
+
+	// Streams as an event log.
+	_ <- result.then(streams.xadd(c, k('events'), None, [('kind', 'login'), ('user', 'ada')]))
+	_ <- result.then(streams.xadd(c, k('events'), None, [('kind', 'logout'), ('user', 'ada')]))
+	events <- result.then(streams.xrange(c, k('events'), '-', '+', None))
+	println('stream  ${array.length(events)} entries, first ${string.inspect(first_entry(events))}')
+
+	// A transaction: both commands run with nothing interleaved.
+	replies <- result.then(
+		transactions.transaction(c, [['INCR', k('counter')], ['INCR', k('counter')]]),
+	)
+	println('multi   EXEC returned ${string.inspect(replies)}')
+
+	// Sets.
+	_ <- result.then(sets.sadd(c, k('tags'), ['db', 'cache', 'kv']))
+	overlap <- result.then(sets.sintercard(c, [k('tags'), k('tags')], None))
+	println('set     SINTERCARD with itself -> ${overlap}')
+
+	// An error reply is a typed failure, and the connection survives it.
+	refused = match strings.incr(c, k('greeting')) {
+		Err(e) -> redis.show_error(e)
+		Ok(n) -> 'unexpectedly incremented to ${n}'
+	}
+	println('error   INCR on a string -> ${refused}')
+
+	_ <- result.then(
+		keys.del(
+			c,
+			[
+				k('greeting'),
+				k('user'),
+				k('queue'),
+				k('queue:working'),
+				k('board'),
+				k('events'),
+				k('counter'),
+				k('tags'),
+			],
+		),
+	)
+	Ok(Nil)
+}
+
+// Pub/Sub needs two connections: a subscriber's is in subscriber mode and
+// cannot carry a PUBLISH. One connection per process is the rule anyway.
+fn pubsub_demo(host String, port Int) Nil {
+	channel = k('news')
+	match redis.connect(host, port) {
+		Err(e) -> println('pubsub  connect failed: ${redis.show_error(e)}')
+		Ok(c) -> match pubsub.subscribe(c, [channel]) {
+			Err(e) -> println('pubsub  subscribe failed: ${redis.show_error(e)}')
+			Ok(sub) -> {
+				scheduler.spawn(fn() publish_later(host, port, channel))
+				(after, first) = pubsub.next_message_within(sub, 3000)
+				match first {
+					Ok(Some(Message(from, payload))) -> println('pubsub  ${from} -> ${payload}')
+					Ok(Some(other)) -> println('pubsub  ${string.inspect(other)}')
+					Ok(None) -> println('pubsub  nothing arrived within 3s')
+					Err(e) -> println('pubsub  ${redis.show_error(e)}')
+				}
+				pubsub.close(after)
+			}
+		}
+	}
+}
+
+fn publish_later(host String, port Int, channel String) Nil {
+	scheduler.sleep(100)
+	match redis.with_conn(host, port, fn(c) pubsub.publish(c, channel, 'scarlet speaks resp')) {
+		Ok(_) -> Nil
+		Err(e) -> println('publisher failed: ${redis.show_error(e)}')
+	}
+}
+
+fn show(v Option(String)) String {
+	match v {
+		Some(s) -> s
+		None -> '(nil)'
+	}
+}
+
+fn first_entry(entries Array(streams.Entry)) Array((String, String)) {
+	match entries {
+		[streams.Entry(_, fields), .._] -> fields
+		[] -> []
+	}
+}
+
+// Pull one `name:value` out of an INFO section.
+fn field(info String, name String) String {
+	match array.find(string.split(info, '\r\n'), fn(line) string.contains(line, name)) {
+		Some(line) -> string.trim(match string.split(line, ':') {
+			[_, value, .._] -> value
+			_ -> line
+		})
+		None -> 'unknown'
+	}
+}
+
+fn main(host String, port Int) Nil {
+	match redis.with_conn(host, port, tour) {
+		Ok(Nil) -> pubsub_demo(host, port)
+		Err(e) -> println('could not run against ${host}:${port} — ${redis.show_error(e)}')
+	}
+}
+
+match process.argv() {
+	[_, host, port] -> match number.parse_int(port) {
+		Ok(p) -> main(host, p)
+		Err(Nil) -> println('port must be a number')
+	}
+	[_, host] -> main(host, 5379)
+	_ -> main('127.0.0.1', 5379)
+}

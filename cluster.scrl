@@ -1,0 +1,200 @@
+// Redis Cluster.
+//
+// These commands work against a cluster node, but this client does not itself
+// route: it holds one connection to one node, and a key that lives on another
+// shard comes back as a `Server` error carrying a MOVED or ASK redirect. What
+// is here is enough to read the topology and to drive a node by hand — the
+// pieces a routing layer would be built from, not the routing layer.
+
+import scarlet/array
+import ./redis.{Conn, RedisError}
+
+// The hash slot a key maps to, computed by the server with the same CRC16 it
+// uses internally — including the `{...}` hash-tag rule, which is what lets
+// related keys be pinned to one slot.
+pub fn keyslot(c Conn, key String) Result(Int, RedisError) {
+	redis.expect_int(redis.command(c, ['CLUSTER', 'KEYSLOT', key]))
+}
+
+// This node's ID.
+pub fn myid(c Conn) Result(String, RedisError) {
+	redis.expect_string(redis.command(c, ['CLUSTER', 'MYID']))
+}
+
+pub fn myshardid(c Conn) Result(String, RedisError) {
+	redis.expect_string(redis.command(c, ['CLUSTER', 'MYSHARDID']))
+}
+
+// Cluster state and statistics, in the server's `field:value` text format.
+pub fn info(c Conn) Result(String, RedisError) {
+	redis.expect_string(redis.command(c, ['CLUSTER', 'INFO']))
+}
+
+// The full node table, one line per node, in the gossip format Redis writes to
+// nodes.conf.
+pub fn nodes(c Conn) Result(String, RedisError) {
+	redis.expect_string(redis.command(c, ['CLUSTER', 'NODES']))
+}
+
+// Slot ranges and the nodes serving them. Nested and version-dependent, so it
+// comes back raw; `shards` is the newer and more complete form.
+pub fn slots(c Conn) Result(Array(resp.Value), RedisError) {
+	redis.expect_values(redis.command(c, ['CLUSTER', 'SLOTS']))
+}
+
+pub fn shards(c Conn) Result(Array(resp.Value), RedisError) {
+	redis.expect_values(redis.command(c, ['CLUSTER', 'SHARDS']))
+}
+
+pub fn links(c Conn) Result(Array(resp.Value), RedisError) {
+	redis.expect_values(redis.command(c, ['CLUSTER', 'LINKS']))
+}
+
+// The replicas of a given primary.
+pub fn replicas(c Conn, node_id String) Result(Array(String), RedisError) {
+	redis.expect_strings(redis.command(c, ['CLUSTER', 'REPLICAS', node_id]))
+}
+
+pub fn count_keys_in_slot(c Conn, slot Int) Result(Int, RedisError) {
+	redis.expect_int(redis.command(c, ['CLUSTER', 'COUNTKEYSINSLOT', redis.arg(slot)]))
+}
+
+pub fn get_keys_in_slot(c Conn, slot Int, count Int) Result(Array(String), RedisError) {
+	redis.expect_strings(
+		redis.command(c, ['CLUSTER', 'GETKEYSINSLOT', redis.arg(slot), redis.arg(count)]),
+	)
+}
+
+// ---------------------------------------------------------------------------
+// Membership and slot administration.
+// ---------------------------------------------------------------------------
+
+// Introduce this node to another, so the gossip protocol can spread from there.
+pub fn meet(c Conn, host String, port Int) Result(Nil, RedisError) {
+	redis.expect_ok(redis.command(c, ['CLUSTER', 'MEET', host, redis.arg(port)]))
+}
+
+pub fn forget(c Conn, node_id String) Result(Nil, RedisError) {
+	redis.expect_ok(redis.command(c, ['CLUSTER', 'FORGET', node_id]))
+}
+
+// Make this node a replica of the given primary.
+pub fn replicate(c Conn, node_id String) Result(Nil, RedisError) {
+	redis.expect_ok(redis.command(c, ['CLUSTER', 'REPLICATE', node_id]))
+}
+
+pub fn addslots(c Conn, slots_ Array(Int)) Result(Nil, RedisError) {
+	redis.expect_ok(
+		redis.command(c, redis.parts([['CLUSTER', 'ADDSLOTS'], array.map(slots_, redis.arg)])),
+	)
+}
+
+pub fn delslots(c Conn, slots_ Array(Int)) Result(Nil, RedisError) {
+	redis.expect_ok(
+		redis.command(c, redis.parts([['CLUSTER', 'DELSLOTS'], array.map(slots_, redis.arg)])),
+	)
+}
+
+// The range forms, which take start/end pairs rather than every slot number.
+pub fn addslotsrange(c Conn, ranges Array((Int, Int))) Result(Nil, RedisError) {
+	redis.expect_ok(
+		redis.command(c, redis.parts([['CLUSTER', 'ADDSLOTSRANGE'], flatten_ranges(ranges)])),
+	)
+}
+
+pub fn delslotsrange(c Conn, ranges Array((Int, Int))) Result(Nil, RedisError) {
+	redis.expect_ok(
+		redis.command(c, redis.parts([['CLUSTER', 'DELSLOTSRANGE'], flatten_ranges(ranges)])),
+	)
+}
+
+fn flatten_ranges(ranges Array((Int, Int))) Array(String) {
+	array.fold(ranges, [], fn(acc, r) match r {
+		(start, end) -> array.concat(acc, [redis.arg(start), redis.arg(end)])
+	})
+}
+
+// Where a slot lives, or which way it is being moved during a resharding.
+pub type SlotState {
+	// This node now owns the slot.
+	Stable(node_id String)
+	// Keys not found here should be redirected to `node_id` with ASK.
+	Migrating(node_id String)
+	// Accept ASK-redirected writes for this slot from `node_id`.
+	Importing(node_id String)
+	// Forget any migrating/importing state.
+	Stopped
+}
+
+pub fn setslot(c Conn, slot Int, state SlotState) Result(Nil, RedisError) {
+	tail = match state {
+		Stable(id) -> ['NODE', id]
+		Migrating(id) -> ['MIGRATING', id]
+		Importing(id) -> ['IMPORTING', id]
+		Stopped -> ['STABLE']
+	}
+	redis.expect_ok(redis.command(c, redis.parts([['CLUSTER', 'SETSLOT', redis.arg(slot)], tail])))
+}
+
+// Promote this replica to primary. `force` skips agreement with the old
+// primary; `takeover` skips agreement with the whole cluster, which can split
+// it — the escape hatch for a disaster, not a routine failover.
+pub fn failover(c Conn, force Bool, takeover Bool) Result(Nil, RedisError) {
+	redis.expect_ok(
+		redis.command(
+			c,
+			redis.parts(
+				[
+					['CLUSTER', 'FAILOVER'],
+					redis.when(force, ['FORCE']),
+					redis.when(takeover, ['TAKEOVER']),
+				],
+			),
+		),
+	)
+}
+
+// Wipe this node's slot assignments, or its whole cluster identity with `hard`.
+pub fn reset(c Conn, hard Bool) Result(Nil, RedisError) {
+	mode = if hard { 'HARD' } else { 'SOFT' }
+	redis.expect_ok(redis.command(c, ['CLUSTER', 'RESET', mode]))
+}
+
+pub fn flushslots(c Conn) Result(Nil, RedisError) {
+	redis.expect_ok(redis.command(c, ['CLUSTER', 'FLUSHSLOTS']))
+}
+
+pub fn bumpepoch(c Conn) Result(String, RedisError) {
+	redis.expect_status(redis.command(c, ['CLUSTER', 'BUMPEPOCH']))
+}
+
+pub fn set_config_epoch(c Conn, epoch Int) Result(Nil, RedisError) {
+	redis.expect_ok(redis.command(c, ['CLUSTER', 'SET-CONFIG-EPOCH', redis.arg(epoch)]))
+}
+
+pub fn saveconfig(c Conn) Result(Nil, RedisError) {
+	redis.expect_ok(redis.command(c, ['CLUSTER', 'SAVECONFIG']))
+}
+
+pub fn count_failure_reports(c Conn, node_id String) Result(Int, RedisError) {
+	redis.expect_int(redis.command(c, ['CLUSTER', 'COUNT-FAILURE-REPORTS', node_id]))
+}
+
+// ---------------------------------------------------------------------------
+// Per-connection cluster mode.
+// ---------------------------------------------------------------------------
+
+// Announce that the next command follows an ASK redirect. Applies to one
+// command only, and must be sent immediately before it.
+pub fn asking(c Conn) Result(Nil, RedisError) {
+	redis.expect_ok(redis.command(c, ['ASKING']))
+}
+
+// Allow reads to be served by a replica for the rest of this connection.
+pub fn readonly(c Conn) Result(Nil, RedisError) {
+	redis.expect_ok(redis.command(c, ['READONLY']))
+}
+
+pub fn readwrite(c Conn) Result(Nil, RedisError) {
+	redis.expect_ok(redis.command(c, ['READWRITE']))
+}

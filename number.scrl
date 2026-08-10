@@ -1,0 +1,231 @@
+// Numeric parsing over ASCII bytes.
+//
+// This exists because the stdlib has no signed-integer or floating-point
+// parser: `binary.parse_int` reads unsigned digits only, and nothing anywhere
+// turns '1.5' into a Float. Redis sends every number as ASCII — integers in
+// `:` replies, scores and float counters as bulk strings — so a client cannot
+// avoid writing one.
+//
+// Scarlet floats have no infinity and no NaN: `1.0 / 0.0` is `0.0`, not `inf`.
+// Redis sorted-set scores really can be infinite (`ZADD key +inf member`, and
+// `-inf`/`+inf` are the default bounds of a score range), so a score is
+// `Score` — a sum type — rather than a Float that would silently render an
+// infinite score as zero.
+//
+// Accuracy: a decimal of up to 15 significant digits with an exponent within
+// ±22 parses to the exact nearest double, because the integer mantissa and the
+// power of ten are both exactly representable and the single multiply (or
+// divide) is then correctly rounded. Redis emits the shortest representation
+// that round-trips, which is 15 digits or fewer for all but a small minority
+// of doubles, so that path covers nearly everything. A 16- or 17-digit input
+// rounds twice — once converting the mantissa, once scaling — and can land one
+// ULP from the true nearest double. Closing that gap needs arbitrary-precision
+// arithmetic, which is a bigger machine than a client library should carry.
+
+import scarlet/binary.{Dec}
+import scarlet/float
+import scarlet/string
+
+// A sorted-set score, or any Redis double.
+pub type Score {
+	Finite(value Float)
+	PosInf
+	NegInf
+}
+
+// Redis spells the infinities `+inf` / `-inf` on the wire and accepts `inf`
+// too; `float.to_string` is round-trip exact for the finite case.
+pub fn score_to_string(s Score) String {
+	match s {
+		Finite(v) -> float.to_string(v)
+		PosInf -> '+inf'
+		NegInf -> '-inf'
+	}
+}
+
+pub fn score_from_float(v Float) Score {
+	Finite(v)
+}
+
+// The finite value, or `default` for an infinity. For callers that would
+// rather not match — but who are then choosing what infinity collapses to,
+// which is the point.
+pub fn score_or(s Score, default Float) Float {
+	match s {
+		Finite(v) -> v
+		PosInf -> default
+		NegInf -> default
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Parsing.
+// ---------------------------------------------------------------------------
+
+pub fn parse_score(text String) Result(Score, Nil) {
+	parse_score_binary(binary.from_string(string.trim(text)))
+}
+
+// A finite float. An infinity parses fine as a `Score` but is an error here,
+// because there is no Float that could carry it.
+pub fn parse_float(text String) Result(Float, Nil) {
+	match parse_score(text) {
+		Ok(Finite(v)) -> Ok(v)
+		Ok(_) -> Err(Nil)
+		Err(Nil) -> Err(Nil)
+	}
+}
+
+pub fn parse_score_binary(b Binary) Result(Score, Nil) {
+	size = binary.byte_size(b)
+	if size == 0 {
+		Err(Nil)
+	} else {
+		match binary.byte_at(b, 0) {
+			45 -> negate(magnitude(b, 1, size))
+			43 -> magnitude(b, 1, size)
+			_ -> magnitude(b, 0, size)
+		}
+	}
+}
+
+// A signed ASCII integer. `binary.parse_int` handles the digits; this handles
+// the sign it rejects.
+pub fn parse_int_binary(b Binary) Result(Int, Nil) {
+	size = binary.byte_size(b)
+	if size == 0 {
+		Err(Nil)
+	} else {
+		match binary.byte_at(b, 0) {
+			45 -> match binary.parse_int(binary.slice_bytes(b, 1, size - 1), Dec) {
+				Ok(n) -> Ok(0 - n)
+				Err(Nil) -> Err(Nil)
+			}
+			43 -> binary.parse_int(binary.slice_bytes(b, 1, size - 1), Dec)
+			_ -> binary.parse_int(b, Dec)
+		}
+	}
+}
+
+pub fn parse_int(text String) Result(Int, Nil) {
+	parse_int_binary(binary.from_string(string.trim(text)))
+}
+
+fn negate(r Result(Score, Nil)) Result(Score, Nil) {
+	match r {
+		Ok(Finite(v)) -> Ok(Finite(0.0 - v))
+		Ok(PosInf) -> Ok(NegInf)
+		Ok(NegInf) -> Ok(PosInf)
+		Err(Nil) -> Err(Nil)
+	}
+}
+
+// The unsigned part: either an infinity spelling, or digits with an optional
+// fraction and an optional exponent.
+fn magnitude(b Binary, start Int, size Int) Result(Score, Nil) {
+	rest = binary.slice_bytes(b, start, size - start)
+	if binary.eq_ignore_ascii_case(rest, <<'inf'>>) ||
+	binary.eq_ignore_ascii_case(rest, <<'infinity'>>) {
+		Ok(PosInf)
+	} else {
+		(int_part, after_int, int_taken, int_dropped) = digits(b, start, size, 0, 0, 0)
+		(
+			mantissa,
+			after_frac,
+			taken,
+			frac_dropped,
+		) = if after_int < size && binary.byte_at(b, after_int) == 46 {
+			digits(b, after_int + 1, size, int_part, int_taken, int_dropped)
+		} else {
+			(int_part, after_int, int_taken, int_dropped)
+		}
+		frac_digits = taken - int_taken
+		if taken + int_dropped + frac_dropped == 0 {
+			Err(Nil)
+		} else {
+			match exponent(b, after_frac, size) {
+				Err(Nil) -> Err(Nil)
+				// Digits dropped from the integer part were never divided out,
+				// so each one still counts as a power of ten.
+				Ok(exp) -> scale(mantissa, exp + int_dropped - frac_digits)
+			}
+		}
+	}
+}
+
+// The most decimal digits that fit in an Int without overflowing: 10^18 is
+// under 2^63, 10^19 is not.
+const MAX_DIGITS = 18
+
+// Accumulate digits into an *integer* mantissa, returning it, the index just
+// past the last digit, how many digits it holds, and how many were dropped
+// once it filled up.
+//
+// Integer rather than Float because a Float mantissa rounds on every single
+// step: seventeen digits meant seventeen roundings, and '1.7976931348623157'
+// came back two ULP light. Accumulating exactly and converting once leaves a
+// single rounding on the conversion and one on the scaling.
+//
+// Both the integer and the fraction part feed the same mantissa; the caller
+// tracks where the decimal point fell.
+fn digits(b Binary, i Int, size Int, acc Int, taken Int, dropped Int) (Int, Int, Int, Int) {
+	if i >= size {
+		(acc, i, taken, dropped)
+	} else {
+		byte = binary.byte_at(b, i)
+		if byte >= 48 && byte <= 57 {
+			if taken < MAX_DIGITS {
+				digits(b, i + 1, size, acc * 10 + { byte - 48 }, taken + 1, dropped)
+			} else {
+				// Past the mantissa's capacity. A dropped digit still moves
+				// the decimal point, so it is counted, not ignored.
+				digits(b, i + 1, size, acc, taken, dropped + 1)
+			}
+		} else {
+			(acc, i, taken, dropped)
+		}
+	}
+}
+
+// The exponent after `e`/`E`, or 0 when there is none. Trailing bytes that are
+// not a well-formed exponent are an error rather than being ignored — '1.5x'
+// is not a number.
+fn exponent(b Binary, i Int, size Int) Result(Int, Nil) {
+	if i >= size {
+		Ok(0)
+	} else {
+		byte = binary.byte_at(b, i)
+		if byte == 101 || byte == 69 {
+			match parse_int_binary(binary.slice_bytes(b, i + 1, size - i - 1)) {
+				Ok(exp) -> Ok(exp)
+				Err(Nil) -> Err(Nil)
+			}
+		} else {
+			Err(Nil)
+		}
+	}
+}
+
+// Shift the decimal point by `exp` places. Beyond a double's exponent range
+// the answer is not representable — and with no infinity to overflow to, the
+// only honest result is an error.
+fn scale(mantissa Int, exp Int) Result(Score, Nil) {
+	value = float.from_int(mantissa)
+	if exp > 308 || exp < 0 - 340 {
+		Err(Nil)
+	} else if exp >= 0 {
+		Ok(Finite(value * pow10(exp)))
+	} else {
+		// Divide by the power rather than multiplying by its reciprocal: the
+		// reciprocal of 10^n is not exact, so multiplying would round twice.
+		Ok(Finite(value / pow10(0 - exp)))
+	}
+}
+
+fn pow10(n Int) Float {
+	if n <= 0 {
+		1.0
+	} else {
+		10.0 * pow10(n - 1)
+	}
+}

@@ -1,0 +1,331 @@
+// Hash commands, including the per-field expiry family Redis added in 7.4.
+
+import scarlet/array
+import ./number.{Score}
+import ./redis.{Conn, RedisError}
+import ./options.{Always, Condition, ExpireWhen, GetExpiry, IfExists, IfNotExists, SetExpiry}
+
+// ---------------------------------------------------------------------------
+// Fields.
+// ---------------------------------------------------------------------------
+
+// Set one field. Returns True when the field was new, False when it replaced
+// an existing value — not whether the write happened, which it always does.
+pub fn hset(c Conn, key String, field String, value String) Result(Bool, RedisError) {
+	redis.map_ok(hset_many(c, key, [(field, value)]), fn(added) added > 0)
+}
+
+// Set several fields at once, returning how many of them were new.
+pub fn hset_many(c Conn, key String, pairs Array((String, String))) Result(Int, RedisError) {
+	redis.expect_int(redis.command(c, redis.parts([['HSET', key], redis.flatten_pairs(pairs)])))
+}
+
+// Set a field only if it is absent.
+pub fn hsetnx(c Conn, key String, field String, value String) Result(Bool, RedisError) {
+	redis.expect_bool(redis.command(c, ['HSETNX', key, field, value]))
+}
+
+pub fn hget(c Conn, key String, field String) Result(Option(String), RedisError) {
+	redis.expect_bulk(redis.command(c, ['HGET', key, field]))
+}
+
+// Positional, like MGET: element i answers field i, and `None` is a field that
+// is not set.
+pub fn hmget(c Conn, key String, fields Array(String)) Result(Array(Option(String)), RedisError) {
+	redis.expect_opt_strings(redis.command(c, redis.parts([['HMGET', key], fields])))
+}
+
+// Every field and value. An empty array means the key does not exist — Redis
+// draws no distinction between an absent hash and an empty one.
+pub fn hgetall(c Conn, key String) Result(Array((String, String)), RedisError) {
+	redis.expect_pairs(redis.command(c, ['HGETALL', key]))
+}
+
+pub fn hkeys(c Conn, key String) Result(Array(String), RedisError) {
+	redis.expect_strings(redis.command(c, ['HKEYS', key]))
+}
+
+pub fn hvals(c Conn, key String) Result(Array(String), RedisError) {
+	redis.expect_strings(redis.command(c, ['HVALS', key]))
+}
+
+pub fn hdel(c Conn, key String, fields Array(String)) Result(Int, RedisError) {
+	redis.expect_int(redis.command(c, redis.parts([['HDEL', key], fields])))
+}
+
+pub fn hexists(c Conn, key String, field String) Result(Bool, RedisError) {
+	redis.expect_bool(redis.command(c, ['HEXISTS', key, field]))
+}
+
+pub fn hlen(c Conn, key String) Result(Int, RedisError) {
+	redis.expect_int(redis.command(c, ['HLEN', key]))
+}
+
+pub fn hstrlen(c Conn, key String, field String) Result(Int, RedisError) {
+	redis.expect_int(redis.command(c, ['HSTRLEN', key, field]))
+}
+
+// ---------------------------------------------------------------------------
+// Counters.
+// ---------------------------------------------------------------------------
+
+pub fn hincrby(c Conn, key String, field String, by Int) Result(Int, RedisError) {
+	redis.expect_int(redis.command(c, ['HINCRBY', key, field, redis.arg(by)]))
+}
+
+pub fn hincrbyfloat(c Conn, key String, field String, by Float) Result(Score, RedisError) {
+	redis.expect_score(
+		redis.command(c, ['HINCRBYFLOAT', key, field, number.score_to_string(number.Finite(by))]),
+	)
+}
+
+// ---------------------------------------------------------------------------
+// Sampling and iteration.
+// ---------------------------------------------------------------------------
+
+// Random fields. A negative `count` allows repeats and always returns exactly
+// that many; a positive one returns distinct fields, capped at the hash size.
+pub fn hrandfield(c Conn, key String, count Int) Result(Array(String), RedisError) {
+	redis.expect_strings(redis.command(c, ['HRANDFIELD', key, redis.arg(count)]))
+}
+
+pub fn hrandfield_with_values(
+	c Conn,
+	key String,
+	count Int,
+) Result(Array((String, String)), RedisError) {
+	redis.expect_pairs(redis.command(c, ['HRANDFIELD', key, redis.arg(count), 'WITHVALUES']))
+}
+
+// One field, or None when the hash is empty.
+pub fn hrandfield_one(c Conn, key String) Result(Option(String), RedisError) {
+	redis.expect_bulk(redis.command(c, ['HRANDFIELD', key]))
+}
+
+// A cursored walk of the fields, yielding field/value pairs. Same cursor
+// protocol as `keys.scan`: start at 0, stop when it comes back 0.
+pub fn hscan(
+	c Conn,
+	key String,
+	cursor Int,
+	pattern Option(String),
+	count Option(Int),
+) Result((Int, Array((String, String))), RedisError) {
+	match redis.expect_scan(redis.command(c, scan_args(key, cursor, pattern, count, False))) {
+		Err(e) -> Err(e)
+		Ok((next, flat)) -> redis.map_ok(pairs_of(flat), fn(ps) (next, ps))
+	}
+}
+
+// The same walk returning only field names, which lets the server skip sending
+// the values at all.
+pub fn hscan_novalues(
+	c Conn,
+	key String,
+	cursor Int,
+	pattern Option(String),
+	count Option(Int),
+) Result((Int, Array(String)), RedisError) {
+	redis.expect_scan(redis.command(c, scan_args(key, cursor, pattern, count, True)))
+}
+
+fn scan_args(
+	key String,
+	cursor Int,
+	pattern Option(String),
+	count Option(Int),
+	novalues Bool,
+) Array(String) {
+	redis.parts(
+		[
+			['HSCAN', key, redis.arg(cursor)],
+			redis.when_some(pattern, fn(p) ['MATCH', p]),
+			redis.when_some(count, fn(n) ['COUNT', redis.arg(n)]),
+			redis.when(novalues, ['NOVALUES']),
+		],
+	)
+}
+
+fn pairs_of(flat Array(String)) Result(Array((String, String)), RedisError) {
+	match flat {
+		[] -> Ok([])
+		[a, b, ..rest] -> redis.map_ok(pairs_of(rest), fn(ps) array.concat([(a, b)], ps))
+		_ -> Err(redis.Protocol('HSCAN returned an odd number of elements'))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Per-field expiry.
+// ---------------------------------------------------------------------------
+//
+// Redis 7.4 gave individual hash fields their own TTLs. Every command here
+// answers once per field, in the order asked, so the reply is an array and not
+// a single value.
+
+// What happened to one field in an expiry call.
+pub type FieldExpiry {
+	// The field (or the whole key) is not there.
+	NoField
+	// A condition — NX, XX, GT, LT — held the change back.
+	NotApplied
+	// The expiry was set, or removed by `hpersist`.
+	Applied
+	// The deadline was already in the past, so the field was deleted outright.
+	FieldDeleted
+}
+
+// Set a TTL on individual fields. `condition` mirrors `keys.expire`'s.
+pub fn hexpire(
+	c Conn,
+	key String,
+	ttl options.Ttl,
+	condition ExpireWhen,
+	fields Array(String),
+) Result(Array(FieldExpiry), RedisError) {
+	field_expiry(
+		redis.command(
+			c,
+			redis.parts(
+				[
+					['H${options.ttl_verb(ttl)}', key, options.ttl_amount(ttl)],
+					options.render_expire_when(condition),
+					fields_block(fields),
+				],
+			),
+		),
+	)
+}
+
+// Clear the TTL on individual fields, leaving the fields themselves in place.
+pub fn hpersist(c Conn, key String, fields Array(String)) Result(Array(FieldExpiry), RedisError) {
+	field_expiry(redis.command(c, redis.parts([['HPERSIST', key], fields_block(fields)])))
+}
+
+// How long each field has left, in seconds.
+pub fn httl(c Conn, key String, fields Array(String)) Result(Array(redis.Remaining), RedisError) {
+	remaining(redis.command(c, redis.parts([['HTTL', key], fields_block(fields)])))
+}
+
+pub fn hpttl(c Conn, key String, fields Array(String)) Result(Array(redis.Remaining), RedisError) {
+	remaining(redis.command(c, redis.parts([['HPTTL', key], fields_block(fields)])))
+}
+
+// The absolute moment each field expires.
+pub fn hexpiretime(
+	c Conn,
+	key String,
+	fields Array(String),
+) Result(Array(redis.Remaining), RedisError) {
+	remaining(redis.command(c, redis.parts([['HEXPIRETIME', key], fields_block(fields)])))
+}
+
+pub fn hpexpiretime(
+	c Conn,
+	key String,
+	fields Array(String),
+) Result(Array(redis.Remaining), RedisError) {
+	remaining(redis.command(c, redis.parts([['HPEXPIRETIME', key], fields_block(fields)])))
+}
+
+// Read fields and re-arm (or clear) their expiry in one step.
+pub fn hgetex(
+	c Conn,
+	key String,
+	expiry Option(GetExpiry),
+	fields Array(String),
+) Result(Array(Option(String)), RedisError) {
+	redis.expect_opt_strings(
+		redis.command(
+			c,
+			redis.parts(
+				[
+					['HGETEX', key],
+					redis.when_some(expiry, options.render_get_expiry),
+					fields_block(fields),
+				],
+			),
+		),
+	)
+}
+
+// Read fields and delete them in one step.
+pub fn hgetdel(
+	c Conn,
+	key String,
+	fields Array(String),
+) Result(Array(Option(String)), RedisError) {
+	redis.expect_opt_strings(
+		redis.command(c, redis.parts([['HGETDEL', key], fields_block(fields)])),
+	)
+}
+
+// Write fields with an expiry, optionally conditioned on whether they already
+// exist. Returns True when the write happened.
+pub fn hsetex(
+	c Conn,
+	key String,
+	pairs Array((String, String)),
+	condition Condition,
+	expiry Option(SetExpiry),
+) Result(Bool, RedisError) {
+	redis.expect_bool(
+		redis.command(
+			c,
+			redis.parts(
+				[
+					['HSETEX', key],
+					// HSETEX spells its existence conditions FNX/FXX — the fields', not the
+					// key's.
+					match condition {
+						Always -> []
+						IfNotExists -> ['FNX']
+						IfExists -> ['FXX']
+					},
+					redis.when_some(expiry, options.render_set_expiry),
+					['FIELDS', redis.arg(array.length(pairs))],
+					redis.flatten_pairs(pairs),
+				],
+			),
+		),
+	)
+}
+
+// Every per-field command counts its fields before listing them, so the server
+// can tell them apart from whatever follows.
+fn fields_block(fields Array(String)) Array(String) {
+	redis.parts([['FIELDS', redis.arg(array.length(fields))], fields])
+}
+
+fn field_expiry(reply Result(resp.Value, RedisError)) Result(Array(FieldExpiry), RedisError) {
+	match redis.expect_values(reply) {
+		Err(e) -> Err(e)
+		Ok(values) -> redis.collect(
+			array.map(values, fn(v) redis.map_ok(redis.value_int(v), fn(n) if n == 0 - 2 {
+				NoField
+			} else if n == 0 {
+				NotApplied
+			} else if n == 2 {
+				FieldDeleted
+			} else {
+				Applied
+			})),
+		)
+	}
+}
+
+fn remaining(reply Result(resp.Value, RedisError)) Result(Array(redis.Remaining), RedisError) {
+	match redis.expect_values(reply) {
+		Err(e) -> Err(e)
+		Ok(values) ->
+			redis.collect(
+				array.map(values, fn(v) redis.map_ok(redis.value_int(v), redis.to_remaining)),
+			)
+	}
+}
+
+// The pre-4.0 spelling of `hset_many`, kept for code being migrated. It
+// answers OK rather than a count, which is why it is a separate function and
+// not an alias.
+pub fn hmset(c Conn, key String, pairs Array((String, String))) Result(Nil, RedisError) {
+	redis.expect_ok(redis.command(c, redis.parts([['HMSET', key], redis.flatten_pairs(pairs)])))
+}

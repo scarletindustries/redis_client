@@ -1,0 +1,183 @@
+// RESP2 — the Redis serialization protocol — encoded and decoded as pure
+// bytes.
+//
+// Sans-IO: nothing here touches a socket. Decoding works over a `Binary` read
+// buffer plus an offset, and every parse ends in one of three answers —
+// `Done` with the value and the offset just past it, `NeedMore` when the
+// buffer holds only part of a reply, or `Bad` when the bytes are not RESP at
+// all. That is what lets the connection layer read whatever the kernel
+// happens to hand it and re-parse from the same offset until a reply is whole:
+// a TCP read is not a message boundary.
+
+import scarlet/array
+import scarlet/binary.{Dec}
+
+// Every RESP frame ends with CRLF. As a binary literal rather than an escaped
+// string so it is bytes on both sides of the comparison.
+pub const CRLF = <<13, 10>>
+
+// The five RESP2 reply types, plus the null that `$-1` and `*-1` both spell.
+// Payloads stay `Binary`: a Redis value is bytes, and only the caller knows
+// whether a given key holds UTF-8 or a JPEG.
+pub type Value {
+	SimpleStr(bytes Binary)
+	RedisErr(bytes Binary)
+	Num(n Int)
+	Bulk(bytes Binary)
+	Null
+	List(items Array(Value))
+}
+
+// The outcome of decoding one reply out of `buf` starting at an offset.
+// `next` is the absolute offset just past the reply — not a length — so the
+// connection loop can parse the following pipelined reply from exactly there.
+pub type Parsed {
+	Done(value Value, next Int)
+	NeedMore
+	Bad(why String)
+}
+
+// ---------------------------------------------------------------------------
+// Encoding.
+// ---------------------------------------------------------------------------
+
+// A command goes out as an array of bulk strings — the only request form a
+// modern server needs to accept, and the only one that is safe: the length
+// prefix means an argument containing CRLF (or spaces, or nothing at all)
+// cannot be read as anything but one argument.
+pub fn encode_command(parts Array(Binary)) Binary {
+	count = binary.from_int_ascii(array.length(parts), Dec)
+	head = <<'*', count:binary, CRLF:binary>>
+	array.fold(parts, head, fn(acc, part) binary.append(acc, encode_bulk(part)))
+}
+
+fn encode_bulk(b Binary) Binary {
+	size = binary.from_int_ascii(binary.byte_size(b), Dec)
+	<<'\$', size:binary, CRLF:binary, b:binary, CRLF:binary>>
+}
+
+// ---------------------------------------------------------------------------
+// Decoding.
+// ---------------------------------------------------------------------------
+
+// Decode one reply from `buf` at `off`. Call again with the same offset after
+// reading more bytes when the answer is `NeedMore`.
+pub fn parse(buf Binary, off Int) Parsed {
+	if off >= binary.byte_size(buf) {
+		NeedMore
+	} else {
+		match binary.byte_at(buf, off) {
+			43 -> parse_simple(buf, off)
+			45 -> parse_error(buf, off)
+			58 -> parse_num(buf, off)
+			36 -> parse_bulk(buf, off)
+			42 -> parse_list(buf, off)
+			tag -> Bad('not a RESP reply: leading byte ${tag}')
+		}
+	}
+}
+
+// The CRLF-terminated line starting at `off`: its payload with the one-byte
+// type tag and the CRLF stripped, and the offset just past that CRLF.
+fn line(buf Binary, off Int) Option((Binary, Int)) {
+	match binary.index_of(buf, CRLF, off) {
+		Some(end) -> Some((binary.slice_bytes(buf, off + 1, end - off - 1), end + 2))
+		None -> None
+	}
+}
+
+fn parse_simple(buf Binary, off Int) Parsed {
+	match line(buf, off) {
+		Some((payload, next)) -> Done(SimpleStr(payload), next)
+		None -> NeedMore
+	}
+}
+
+fn parse_error(buf Binary, off Int) Parsed {
+	match line(buf, off) {
+		Some((payload, next)) -> Done(RedisErr(payload), next)
+		None -> NeedMore
+	}
+}
+
+fn parse_num(buf Binary, off Int) Parsed {
+	match line(buf, off) {
+		None -> NeedMore
+		Some((digits, next)) -> match parse_signed(digits) {
+			Ok(n) -> Done(Num(n), next)
+			Err(Nil) -> Bad('integer reply is not an integer')
+		}
+	}
+}
+
+// A bulk string announces its own byte count, so its payload is taken by
+// length and never scanned — a value holding CRLF stays one value. A negative
+// count is the RESP2 null.
+fn parse_bulk(buf Binary, off Int) Parsed {
+	match line(buf, off) {
+		None -> NeedMore
+		Some((digits, after_head)) -> match parse_signed(digits) {
+			Err(Nil) -> Bad('bulk length is not an integer')
+			Ok(size) -> if size < 0 {
+				Done(Null, after_head)
+			} else if binary.byte_size(buf) < after_head + size + 2 {
+				// The payload, or the CRLF that must follow it, has not
+				// arrived yet.
+				NeedMore
+			} else {
+				Done(Bulk(binary.slice_bytes(buf, after_head, size)), after_head + size + 2)
+			}
+		}
+	}
+}
+
+fn parse_list(buf Binary, off Int) Parsed {
+	match line(buf, off) {
+		None -> NeedMore
+		Some((digits, after_head)) -> match parse_signed(digits) {
+			Err(Nil) -> Bad('array length is not an integer')
+			Ok(count) -> if count < 0 {
+				Done(Null, after_head)
+			} else {
+				match parse_items(buf, after_head, count, []) {
+					ItemsDone(items, next) -> Done(List(items), next)
+					ItemsNeedMore -> NeedMore
+					ItemsBad(why) -> Bad(why)
+				}
+			}
+		}
+	}
+}
+
+// The element loop's three answers, mirroring `Parsed` — an array is only
+// `Done` once every one of its elements is, and a partial element makes the
+// whole array `NeedMore` from its original offset.
+type Items {
+	ItemsDone(values Array(Value), next Int)
+	ItemsNeedMore
+	ItemsBad(why String)
+}
+
+fn parse_items(buf Binary, off Int, remaining Int, acc Array(Value)) Items {
+	if remaining <= 0 {
+		ItemsDone(array.reverse(acc), off)
+	} else {
+		match parse(buf, off) {
+			Done(value, next) -> parse_items(buf, next, remaining - 1, [value, ..acc])
+			NeedMore -> ItemsNeedMore
+			Bad(why) -> ItemsBad(why)
+		}
+	}
+}
+
+// RESP integers and lengths are signed — `:-1`, `$-1` — and binary.parse_int
+// reads unsigned digits only, so the sign is peeled off here.
+fn parse_signed(b Binary) Result(Int, Nil) {
+	match binary.byte_at(b, 0) {
+		45 -> match binary.parse_int(binary.slice_bytes(b, 1, binary.byte_size(b) - 1), Dec) {
+			Ok(n) -> Ok(0 - n)
+			Err(Nil) -> Err(Nil)
+		}
+		_ -> binary.parse_int(b, Dec)
+	}
+}

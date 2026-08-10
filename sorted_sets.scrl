@@ -1,0 +1,883 @@
+// Sorted-set commands.
+//
+// Scores are `number.Score` rather than Float throughout, because Redis scores
+// really can be infinite and a Scarlet Float cannot hold an infinity. The
+// range bounds are their own types for the same reason the option types are:
+// `(1.5` and `[member` and `-inf` are a small grammar, and spelling it out in
+// types means a caller cannot forget the bracket.
+
+import scarlet/array
+import ./number.{Finite, NegInf, PosInf, Score}
+import ./redis.{Conn, RedisError}
+import ./options.{Aggregate, Asc, Condition, Desc, Direction, Limit}
+
+// ---------------------------------------------------------------------------
+// Range bounds.
+// ---------------------------------------------------------------------------
+
+// One end of a score range. Redis writes an exclusive bound with a leading
+// paren — `(1.5` — and the infinities as `-inf` / `+inf`.
+pub type ScoreBound {
+	Inclusive(value Score)
+	Exclusive(value Score)
+}
+
+pub fn at_least(v Float) ScoreBound {
+	Inclusive(Finite(v))
+}
+
+pub fn above(v Float) ScoreBound {
+	Exclusive(Finite(v))
+}
+
+pub const LOWEST = Inclusive(NegInf)
+pub const HIGHEST = Inclusive(PosInf)
+
+fn render_score_bound(b ScoreBound) String {
+	match b {
+		Inclusive(v) -> number.score_to_string(v)
+		Exclusive(v) -> '(${number.score_to_string(v)}'
+	}
+}
+
+// One end of a lexicographic range. Only meaningful when every member shares
+// the same score — the ordering it slices is the tie-break ordering.
+pub type LexBound {
+	LexInclusive(value String)
+	LexExclusive(value String)
+	LexLowest
+	LexHighest
+}
+
+fn render_lex_bound(b LexBound) String {
+	match b {
+		LexInclusive(v) -> '[${v}'
+		LexExclusive(v) -> '(${v}'
+		LexLowest -> '-'
+		LexHighest -> '+'
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Adding.
+// ---------------------------------------------------------------------------
+
+// Add members, returning how many were newly created. Updating an existing
+// member's score is not counted — use `zadd_opts` with `changed` for that.
+pub fn zadd(c Conn, key String, members Array((String, Score))) Result(Int, RedisError) {
+	redis.expect_int(redis.command(c, redis.parts([['ZADD', key], score_members(members)])))
+}
+
+// Whether an existing score may be moved, and in which direction. GT and LT
+// only ever raise or lower a score, never the reverse — the primitive for a
+// high-water mark.
+pub type ScoreCompare {
+	Anyway
+	OnlyGreater
+	OnlyLess
+}
+
+fn render_compare(cmp ScoreCompare) Array(String) {
+	match cmp {
+		Anyway -> []
+		OnlyGreater -> ['GT']
+		OnlyLess -> ['LT']
+	}
+}
+
+// ZADD with its modifiers. With `changed`, the count includes members whose
+// score was updated, not only those that were added.
+pub fn zadd_opts(
+	c Conn,
+	key String,
+	members Array((String, Score)),
+	condition Condition,
+	compare ScoreCompare,
+	changed Bool,
+) Result(Int, RedisError) {
+	redis.expect_int(
+		redis.command(
+			c,
+			redis.parts(
+				[
+					['ZADD', key],
+					options.render_condition(condition),
+					render_compare(compare),
+					redis.when(changed, ['CH']),
+					score_members(members),
+				],
+			),
+		),
+	)
+}
+
+// ZADD ... INCR: add `by` to one member's score and return the result. `None`
+// when a condition stopped the write.
+pub fn zadd_incr(
+	c Conn,
+	key String,
+	member String,
+	by Score,
+	condition Condition,
+	compare ScoreCompare,
+) Result(Option(Score), RedisError) {
+	redis.expect_opt_score(
+		redis.command(
+			c,
+			redis.parts(
+				[
+					['ZADD', key],
+					options.render_condition(condition),
+					render_compare(compare),
+					['INCR', number.score_to_string(by), member],
+				],
+			),
+		),
+	)
+}
+
+// Increment a member's score, creating it at `by` if it is not there.
+pub fn zincrby(c Conn, key String, member String, by Score) Result(Score, RedisError) {
+	redis.expect_score(redis.command(c, ['ZINCRBY', key, number.score_to_string(by), member]))
+}
+
+// Redis takes score before member, which is the opposite order to how the
+// pair reads in most APIs — so the flip happens here, once.
+fn score_members(members Array((String, Score))) Array(String) {
+	array.fold(members, [], fn(acc, m) match m {
+		(member, score) -> array.concat(acc, [number.score_to_string(score), member])
+	})
+}
+
+// ---------------------------------------------------------------------------
+// Reading.
+// ---------------------------------------------------------------------------
+
+pub fn zcard(c Conn, key String) Result(Int, RedisError) {
+	redis.expect_int(redis.command(c, ['ZCARD', key]))
+}
+
+pub fn zscore(c Conn, key String, member String) Result(Option(Score), RedisError) {
+	redis.expect_opt_score(redis.command(c, ['ZSCORE', key, member]))
+}
+
+// Scores of several members. Positional: element i answers member i, and
+// `None` is a member that is not in the set.
+pub fn zmscore(
+	c Conn,
+	key String,
+	members Array(String),
+) Result(Array(Option(Score)), RedisError) {
+	match redis.expect_values(redis.command(c, redis.parts([['ZMSCORE', key], members]))) {
+		Err(e) -> Err(e)
+		Ok(values) -> redis.collect(
+			array.map(values, fn(v) match v {
+				Null -> Ok(None)
+				other -> redis.map_ok(redis.value_score(other), fn(s) Some(s))
+			}),
+		)
+	}
+}
+
+// How many members fall inside a score range.
+pub fn zcount(c Conn, key String, min ScoreBound, max ScoreBound) Result(Int, RedisError) {
+	redis.expect_int(
+		redis.command(c, ['ZCOUNT', key, render_score_bound(min), render_score_bound(max)]),
+	)
+}
+
+pub fn zlexcount(c Conn, key String, min LexBound, max LexBound) Result(Int, RedisError) {
+	redis.expect_int(
+		redis.command(c, ['ZLEXCOUNT', key, render_lex_bound(min), render_lex_bound(max)]),
+	)
+}
+
+// The 0-based position of a member, counting from the lowest score.
+pub fn zrank(c Conn, key String, member String) Result(Option(Int), RedisError) {
+	redis.expect_opt_int(redis.command(c, ['ZRANK', key, member]))
+}
+
+// Counting from the highest score instead.
+pub fn zrevrank(c Conn, key String, member String) Result(Option(Int), RedisError) {
+	redis.expect_opt_int(redis.command(c, ['ZREVRANK', key, member]))
+}
+
+// Rank and score together, which saves a second round trip to `zscore`.
+pub fn zrank_withscore(
+	c Conn,
+	key String,
+	member String,
+) Result(Option((Int, Score)), RedisError) {
+	ranked(redis.command(c, ['ZRANK', key, member, 'WITHSCORE']))
+}
+
+pub fn zrevrank_withscore(
+	c Conn,
+	key String,
+	member String,
+) Result(Option((Int, Score)), RedisError) {
+	ranked(redis.command(c, ['ZREVRANK', key, member, 'WITHSCORE']))
+}
+
+fn ranked(reply Result(resp.Value, RedisError)) Result(Option((Int, Score)), RedisError) {
+	match redis.expect_opt_values(reply) {
+		Err(e) -> Err(e)
+		Ok(None) -> Ok(None)
+		Ok(Some([r, s])) -> match (redis.value_int(r), redis.value_score(s)) {
+			(Ok(rank), Ok(score)) -> Ok(Some((rank, score)))
+			(Err(e), _) -> Err(e)
+			(_, Err(e)) -> Err(e)
+		}
+		Ok(Some(_)) -> Err(redis.Protocol('expected a rank and a score'))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Ranges.
+// ---------------------------------------------------------------------------
+//
+// `rev` reverses the ordering. The bounds are always given low-then-high
+// whichever way the range runs — Redis wants them swapped for a reversed
+// range, and doing that here means a caller never has to remember it.
+
+// By position: an inclusive range of ranks, where negative indices count back
+// from the end.
+pub fn zrange(c Conn, key String, start Int, stop Int, rev Bool) Result(Array(String), RedisError) {
+	redis.expect_strings(
+		redis.command(
+			c,
+			redis.parts(
+				[['ZRANGE', key, redis.arg(start), redis.arg(stop)], redis.when(rev, ['REV'])],
+			),
+		),
+	)
+}
+
+pub fn zrange_withscores(
+	c Conn,
+	key String,
+	start Int,
+	stop Int,
+	rev Bool,
+) Result(Array((String, Score)), RedisError) {
+	redis.expect_scored(
+		redis.command(
+			c,
+			redis.parts(
+				[
+					['ZRANGE', key, redis.arg(start), redis.arg(stop)],
+					redis.when(rev, ['REV']),
+					['WITHSCORES'],
+				],
+			),
+		),
+	)
+}
+
+pub fn zrange_by_score(
+	c Conn,
+	key String,
+	min ScoreBound,
+	max ScoreBound,
+	rev Bool,
+	limit Option(Limit),
+) Result(Array(String), RedisError) {
+	redis.expect_strings(redis.command(c, by_score_args(key, min, max, rev, limit, False)))
+}
+
+pub fn zrange_by_score_withscores(
+	c Conn,
+	key String,
+	min ScoreBound,
+	max ScoreBound,
+	rev Bool,
+	limit Option(Limit),
+) Result(Array((String, Score)), RedisError) {
+	redis.expect_scored(redis.command(c, by_score_args(key, min, max, rev, limit, True)))
+}
+
+pub fn zrange_by_lex(
+	c Conn,
+	key String,
+	min LexBound,
+	max LexBound,
+	rev Bool,
+	limit Option(Limit),
+) Result(Array(String), RedisError) {
+	redis.expect_strings(redis.command(c, by_lex_args(key, min, max, rev, limit)))
+}
+
+fn by_score_args(
+	key String,
+	min ScoreBound,
+	max ScoreBound,
+	rev Bool,
+	limit Option(Limit),
+	withscores Bool,
+) Array(String) {
+	(first, second) = if rev {
+		(render_score_bound(max), render_score_bound(min))
+	} else {
+		(render_score_bound(min), render_score_bound(max))
+	}
+	redis.parts(
+		[
+			['ZRANGE', key, first, second, 'BYSCORE'],
+			redis.when(rev, ['REV']),
+			redis.when_some(limit, options.render_limit),
+			redis.when(withscores, ['WITHSCORES']),
+		],
+	)
+}
+
+fn by_lex_args(
+	key String,
+	min LexBound,
+	max LexBound,
+	rev Bool,
+	limit Option(Limit),
+) Array(String) {
+	(first, second) = if rev {
+		(render_lex_bound(max), render_lex_bound(min))
+	} else {
+		(render_lex_bound(min), render_lex_bound(max))
+	}
+	redis.parts(
+		[
+			['ZRANGE', key, first, second, 'BYLEX'],
+			redis.when(rev, ['REV']),
+			redis.when_some(limit, options.render_limit),
+		],
+	)
+}
+
+// Store a range in another key instead of returning it, giving its size.
+pub fn zrangestore_by_rank(
+	c Conn,
+	destination String,
+	source String,
+	start Int,
+	stop Int,
+	rev Bool,
+) Result(Int, RedisError) {
+	redis.expect_int(
+		redis.command(
+			c,
+			redis.parts(
+				[
+					['ZRANGESTORE', destination, source, redis.arg(start), redis.arg(stop)],
+					redis.when(rev, ['REV']),
+				],
+			),
+		),
+	)
+}
+
+pub fn zrangestore_by_score(
+	c Conn,
+	destination String,
+	source String,
+	min ScoreBound,
+	max ScoreBound,
+	rev Bool,
+	limit Option(Limit),
+) Result(Int, RedisError) {
+	// The argument list is ZRANGE's with a destination spliced in front of the
+	// source, so it is built by patching rather than duplicated.
+	match by_score_args(source, min, max, rev, limit, False) {
+		[_, ..rest] ->
+			redis.expect_int(redis.command(c, redis.parts([['ZRANGESTORE', destination], rest])))
+		[] -> Err(redis.Protocol('empty range arguments'))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Removing.
+// ---------------------------------------------------------------------------
+
+pub fn zrem(c Conn, key String, members Array(String)) Result(Int, RedisError) {
+	redis.expect_int(redis.command(c, redis.parts([['ZREM', key], members])))
+}
+
+pub fn zremrangebyrank(c Conn, key String, start Int, stop Int) Result(Int, RedisError) {
+	redis.expect_int(redis.command(c, ['ZREMRANGEBYRANK', key, redis.arg(start), redis.arg(stop)]))
+}
+
+pub fn zremrangebyscore(
+	c Conn,
+	key String,
+	min ScoreBound,
+	max ScoreBound,
+) Result(Int, RedisError) {
+	redis.expect_int(
+		redis.command(
+			c,
+			['ZREMRANGEBYSCORE', key, render_score_bound(min), render_score_bound(max)],
+		),
+	)
+}
+
+pub fn zremrangebylex(c Conn, key String, min LexBound, max LexBound) Result(Int, RedisError) {
+	redis.expect_int(
+		redis.command(c, ['ZREMRANGEBYLEX', key, render_lex_bound(min), render_lex_bound(max)]),
+	)
+}
+
+// ---------------------------------------------------------------------------
+// Popping.
+// ---------------------------------------------------------------------------
+
+pub fn zpopmin(c Conn, key String) Result(Option((String, Score)), RedisError) {
+	one_popped(redis.command(c, ['ZPOPMIN', key]))
+}
+
+pub fn zpopmax(c Conn, key String) Result(Option((String, Score)), RedisError) {
+	one_popped(redis.command(c, ['ZPOPMAX', key]))
+}
+
+pub fn zpopmin_count(c Conn, key String, count Int) Result(Array((String, Score)), RedisError) {
+	redis.expect_scored(redis.command(c, ['ZPOPMIN', key, redis.arg(count)]))
+}
+
+pub fn zpopmax_count(c Conn, key String, count Int) Result(Array((String, Score)), RedisError) {
+	redis.expect_scored(redis.command(c, ['ZPOPMAX', key, redis.arg(count)]))
+}
+
+// Pop from whichever of several sets is non-empty, saying which one that was.
+pub fn zmpop(
+	c Conn,
+	keys Array(String),
+	from Direction,
+	count Option(Int),
+) Result(Option((String, Array((String, Score)))), RedisError) {
+	keyed(
+		redis.command(
+			c,
+			redis.parts(
+				[
+					['ZMPOP', redis.arg(array.length(keys))],
+					keys,
+					[min_or_max(from)],
+					redis.when_some(count, fn(n) ['COUNT', redis.arg(n)]),
+				],
+			),
+		),
+	)
+}
+
+// The blocking forms. `None` means the timeout passed with every set empty.
+pub fn bzpopmin(
+	c Conn,
+	keys Array(String),
+	timeout_seconds Float,
+) Result(Option((String, String, Score)), RedisError) {
+	triple(redis.command(c, redis.parts([['BZPOPMIN'], keys, [timeout(timeout_seconds)]])))
+}
+
+pub fn bzpopmax(
+	c Conn,
+	keys Array(String),
+	timeout_seconds Float,
+) Result(Option((String, String, Score)), RedisError) {
+	triple(redis.command(c, redis.parts([['BZPOPMAX'], keys, [timeout(timeout_seconds)]])))
+}
+
+pub fn bzmpop(
+	c Conn,
+	keys Array(String),
+	from Direction,
+	timeout_seconds Float,
+	count Option(Int),
+) Result(Option((String, Array((String, Score)))), RedisError) {
+	keyed(
+		redis.command(
+			c,
+			redis.parts(
+				[
+					['BZMPOP', timeout(timeout_seconds), redis.arg(array.length(keys))],
+					keys,
+					[min_or_max(from)],
+					redis.when_some(count, fn(n) ['COUNT', redis.arg(n)]),
+				],
+			),
+		),
+	)
+}
+
+fn min_or_max(d Direction) String {
+	match d {
+		Asc -> 'MIN'
+		Desc -> 'MAX'
+	}
+}
+
+fn timeout(seconds Float) String {
+	number.score_to_string(Finite(seconds))
+}
+
+fn one_popped(reply Result(resp.Value, RedisError)) Result(Option((String, Score)), RedisError) {
+	redis.map_ok(redis.expect_scored(reply), fn(pairs) match pairs {
+		[first, .._] -> Some(first)
+		[] -> None
+	})
+}
+
+// BZPOPMIN answers with three elements — key, member, score — because the
+// caller may have been waiting on several sets.
+fn triple(
+	reply Result(resp.Value, RedisError),
+) Result(Option((String, String, Score)), RedisError) {
+	match redis.expect_opt_values(reply) {
+		Err(e) -> Err(e)
+		Ok(None) -> Ok(None)
+		Ok(
+			Some([k, m, s]),
+		) -> match (redis.value_text(k), redis.value_text(m), redis.value_score(s)) {
+			(Ok(key), Ok(member), Ok(score)) -> Ok(Some((key, member, score)))
+			(Err(e), _, _) -> Err(e)
+			(_, Err(e), _) -> Err(e)
+			(_, _, Err(e)) -> Err(e)
+		}
+		Ok(Some(_)) -> Err(redis.Protocol('expected a key, member and score'))
+	}
+}
+
+fn keyed(
+	reply Result(resp.Value, RedisError),
+) Result(Option((String, Array((String, Score)))), RedisError) {
+	match redis.expect_opt_values(reply) {
+		Err(e) -> Err(e)
+		Ok(None) -> Ok(None)
+		Ok(Some([k, entries])) -> match (redis.value_text(k), scored_pairs(entries)) {
+			(Ok(key), Ok(members)) -> Ok(Some((key, members)))
+			(Err(e), _) -> Err(e)
+			(_, Err(e)) -> Err(e)
+		}
+		Ok(Some(_)) -> Err(redis.Protocol('expected a key and an array of members'))
+	}
+}
+
+// ZMPOP nests each member as its own two-element array, unlike the flat
+// WITHSCORES form that `expect_scored` reads.
+fn scored_pairs(v resp.Value) Result(Array((String, Score)), RedisError) {
+	match redis.expect_values(Ok(v)) {
+		Err(e) -> Err(e)
+		Ok(entries) -> redis.collect(
+			array.map(entries, fn(entry) match redis.expect_values(Ok(entry)) {
+				Err(e) -> Err(e)
+				Ok([m, s]) -> match (redis.value_text(m), redis.value_score(s)) {
+					(Ok(member), Ok(score)) -> Ok((member, score))
+					(Err(e), _) -> Err(e)
+					(_, Err(e)) -> Err(e)
+				}
+				Ok(_) -> Err(redis.Protocol('expected a member and a score'))
+			}),
+		)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Sampling and iteration.
+// ---------------------------------------------------------------------------
+
+pub fn zrandmember(c Conn, key String, count Int) Result(Array(String), RedisError) {
+	redis.expect_strings(redis.command(c, ['ZRANDMEMBER', key, redis.arg(count)]))
+}
+
+pub fn zrandmember_withscores(
+	c Conn,
+	key String,
+	count Int,
+) Result(Array((String, Score)), RedisError) {
+	redis.expect_scored(redis.command(c, ['ZRANDMEMBER', key, redis.arg(count), 'WITHSCORES']))
+}
+
+pub fn zrandmember_one(c Conn, key String) Result(Option(String), RedisError) {
+	redis.expect_bulk(redis.command(c, ['ZRANDMEMBER', key]))
+}
+
+// A cursored walk, yielding member/score pairs.
+pub fn zscan(
+	c Conn,
+	key String,
+	cursor Int,
+	pattern Option(String),
+	count Option(Int),
+) Result((Int, Array((String, Score))), RedisError) {
+	match redis.expect_scan(
+		redis.command(
+			c,
+			redis.parts(
+				[
+					['ZSCAN', key, redis.arg(cursor)],
+					redis.when_some(pattern, fn(p) ['MATCH', p]),
+					redis.when_some(count, fn(n) ['COUNT', redis.arg(n)]),
+				],
+			),
+		),
+	) {
+		Err(e) -> Err(e)
+		Ok((next, flat)) -> redis.map_ok(flat_scores(flat), fn(ps) (next, ps))
+	}
+}
+
+fn flat_scores(flat Array(String)) Result(Array((String, Score)), RedisError) {
+	match flat {
+		[] -> Ok([])
+		[m, s, ..rest] -> match (redis.to_score(s), flat_scores(rest)) {
+			(Ok(score), Ok(more)) -> Ok(array.concat([(m, score)], more))
+			(Err(e), _) -> Err(e)
+			(_, Err(e)) -> Err(e)
+		}
+		_ -> Err(redis.Protocol('ZSCAN returned an odd number of elements'))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Combining sets.
+// ---------------------------------------------------------------------------
+//
+// `weights` multiplies each input set's scores before they are aggregated;
+// pass `None` for all ones. `aggregate` decides what happens to a member that
+// appears in more than one input.
+
+pub fn zunion(
+	c Conn,
+	keys Array(String),
+	weights Option(Array(Float)),
+	aggregate Option(Aggregate),
+) Result(Array(String), RedisError) {
+	redis.expect_strings(redis.command(c, combine_args('ZUNION', keys, weights, aggregate, False)))
+}
+
+pub fn zinter(
+	c Conn,
+	keys Array(String),
+	weights Option(Array(Float)),
+	aggregate Option(Aggregate),
+) Result(Array(String), RedisError) {
+	redis.expect_strings(redis.command(c, combine_args('ZINTER', keys, weights, aggregate, False)))
+}
+
+pub fn zdiff(c Conn, keys Array(String)) Result(Array(String), RedisError) {
+	redis.expect_strings(
+		redis.command(c, redis.parts([['ZDIFF', redis.arg(array.length(keys))], keys])),
+	)
+}
+
+pub fn zunion_withscores(
+	c Conn,
+	keys Array(String),
+	weights Option(Array(Float)),
+	aggregate Option(Aggregate),
+) Result(Array((String, Score)), RedisError) {
+	redis.expect_scored(redis.command(c, combine_args('ZUNION', keys, weights, aggregate, True)))
+}
+
+pub fn zinter_withscores(
+	c Conn,
+	keys Array(String),
+	weights Option(Array(Float)),
+	aggregate Option(Aggregate),
+) Result(Array((String, Score)), RedisError) {
+	redis.expect_scored(redis.command(c, combine_args('ZINTER', keys, weights, aggregate, True)))
+}
+
+pub fn zdiff_withscores(c Conn, keys Array(String)) Result(Array((String, Score)), RedisError) {
+	redis.expect_scored(
+		redis.command(
+			c,
+			redis.parts([['ZDIFF', redis.arg(array.length(keys))], keys, ['WITHSCORES']]),
+		),
+	)
+}
+
+// The storing forms, which answer with the size of the destination.
+pub fn zunionstore(
+	c Conn,
+	destination String,
+	keys Array(String),
+	weights Option(Array(Float)),
+	aggregate Option(Aggregate),
+) Result(Int, RedisError) {
+	redis.expect_int(
+		redis.command(
+			c,
+			redis.parts([['ZUNIONSTORE', destination], combine_tail(keys, weights, aggregate)]),
+		),
+	)
+}
+
+pub fn zinterstore(
+	c Conn,
+	destination String,
+	keys Array(String),
+	weights Option(Array(Float)),
+	aggregate Option(Aggregate),
+) Result(Int, RedisError) {
+	redis.expect_int(
+		redis.command(
+			c,
+			redis.parts([['ZINTERSTORE', destination], combine_tail(keys, weights, aggregate)]),
+		),
+	)
+}
+
+pub fn zdiffstore(c Conn, destination String, keys Array(String)) Result(Int, RedisError) {
+	redis.expect_int(
+		redis.command(
+			c,
+			redis.parts([['ZDIFFSTORE', destination, redis.arg(array.length(keys))], keys]),
+		),
+	)
+}
+
+// How many members the intersection would have, without building it.
+pub fn zintercard(c Conn, keys Array(String), limit Option(Int)) Result(Int, RedisError) {
+	redis.expect_int(
+		redis.command(
+			c,
+			redis.parts(
+				[
+					['ZINTERCARD', redis.arg(array.length(keys))],
+					keys,
+					redis.when_some(limit, fn(n) ['LIMIT', redis.arg(n)]),
+				],
+			),
+		),
+	)
+}
+
+fn combine_args(
+	verb String,
+	keys Array(String),
+	weights Option(Array(Float)),
+	aggregate Option(Aggregate),
+	withscores Bool,
+) Array(String) {
+	redis.parts(
+		[[verb], combine_tail(keys, weights, aggregate), redis.when(withscores, ['WITHSCORES'])],
+	)
+}
+
+fn combine_tail(
+	keys Array(String),
+	weights Option(Array(Float)),
+	aggregate Option(Aggregate),
+) Array(String) {
+	redis.parts(
+		[
+			[redis.arg(array.length(keys))],
+			keys,
+			redis.when_some(weights, fn(
+				ws,
+			) redis.parts([['WEIGHTS'], array.map(ws, fn(w) number.score_to_string(Finite(w)))])),
+			redis.when_some(aggregate, options.render_aggregate),
+		],
+	)
+}
+
+// ---------------------------------------------------------------------------
+// The pre-6.2 range spellings.
+// ---------------------------------------------------------------------------
+//
+// `zrange_by_score` and `zrange_by_lex` above cover all of these through
+// ZRANGE's BYSCORE/BYLEX/REV modifiers, which is what Redis recommends. They
+// are kept because a codebase migrating to this client will have them written
+// down, and because a server older than 6.2 understands nothing else.
+
+pub fn zrangebyscore(
+	c Conn,
+	key String,
+	min ScoreBound,
+	max ScoreBound,
+	limit Option(Limit),
+) Result(Array(String), RedisError) {
+	redis.expect_strings(
+		redis.command(
+			c,
+			redis.parts(
+				[
+					['ZRANGEBYSCORE', key, render_score_bound(min), render_score_bound(max)],
+					redis.when_some(limit, options.render_limit),
+				],
+			),
+		),
+	)
+}
+
+// Note the argument order: max first, as the command itself takes them.
+pub fn zrevrangebyscore(
+	c Conn,
+	key String,
+	max ScoreBound,
+	min ScoreBound,
+	limit Option(Limit),
+) Result(Array(String), RedisError) {
+	redis.expect_strings(
+		redis.command(
+			c,
+			redis.parts(
+				[
+					['ZREVRANGEBYSCORE', key, render_score_bound(max), render_score_bound(min)],
+					redis.when_some(limit, options.render_limit),
+				],
+			),
+		),
+	)
+}
+
+pub fn zrangebylex(
+	c Conn,
+	key String,
+	min LexBound,
+	max LexBound,
+	limit Option(Limit),
+) Result(Array(String), RedisError) {
+	redis.expect_strings(
+		redis.command(
+			c,
+			redis.parts(
+				[
+					['ZRANGEBYLEX', key, render_lex_bound(min), render_lex_bound(max)],
+					redis.when_some(limit, options.render_limit),
+				],
+			),
+		),
+	)
+}
+
+pub fn zrevrangebylex(
+	c Conn,
+	key String,
+	max LexBound,
+	min LexBound,
+	limit Option(Limit),
+) Result(Array(String), RedisError) {
+	redis.expect_strings(
+		redis.command(
+			c,
+			redis.parts(
+				[
+					['ZREVRANGEBYLEX', key, render_lex_bound(max), render_lex_bound(min)],
+					redis.when_some(limit, options.render_limit),
+				],
+			),
+		),
+	)
+}
+
+pub fn zrevrange(c Conn, key String, start Int, stop Int) Result(Array(String), RedisError) {
+	redis.expect_strings(redis.command(c, ['ZREVRANGE', key, redis.arg(start), redis.arg(stop)]))
+}
+
+pub fn zrevrange_withscores(
+	c Conn,
+	key String,
+	start Int,
+	stop Int,
+) Result(Array((String, Score)), RedisError) {
+	redis.expect_scored(
+		redis.command(c, ['ZREVRANGE', key, redis.arg(start), redis.arg(stop), 'WITHSCORES']),
+	)
+}

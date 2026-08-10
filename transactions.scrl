@@ -1,0 +1,82 @@
+// Transactions: MULTI, EXEC, and the optimistic locking WATCH provides.
+//
+// A Redis transaction is not a rollback transaction. Queued commands are run
+// one after another with nothing interleaved, but a command that fails at
+// runtime — wrong type for the key, say — does not undo the ones before it.
+// What you get is isolation, not atomic rollback.
+//
+// WATCH is the other half: it aborts the whole EXEC if any watched key changed
+// since the WATCH, which is how a read-modify-write is made safe without
+// holding a lock.
+
+import scarlet/array
+import ./redis.{Conn, RedisError}
+
+// Open a transaction. Commands sent after this are queued rather than run.
+pub fn multi(c Conn) Result(Nil, RedisError) {
+	redis.expect_ok(redis.command(c, ['MULTI']))
+}
+
+// Queue a command inside an open transaction. The server answers QUEUED; a
+// command it cannot parse or does not know is rejected here, and that poisons
+// the transaction — EXEC will then refuse rather than run a partial batch.
+pub fn queue(c Conn, args Array(String)) Result(Nil, RedisError) {
+	match redis.expect_status(redis.command(c, args)) {
+		Ok('QUEUED') -> Ok(Nil)
+		Ok(other) -> Err(redis.Protocol('expected QUEUED, got ${other}'))
+		Err(e) -> Err(e)
+	}
+}
+
+// Run the queued commands and collect their replies, in order.
+//
+// `None` means the transaction was aborted because a watched key changed — not
+// an error, but the signal to read the values again and retry.
+pub fn exec(c Conn) Result(Option(Array(resp.Value)), RedisError) {
+	redis.expect_opt_values(redis.command(c, ['EXEC']))
+}
+
+// Throw the queued commands away without running any of them.
+pub fn discard(c Conn) Result(Nil, RedisError) {
+	redis.expect_ok(redis.command(c, ['DISCARD']))
+}
+
+// Watch keys for modification until the next EXEC or DISCARD. Must be called
+// before MULTI, not inside the transaction.
+pub fn watch(c Conn, keys Array(String)) Result(Nil, RedisError) {
+	redis.expect_ok(redis.command(c, array.concat(['WATCH'], keys)))
+}
+
+// Stop watching everything. EXEC and DISCARD do this too.
+pub fn unwatch(c Conn) Result(Nil, RedisError) {
+	redis.expect_ok(redis.command(c, ['UNWATCH']))
+}
+
+// Queue a whole batch and run it: MULTI, each command, EXEC. If queuing any of
+// them fails the transaction is discarded rather than left open on the
+// connection, which would break every command that followed.
+pub fn transaction(
+	c Conn,
+	commands Array(Array(String)),
+) Result(Option(Array(resp.Value)), RedisError) {
+	match multi(c) {
+		Err(e) -> Err(e)
+		Ok(Nil) -> match queue_all(c, commands) {
+			Ok(Nil) -> exec(c)
+			Err(e) -> {
+				discard(c) or Nil
+				Err(e)
+			}
+		}
+	}
+}
+
+fn queue_all(c Conn, commands Array(Array(String))) Result(Nil, RedisError) {
+	match commands {
+		[] -> Ok(Nil)
+		[first, ..rest] -> match queue(c, first) {
+			Ok(Nil) -> queue_all(c, rest)
+			Err(e) -> Err(e)
+		}
+	}
+}

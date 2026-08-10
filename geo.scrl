@@ -1,0 +1,495 @@
+// Geospatial commands.
+//
+// A geo index is a sorted set whose scores are 52-bit geohashes, so every
+// sorted-set command works on one — `zrem` removes a place, `zcard` counts
+// them. What these commands add is the coordinate encoding and the searches.
+
+import scarlet/array
+import ./number.{Finite, Score}
+import ./redis.{Conn, RedisError}
+import ./options.{Condition, Direction, Unit}
+
+// A longitude/latitude pair, in degrees. Longitude comes first, matching the
+// order Redis takes and returns them — the opposite of the "lat, long" a map
+// application usually shows.
+pub type Point {
+	longitude Float
+	latitude Float
+}
+
+fn render_point(p Point) Array(String) {
+	match p {
+		Point(lon, lat) ->
+			[number.score_to_string(Finite(lon)), number.score_to_string(Finite(lat))]
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Adding and reading.
+// ---------------------------------------------------------------------------
+
+// Add places, returning how many were new. `condition` guards existing
+// members, and `changed` makes the count include moved ones.
+pub fn geoadd(
+	c Conn,
+	key String,
+	places Array((String, Point)),
+	condition Condition,
+	changed Bool,
+) Result(Int, RedisError) {
+	redis.expect_int(
+		redis.command(
+			c,
+			redis.parts(
+				[
+					['GEOADD', key],
+					options.render_condition(condition),
+					redis.when(changed, ['CH']),
+					array.fold(places, [], fn(acc, place) match place {
+						(member, point) -> redis.parts([acc, render_point(point), [member]])
+					}),
+				],
+			),
+		),
+	)
+}
+
+// The distance between two members, `None` if either is missing.
+pub fn geodist(
+	c Conn,
+	key String,
+	member1 String,
+	member2 String,
+	unit Unit,
+) Result(Option(Score), RedisError) {
+	redis.expect_opt_score(
+		redis.command(c, ['GEODIST', key, member1, member2, options.render_unit(unit)]),
+	)
+}
+
+// The Geohash string for each member — the standard base-32 form, comparable
+// with geohashes from anywhere else.
+pub fn geohash(
+	c Conn,
+	key String,
+	members Array(String),
+) Result(Array(Option(String)), RedisError) {
+	redis.expect_opt_strings(redis.command(c, redis.parts([['GEOHASH', key], members])))
+}
+
+// The coordinates of each member. `None` for one that is not in the index.
+//
+// The values come back slightly changed from what was stored: the geohash is
+// 52 bits, so a position round-trips to within about half a metre.
+pub fn geopos(
+	c Conn,
+	key String,
+	members Array(String),
+) Result(Array(Option(Point)), RedisError) {
+	match redis.expect_values(redis.command(c, redis.parts([['GEOPOS', key], members]))) {
+		Err(e) -> Err(e)
+		Ok(values) -> redis.collect(array.map(values, decode_point))
+	}
+}
+
+fn decode_point(v resp.Value) Result(Option(Point), RedisError) {
+	match v {
+		Null -> Ok(None)
+		other -> match redis.expect_values(Ok(other)) {
+			Err(e) -> Err(e)
+			Ok([lon, lat]) -> match (coordinate(lon), coordinate(lat)) {
+				(Ok(x), Ok(y)) -> Ok(Some(Point(x, y)))
+				(Err(e), _) -> Err(e)
+				(_, Err(e)) -> Err(e)
+			}
+			Ok(_) -> Err(redis.Protocol('expected a longitude and a latitude'))
+		}
+	}
+}
+
+fn coordinate(v resp.Value) Result(Float, RedisError) {
+	// A coordinate is always finite — the infinities a Score can carry cannot
+	// occur here, so collapsing to Float loses nothing.
+	redis.map_ok(redis.value_score(v), fn(s) number.score_or(s, 0.0))
+}
+
+// ---------------------------------------------------------------------------
+// Searching.
+// ---------------------------------------------------------------------------
+
+// Where a search is centred: on a member already in the index, or on a
+// coordinate.
+pub type Origin {
+	FromMember(member String)
+	FromPoint(point Point)
+}
+
+fn render_origin(o Origin) Array(String) {
+	match o {
+		FromMember(m) -> ['FROMMEMBER', m]
+		FromPoint(p) -> redis.parts([['FROMLONLAT'], render_point(p)])
+	}
+}
+
+// The shape searched: a circle, or an axis-aligned rectangle.
+pub type Shape {
+	ByRadius(radius Float, unit Unit)
+	ByBox(width Float, height Float, unit Unit)
+}
+
+fn render_shape(s Shape) Array(String) {
+	match s {
+		ByRadius(r, unit) ->
+			['BYRADIUS', number.score_to_string(Finite(r)), options.render_unit(unit)]
+		ByBox(w, h, unit) ->
+			[
+				'BYBOX',
+				number.score_to_string(Finite(w)),
+				number.score_to_string(Finite(h)),
+				options.render_unit(unit),
+			]
+	}
+}
+
+// What to return alongside each member.
+pub type Detail {
+	WithCoordinates
+	WithDistance
+	WithHash
+}
+
+fn render_detail(d Detail) String {
+	match d {
+		WithCoordinates -> 'WITHCOORD'
+		WithDistance -> 'WITHDIST'
+		WithHash -> 'WITHHASH'
+	}
+}
+
+// One hit. The optional fields are present exactly when the matching `Detail`
+// was requested.
+pub type Found {
+	member String
+	distance Option(Score)
+	hash Option(Int)
+	point Option(Point)
+}
+
+// Members inside a shape. `count` caps the results; with `any`, the search
+// stops as soon as that many are found rather than sorting all matches first —
+// faster, but the ones you get are then arbitrary.
+pub fn geosearch(
+	c Conn,
+	key String,
+	origin Origin,
+	shape Shape,
+	sort Option(Direction),
+	count Option(Int),
+	any Bool,
+	details Array(Detail),
+) Result(Array(Found), RedisError) {
+	decode_found(
+		redis.command(
+			c,
+			redis.parts(
+				[
+					['GEOSEARCH', key],
+					render_origin(origin),
+					render_shape(shape),
+					redis.when_some(sort, options.render_direction),
+					redis.when_some(
+						count,
+						fn(n) redis.parts([['COUNT', redis.arg(n)], redis.when(any, ['ANY'])]),
+					),
+					array.map(details, render_detail),
+				],
+			),
+		),
+		details,
+	)
+}
+
+// The same search, storing the matching members in a destination sorted set
+// rather than returning them. With `store_dist` the destination's scores are
+// the distances instead of the geohashes, which makes the result a ranking.
+pub fn geosearchstore(
+	c Conn,
+	destination String,
+	source String,
+	origin Origin,
+	shape Shape,
+	sort Option(Direction),
+	count Option(Int),
+	any Bool,
+	store_dist Bool,
+) Result(Int, RedisError) {
+	redis.expect_int(
+		redis.command(
+			c,
+			redis.parts(
+				[
+					['GEOSEARCHSTORE', destination, source],
+					render_origin(origin),
+					render_shape(shape),
+					redis.when_some(sort, options.render_direction),
+					redis.when_some(
+						count,
+						fn(n) redis.parts([['COUNT', redis.arg(n)], redis.when(any, ['ANY'])]),
+					),
+					redis.when(store_dist, ['STOREDIST']),
+				],
+			),
+		),
+	)
+}
+
+// With no details requested the reply is a flat array of member names; with
+// any, each element becomes an array whose first entry is the name and whose
+// rest arrive in a fixed order — distance, hash, coordinates — skipping the
+// ones that were not asked for.
+fn decode_found(
+	reply Result(resp.Value, RedisError),
+	details Array(Detail),
+) Result(Array(Found), RedisError) {
+	if array.length(details) == 0 {
+		redis.map_ok(
+			redis.expect_strings(reply),
+			fn(names) array.map(names, fn(n) Found(n, None, None, None)),
+		)
+	} else {
+		match redis.expect_values(reply) {
+			Err(e) -> Err(e)
+			Ok(entries) -> redis.collect(array.map(entries, fn(entry) decode_entry(entry, details)))
+		}
+	}
+}
+
+fn decode_entry(entry resp.Value, details Array(Detail)) Result(Found, RedisError) {
+	match redis.expect_values(Ok(entry)) {
+		Err(e) -> Err(e)
+		Ok([]) -> Err(redis.Protocol('empty geo result entry'))
+		Ok([name, ..rest]) -> match redis.value_text(name) {
+			Err(e) -> Err(e)
+			Ok(member) -> gather(member, rest, details)
+		}
+	}
+}
+
+fn gather(
+	member String,
+	rest Array(resp.Value),
+	details Array(Detail),
+) Result(Found, RedisError) {
+	wants = fn(d Detail) array.contains(details, d)
+	// The order is fixed by the server, not by the order the flags were given.
+	(distance, after_dist) = if wants(WithDistance) {
+		match rest {
+			[d, ..tail] -> (Some(d), tail)
+			[] -> (None, [])
+		}
+	} else {
+		(None, rest)
+	}
+	(hash, after_hash) = if wants(WithHash) {
+		match after_dist {
+			[h, ..tail] -> (Some(h), tail)
+			[] -> (None, [])
+		}
+	} else {
+		(None, after_dist)
+	}
+	point = if wants(WithCoordinates) {
+		match after_hash {
+			[p, .._] -> Some(p)
+			[] -> None
+		}
+	} else {
+		None
+	}
+	match (opt_score(distance), opt_int(hash), opt_point(point)) {
+		(Ok(d), Ok(h), Ok(p)) -> Ok(Found(member, d, h, p))
+		(Err(e), _, _) -> Err(e)
+		(_, Err(e), _) -> Err(e)
+		(_, _, Err(e)) -> Err(e)
+	}
+}
+
+fn opt_score(v Option(resp.Value)) Result(Option(Score), RedisError) {
+	match v {
+		None -> Ok(None)
+		Some(x) -> redis.map_ok(redis.value_score(x), fn(s) Some(s))
+	}
+}
+
+fn opt_int(v Option(resp.Value)) Result(Option(Int), RedisError) {
+	match v {
+		None -> Ok(None)
+		Some(x) -> redis.map_ok(redis.value_int(x), fn(n) Some(n))
+	}
+}
+
+fn opt_point(v Option(resp.Value)) Result(Option(Point), RedisError) {
+	match v {
+		None -> Ok(None)
+		Some(x) -> decode_point(x)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The pre-6.2 search spellings.
+// ---------------------------------------------------------------------------
+//
+// `geosearch` covers both of these and is what Redis recommends. They are kept
+// for servers older than 6.2, and because GEORADIUS can store its result,
+// which `geosearchstore` now does instead.
+
+pub fn georadius(
+	c Conn,
+	key String,
+	centre Point,
+	radius Float,
+	unit Unit,
+	sort Option(Direction),
+	count Option(Int),
+	details Array(Detail),
+) Result(Array(Found), RedisError) {
+	decode_found(
+		redis.command(
+			c,
+			redis.parts(
+				[
+					['GEORADIUS', key],
+					render_point(centre),
+					[number.score_to_string(Finite(radius)), options.render_unit(unit)],
+					array.map(details, render_detail),
+					redis.when_some(count, fn(n) ['COUNT', redis.arg(n)]),
+					redis.when_some(sort, options.render_direction),
+				],
+			),
+		),
+		details,
+	)
+}
+
+// The read-only form, which a replica will accept — plain GEORADIUS is a write
+// command because it can STORE, even when no destination is given.
+pub fn georadius_ro(
+	c Conn,
+	key String,
+	centre Point,
+	radius Float,
+	unit Unit,
+	sort Option(Direction),
+	count Option(Int),
+	details Array(Detail),
+) Result(Array(Found), RedisError) {
+	decode_found(
+		redis.command(
+			c,
+			redis.parts(
+				[
+					['GEORADIUS_RO', key],
+					render_point(centre),
+					[number.score_to_string(Finite(radius)), options.render_unit(unit)],
+					array.map(details, render_detail),
+					redis.when_some(count, fn(n) ['COUNT', redis.arg(n)]),
+					redis.when_some(sort, options.render_direction),
+				],
+			),
+		),
+		details,
+	)
+}
+
+pub fn georadiusbymember(
+	c Conn,
+	key String,
+	member String,
+	radius Float,
+	unit Unit,
+	sort Option(Direction),
+	count Option(Int),
+	details Array(Detail),
+) Result(Array(Found), RedisError) {
+	decode_found(
+		redis.command(
+			c,
+			redis.parts(
+				[
+					[
+						'GEORADIUSBYMEMBER',
+						key,
+						member,
+						number.score_to_string(Finite(radius)),
+						options.render_unit(unit),
+					],
+					array.map(details, render_detail),
+					redis.when_some(count, fn(n) ['COUNT', redis.arg(n)]),
+					redis.when_some(sort, options.render_direction),
+				],
+			),
+		),
+		details,
+	)
+}
+
+pub fn georadiusbymember_ro(
+	c Conn,
+	key String,
+	member String,
+	radius Float,
+	unit Unit,
+	sort Option(Direction),
+	count Option(Int),
+	details Array(Detail),
+) Result(Array(Found), RedisError) {
+	decode_found(
+		redis.command(
+			c,
+			redis.parts(
+				[
+					[
+						'GEORADIUSBYMEMBER_RO',
+						key,
+						member,
+						number.score_to_string(Finite(radius)),
+						options.render_unit(unit),
+					],
+					array.map(details, render_detail),
+					redis.when_some(count, fn(n) ['COUNT', redis.arg(n)]),
+					redis.when_some(sort, options.render_direction),
+				],
+			),
+		),
+		details,
+	)
+}
+
+// Store the matching members in a destination sorted set, returning how many.
+// With `store_dist` the scores are distances rather than geohashes.
+pub fn georadius_store(
+	c Conn,
+	key String,
+	centre Point,
+	radius Float,
+	unit Unit,
+	destination String,
+	store_dist Bool,
+	count Option(Int),
+) Result(Int, RedisError) {
+	verb = if store_dist { 'STOREDIST' } else { 'STORE' }
+	redis.expect_int(
+		redis.command(
+			c,
+			redis.parts(
+				[
+					['GEORADIUS', key],
+					render_point(centre),
+					[number.score_to_string(Finite(radius)), options.render_unit(unit)],
+					redis.when_some(count, fn(n) ['COUNT', redis.arg(n)]),
+					[verb, destination],
+				],
+			),
+		),
+	)
+}

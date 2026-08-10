@@ -1,0 +1,414 @@
+// Generic key commands: existence, expiry, renaming, iteration, and sorting —
+// everything that applies to a key whatever type of value it holds.
+
+import scarlet/array
+import scarlet/binary
+import ./redis.{Conn, RedisError}
+import ./options.{Direction, ExpireWhen, Limit, Ttl}
+
+// ---------------------------------------------------------------------------
+// Existence and removal.
+// ---------------------------------------------------------------------------
+
+// How many of the given keys were removed. Keys that did not exist are simply
+// not counted, so this is never an error.
+pub fn del(c Conn, keys Array(String)) Result(Int, RedisError) {
+	redis.expect_int(redis.command(c, array.concat(['DEL'], keys)))
+}
+
+// DEL, but the memory is reclaimed by a background thread. Prefer it for large
+// collections, where the free itself is what blocks the server.
+pub fn unlink(c Conn, keys Array(String)) Result(Int, RedisError) {
+	redis.expect_int(redis.command(c, array.concat(['UNLINK'], keys)))
+}
+
+// How many of the given keys exist. Duplicates are counted repeatedly, so
+// `exists(c, ['k', 'k'])` on one live key is 2 — use `has` for the yes/no.
+pub fn exists(c Conn, keys Array(String)) Result(Int, RedisError) {
+	redis.expect_int(redis.command(c, array.concat(['EXISTS'], keys)))
+}
+
+pub fn has(c Conn, key String) Result(Bool, RedisError) {
+	redis.expect_bool(redis.command(c, ['EXISTS', key]))
+}
+
+// Read the keys without changing their idle time — the way to check liveness
+// without disturbing an LRU eviction policy.
+pub fn touch(c Conn, keys Array(String)) Result(Int, RedisError) {
+	redis.expect_int(redis.command(c, array.concat(['TOUCH'], keys)))
+}
+
+// ---------------------------------------------------------------------------
+// Type.
+// ---------------------------------------------------------------------------
+
+// What kind of value a key holds. `NoKey` is the answer for a key that does
+// not exist, which Redis spells 'none'.
+pub type KeyType {
+	StringKey
+	ListKey
+	SetKey
+	SortedSetKey
+	HashKey
+	StreamKey
+	NoKey
+	// A type this client does not know — a module type, or one added to Redis
+	// after this was written. Kept rather than rejected: a client should not
+	// fail on a server that knows more than it does.
+	OtherKey(name String)
+}
+
+pub fn key_type(c Conn, key String) Result(KeyType, RedisError) {
+	redis.map_ok(redis.expect_status(redis.command(c, ['TYPE', key])), fn(name) match name {
+		'string' -> StringKey
+		'list' -> ListKey
+		'set' -> SetKey
+		'zset' -> SortedSetKey
+		'hash' -> HashKey
+		'stream' -> StreamKey
+		'none' -> NoKey
+		other -> OtherKey(other)
+	})
+}
+
+// ---------------------------------------------------------------------------
+// Expiry.
+// ---------------------------------------------------------------------------
+
+// Set an expiry. False means the condition was not met, or the key is absent.
+pub fn expire(c Conn, key String, ttl Ttl, when ExpireWhen) Result(Bool, RedisError) {
+	redis.expect_bool(
+		redis.command(
+			c,
+			redis.parts(
+				[
+					[options.ttl_verb(ttl), key, options.ttl_amount(ttl)],
+					options.render_expire_when(when),
+				],
+			),
+		),
+	)
+}
+
+// Remove the expiry, making the key permanent. False if it had none.
+pub fn persist(c Conn, key String) Result(Bool, RedisError) {
+	redis.expect_bool(redis.command(c, ['PERSIST', key]))
+}
+
+// How long a key has left, as `redis.Remaining` — `NoExpiry` for a key that
+// never expires, `Missing` for one that is not there.
+pub fn ttl(c Conn, key String) Result(redis.Remaining, RedisError) {
+	redis.expect_remaining(redis.command(c, ['TTL', key]))
+}
+
+pub fn pttl(c Conn, key String) Result(redis.Remaining, RedisError) {
+	redis.expect_remaining(redis.command(c, ['PTTL', key]))
+}
+
+// The absolute moment a key expires, rather than the duration until it does.
+pub fn expiretime(c Conn, key String) Result(redis.Remaining, RedisError) {
+	redis.expect_remaining(redis.command(c, ['EXPIRETIME', key]))
+}
+
+pub fn pexpiretime(c Conn, key String) Result(redis.Remaining, RedisError) {
+	redis.expect_remaining(redis.command(c, ['PEXPIRETIME', key]))
+}
+
+// ---------------------------------------------------------------------------
+// Moving and copying.
+// ---------------------------------------------------------------------------
+
+pub fn rename(c Conn, key String, new_key String) Result(Nil, RedisError) {
+	redis.expect_ok(redis.command(c, ['RENAME', key, new_key]))
+}
+
+// Rename only if the destination is free. False means it was taken.
+pub fn renamenx(c Conn, key String, new_key String) Result(Bool, RedisError) {
+	redis.expect_bool(redis.command(c, ['RENAMENX', key, new_key]))
+}
+
+pub fn copy(
+	c Conn,
+	source String,
+	destination String,
+	db Option(Int),
+	replace Bool,
+) Result(Bool, RedisError) {
+	redis.expect_bool(
+		redis.command(
+			c,
+			redis.parts(
+				[
+					['COPY', source, destination],
+					redis.when_some(db, fn(n) ['DB', redis.arg(n)]),
+					redis.when(replace, ['REPLACE']),
+				],
+			),
+		),
+	)
+}
+
+// Move a key to another database on the same server. False if the key is
+// absent or the destination already has that name.
+pub fn move(c Conn, key String, db Int) Result(Bool, RedisError) {
+	redis.expect_bool(redis.command(c, ['MOVE', key, redis.arg(db)]))
+}
+
+// ---------------------------------------------------------------------------
+// Iteration.
+// ---------------------------------------------------------------------------
+
+// Every key matching a glob pattern. This walks the whole keyspace in one
+// blocking pass — fine on a small database or a replica, a stall on a large
+// one. `scan` is the incremental version and is what production code wants.
+pub fn keys(c Conn, pattern String) Result(Array(String), RedisError) {
+	redis.expect_strings(redis.command(c, ['KEYS', pattern]))
+}
+
+pub fn random_key(c Conn) Result(Option(String), RedisError) {
+	redis.expect_bulk(redis.command(c, ['RANDOMKEY']))
+}
+
+// One step of a cursored walk of the keyspace. Start at cursor 0 and pass back
+// the cursor you are given until it returns to 0. `count` is a hint about work
+// per call, not a page size — a batch may be empty while the cursor advances,
+// and that is not the end.
+pub fn scan(
+	c Conn,
+	cursor Int,
+	pattern Option(String),
+	count Option(Int),
+	of_type Option(String),
+) Result((Int, Array(String)), RedisError) {
+	redis.expect_scan(
+		redis.command(
+			c,
+			redis.parts(
+				[
+					['SCAN', redis.arg(cursor)],
+					redis.when_some(pattern, fn(p) ['MATCH', p]),
+					redis.when_some(count, fn(n) ['COUNT', redis.arg(n)]),
+					redis.when_some(of_type, fn(t) ['TYPE', t]),
+				],
+			),
+		),
+	)
+}
+
+// Walk the whole keyspace, gathering every match. Convenience over `scan` for
+// when the result is known to fit in memory; it still goes a batch at a time,
+// so it never blocks the server the way `keys` does.
+pub fn scan_all(
+	c Conn,
+	pattern Option(String),
+	count Option(Int),
+) Result(Array(String), RedisError) {
+	scan_loop(c, 0, pattern, count, [])
+}
+
+fn scan_loop(
+	c Conn,
+	cursor Int,
+	pattern Option(String),
+	count Option(Int),
+	acc Array(String),
+) Result(Array(String), RedisError) {
+	match scan(c, cursor, pattern, count, None) {
+		Err(e) -> Err(e)
+		Ok((next, batch)) -> {
+			found = array.concat(acc, batch)
+			if next == 0 {
+				Ok(found)
+			} else {
+				scan_loop(c, next, pattern, count, found)
+			}
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Sorting.
+// ---------------------------------------------------------------------------
+
+// SORT's modifiers. `by` and `get` take key patterns containing `*`, and the
+// special pattern `#` in `get` means the element itself. `alpha` sorts
+// lexicographically — without it the elements must parse as numbers.
+pub type SortOptions {
+	by Option(String)
+	limit Option(Limit)
+	get Array(String)
+	direction Option(Direction)
+	alpha Bool
+}
+
+pub const SORT_DEFAULTS = SortOptions(by: None, limit: None, get: [], direction: None, alpha: False)
+
+pub fn sort(c Conn, key String, opts SortOptions) Result(Array(String), RedisError) {
+	redis.expect_strings(redis.command(c, array.concat(['SORT', key], sort_args(opts))))
+}
+
+// The read-only form, which a replica will accept.
+pub fn sort_ro(c Conn, key String, opts SortOptions) Result(Array(String), RedisError) {
+	redis.expect_strings(redis.command(c, array.concat(['SORT_RO', key], sort_args(opts))))
+}
+
+// Sort into a destination list, returning its length.
+pub fn sort_store(
+	c Conn,
+	key String,
+	destination String,
+	opts SortOptions,
+) Result(Int, RedisError) {
+	redis.expect_int(
+		redis.command(c, redis.parts([['SORT', key], sort_args(opts), ['STORE', destination]])),
+	)
+}
+
+fn sort_args(opts SortOptions) Array(String) {
+	match opts {
+		SortOptions(by, limit, get, direction, alpha) ->
+			redis.parts(
+				[
+					redis.when_some(by, fn(p) ['BY', p]),
+					redis.when_some(limit, options.render_limit),
+					array.fold(get, [], fn(acc, p) array.concat(acc, ['GET', p])),
+					redis.when_some(direction, options.render_direction),
+					redis.when(alpha, ['ALPHA']),
+				],
+			)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Serialization and introspection.
+// ---------------------------------------------------------------------------
+
+// The serialized form of a value, for handing to `restore`. Binary, not text —
+// it carries a version footer and a checksum.
+pub fn dump(c Conn, key String) Result(Option(Binary), RedisError) {
+	redis.expect_binary(redis.command(c, ['DUMP', key]))
+}
+
+// Recreate a key from `dump` output. `ttl` is in milliseconds, 0 for none; the
+// payload is passed as raw bytes because it is not text.
+pub fn restore(
+	c Conn,
+	key String,
+	ttl_ms Int,
+	serialized Binary,
+	replace Bool,
+	absolute_ttl Bool,
+	idle_time Option(Int),
+	freq Option(Int),
+) Result(Nil, RedisError) {
+	head = array.map(['RESTORE', key, redis.arg(ttl_ms)], binary.from_string)
+	tail = array.map(
+		redis.parts(
+			[
+				redis.when(replace, ['REPLACE']),
+				redis.when(absolute_ttl, ['ABSTTL']),
+				redis.when_some(idle_time, fn(n) ['IDLETIME', redis.arg(n)]),
+				redis.when_some(freq, fn(n) ['FREQ', redis.arg(n)]),
+			],
+		),
+		binary.from_string,
+	)
+	redis.expect_ok(redis.command_raw(c, redis.parts([head, [serialized], tail])))
+}
+
+// How the value is stored internally — 'listpack', 'skiplist', 'intset' and so
+// on. Diagnostic: encodings change between Redis versions.
+pub fn object_encoding(c Conn, key String) Result(String, RedisError) {
+	redis.expect_string(redis.command(c, ['OBJECT', 'ENCODING', key]))
+}
+
+pub fn object_refcount(c Conn, key String) Result(Int, RedisError) {
+	redis.expect_int(redis.command(c, ['OBJECT', 'REFCOUNT', key]))
+}
+
+pub fn object_idletime(c Conn, key String) Result(Int, RedisError) {
+	redis.expect_int(redis.command(c, ['OBJECT', 'IDLETIME', key]))
+}
+
+// The access frequency counter, which only exists under an LFU eviction
+// policy; under any other it is a `Server` error.
+pub fn object_freq(c Conn, key String) Result(Int, RedisError) {
+	redis.expect_int(redis.command(c, ['OBJECT', 'FREQ', key]))
+}
+
+// ---------------------------------------------------------------------------
+// Replication barriers.
+// ---------------------------------------------------------------------------
+
+// Block until the preceding writes have reached `replicas` replicas, or the
+// timeout passes. Returns how many acknowledged — which may be fewer than
+// asked for, so the count is the answer, not a guarantee.
+pub fn wait(c Conn, replicas Int, timeout_ms Int) Result(Int, RedisError) {
+	redis.expect_int(redis.command(c, ['WAIT', redis.arg(replicas), redis.arg(timeout_ms)]))
+}
+
+// The same barrier against the append-only file: how many local and replica
+// AOFs have fsynced the preceding writes.
+pub fn waitaof(
+	c Conn,
+	local Int,
+	replicas Int,
+	timeout_ms Int,
+) Result((Int, Int), RedisError) {
+	match redis.expect_values(
+		redis.command(c, ['WAITAOF', redis.arg(local), redis.arg(replicas), redis.arg(timeout_ms)]),
+	) {
+		Err(e) -> Err(e)
+		Ok([l, r]) -> match (redis.value_int(l), redis.value_int(r)) {
+			(Ok(a), Ok(b)) -> Ok((a, b))
+			(Err(e), _) -> Err(e)
+			(_, Err(e)) -> Err(e)
+		}
+		Ok(_) -> Err(redis.Protocol('expected two counts from WAITAOF'))
+	}
+}
+
+// Move keys to another instance, atomically: they are serialized, sent,
+// restored on the target, and removed here unless `copy` is set. `timeout_ms`
+// bounds the transfer, not the whole operation.
+//
+// A migration that times out can leave the keys on both instances — Redis
+// reports IOERR and the caller has to check. That is a property of the command,
+// not of this wrapper.
+pub fn migrate(
+	c Conn,
+	host String,
+	port Int,
+	destination_db Int,
+	timeout_ms Int,
+	to_migrate Array(String),
+	copy Bool,
+	replace Bool,
+	auth Option((String, String)),
+) Result(String, RedisError) {
+	redis.expect_status(
+		redis.command(
+			c,
+			redis.parts(
+				[
+					// The empty key argument is what selects the multi-key KEYS form.
+					[
+						'MIGRATE',
+						host,
+						redis.arg(port),
+						'',
+						redis.arg(destination_db),
+						redis.arg(timeout_ms),
+					],
+					redis.when(copy, ['COPY']),
+					redis.when(replace, ['REPLACE']),
+					redis.when_some(auth, fn(creds) match creds {
+						(username, password) -> ['AUTH2', username, password]
+					}),
+					['KEYS'],
+					to_migrate,
+				],
+			),
+		),
+	)
+}

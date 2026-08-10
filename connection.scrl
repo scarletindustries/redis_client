@@ -1,0 +1,161 @@
+// Connection-level commands: liveness, authentication, database selection,
+// and the CLIENT family.
+
+import scarlet/array
+import ./redis.{Conn, RedisError}
+
+// PONG, unless the connection is in subscriber mode.
+pub fn ping(c Conn) Result(String, RedisError) {
+	redis.expect_status(redis.command(c, ['PING']))
+}
+
+// PING with a payload, which comes back verbatim — useful for matching a
+// reply to a probe.
+pub fn ping_message(c Conn, message String) Result(String, RedisError) {
+	redis.expect_string(redis.command(c, ['PING', message]))
+}
+
+pub fn echo(c Conn, message String) Result(String, RedisError) {
+	redis.expect_string(redis.command(c, ['ECHO', message]))
+}
+
+// Switch database. Numbered 0-15 by default; a cluster has only database 0.
+pub fn select(c Conn, db Int) Result(Nil, RedisError) {
+	redis.expect_ok(redis.command(c, ['SELECT', redis.arg(db)]))
+}
+
+// Authenticate with a password only, for a server using `requirepass` and no
+// ACL users.
+pub fn auth(c Conn, password String) Result(Nil, RedisError) {
+	redis.expect_ok(redis.command(c, ['AUTH', password]))
+}
+
+// Authenticate as a named ACL user.
+pub fn auth_as(c Conn, username String, password String) Result(Nil, RedisError) {
+	redis.expect_ok(redis.command(c, ['AUTH', username, password]))
+}
+
+// The handshake. Returns the server's greeting as field/value pairs — version,
+// role, protocol and so on. The values stay as raw replies because they are
+// not uniformly text: `modules` is an array of module descriptions.
+//
+// This client speaks RESP2 and only RESP2: the decoders assume the RESP2
+// spellings, where a map is a flat array and a double is a bulk string.
+// Requesting protocol 3 here would change those shapes underneath and is not
+// supported, so `hello` deliberately does not take a version.
+pub fn hello(c Conn) Result(Array((String, resp.Value)), RedisError) {
+	redis.expect_fields(redis.command(c, ['HELLO', '2']))
+}
+
+pub fn hello_auth(
+	c Conn,
+	username String,
+	password String,
+	client_name Option(String),
+) Result(Array((String, resp.Value)), RedisError) {
+	redis.expect_fields(
+		redis.command(
+			c,
+			redis.parts(
+				[
+					['HELLO', '2', 'AUTH', username, password],
+					redis.when_some(client_name, fn(n) ['SETNAME', n]),
+				],
+			),
+		),
+	)
+}
+
+// Reset the connection to its just-connected state: transaction discarded,
+// subscriptions dropped, authentication cleared, database back to 0.
+pub fn reset(c Conn) Result(String, RedisError) {
+	redis.expect_status(redis.command(c, ['RESET']))
+}
+
+// Ask the server to close the connection. `redis.close` closes the socket
+// directly and is usually what you want; this is the polite version, which
+// waits for pending replies to be delivered first.
+pub fn quit(c Conn) Result(Nil, RedisError) {
+	redis.expect_ok(redis.command(c, ['QUIT']))
+}
+
+// ---------------------------------------------------------------------------
+// CLIENT.
+// ---------------------------------------------------------------------------
+
+// This connection's unique ID, which `client_kill_by_id` and CLIENT UNPAUSE
+// refer to.
+pub fn client_id(c Conn) Result(Int, RedisError) {
+	redis.expect_int(redis.command(c, ['CLIENT', 'ID']))
+}
+
+// Attach a name to this connection. It shows up in `client_list`, which is
+// what makes a stuck connection identifiable in production.
+pub fn client_setname(c Conn, name String) Result(Nil, RedisError) {
+	redis.expect_ok(redis.command(c, ['CLIENT', 'SETNAME', name]))
+}
+
+pub fn client_getname(c Conn) Result(Option(String), RedisError) {
+	redis.expect_bulk(redis.command(c, ['CLIENT', 'GETNAME']))
+}
+
+// Every connected client, one line each, in the server's own field=value
+// format.
+pub fn client_list(c Conn) Result(String, RedisError) {
+	redis.expect_string(redis.command(c, ['CLIENT', 'LIST']))
+}
+
+// The same, for this connection only.
+pub fn client_info(c Conn) Result(String, RedisError) {
+	redis.expect_string(redis.command(c, ['CLIENT', 'INFO']))
+}
+
+// Disconnect a client by ID, returning how many were closed (0 or 1).
+pub fn client_kill_by_id(c Conn, id Int) Result(Int, RedisError) {
+	redis.expect_int(redis.command(c, ['CLIENT', 'KILL', 'ID', redis.arg(id)]))
+}
+
+// Disconnect by address, in `host:port` form.
+pub fn client_kill_by_addr(c Conn, addr String) Result(Int, RedisError) {
+	redis.expect_int(redis.command(c, ['CLIENT', 'KILL', 'ADDR', addr]))
+}
+
+// Exempt this connection from eviction when the server is under memory
+// pressure, or put it back in the pool.
+pub fn client_no_evict(c Conn, on Bool) Result(Nil, RedisError) {
+	redis.expect_ok(redis.command(c, ['CLIENT', 'NO-EVICT', on_off(on)]))
+}
+
+// Stop this connection's reads from counting as access, so they do not disturb
+// an LRU or LFU eviction policy.
+pub fn client_no_touch(c Conn, on Bool) Result(Nil, RedisError) {
+	redis.expect_ok(redis.command(c, ['CLIENT', 'NO-TOUCH', on_off(on)]))
+}
+
+// Suspend processing for every client for `timeout_ms`. `write_only` lets
+// reads through, which is the form used during a failover.
+pub fn client_pause(c Conn, timeout_ms Int, write_only Bool) Result(Nil, RedisError) {
+	mode = if write_only { 'WRITE' } else { 'ALL' }
+	redis.expect_ok(redis.command(c, ['CLIENT', 'PAUSE', redis.arg(timeout_ms), mode]))
+}
+
+pub fn client_unpause(c Conn) Result(Nil, RedisError) {
+	redis.expect_ok(redis.command(c, ['CLIENT', 'UNPAUSE']))
+}
+
+// The IDs of clients this one has unblocked or is tracking, per the server's
+// own reporting. Shape varies by version, so the pairs come back raw.
+pub fn client_tracking_info(c Conn) Result(Array((String, String)), RedisError) {
+	redis.expect_pairs(redis.command(c, ['CLIENT', 'TRACKINGINFO']))
+}
+
+// Unblock a client parked in a blocking command. With `as_error` it is woken
+// with an error instead of a timeout-shaped empty reply.
+pub fn client_unblock(c Conn, id Int, as_error Bool) Result(Bool, RedisError) {
+	how = if as_error { 'ERROR' } else { 'TIMEOUT' }
+	redis.expect_bool(redis.command(c, ['CLIENT', 'UNBLOCK', redis.arg(id), how]))
+}
+
+fn on_off(on Bool) String {
+	if on { 'ON' } else { 'OFF' }
+}

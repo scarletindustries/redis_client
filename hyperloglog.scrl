@@ -1,0 +1,42 @@
+// HyperLogLog: approximate cardinality in a fixed 12KB, whatever the number of
+// distinct elements.
+//
+// The trade is accuracy for space — the standard error is about 0.81%, and the
+// structure can tell you how many distinct things it has seen but never which
+// ones. A HyperLogLog is stored in an ordinary string key, so `keys.del` and
+// the expiry commands apply to it unchanged.
+
+import scarlet/array
+import ./redis.{Conn, RedisError}
+
+// Observe elements. True when the estimate changed as a result — which is not
+// the same as "these were new", since the registers only move when an element
+// lands in a bucket with a longer run of leading zeros than what is there.
+pub fn pfadd(c Conn, key String, elements Array(String)) Result(Bool, RedisError) {
+	redis.expect_bool(redis.command(c, redis.parts([['PFADD', key], elements])))
+}
+
+// Create an empty HyperLogLog, or leave an existing one alone.
+pub fn pfcreate(c Conn, key String) Result(Bool, RedisError) {
+	redis.expect_bool(redis.command(c, ['PFADD', key]))
+}
+
+// The estimated number of distinct elements. Given several keys, the estimate
+// is of their union — computed on the fly, without modifying any of them.
+//
+// Note this is a write command on a single key despite reading like a query:
+// it may rewrite the cached cardinality inside the value.
+pub fn pfcount(c Conn, keys Array(String)) Result(Int, RedisError) {
+	redis.expect_int(redis.command(c, array.concat(['PFCOUNT'], keys)))
+}
+
+// Merge several HyperLogLogs into a destination, which then estimates the
+// cardinality of the union. The destination is included in the union if it
+// already exists.
+pub fn pfmerge(
+	c Conn,
+	destination String,
+	sources Array(String),
+) Result(Nil, RedisError) {
+	redis.expect_ok(redis.command(c, redis.parts([['PFMERGE', destination], sources])))
+}

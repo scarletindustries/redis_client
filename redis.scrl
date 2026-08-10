@@ -1,0 +1,556 @@
+// A Redis client over a plain TCP socket.
+//
+// This module is the connection and the reply-decoding vocabulary. The
+// commands themselves live in `./redis/<group>.scrl`, one module per Redis
+// command group, and every one of them is built from `command` plus the
+// `expect_*` decoders below.
+//
+// A `Conn` is just the socket — no read buffer threaded through the caller's
+// code, because under strict request/response there is nothing to thread. We
+// write one command and read until exactly one reply is complete; Redis sends
+// exactly one reply per command and never speaks unbidden, so bytes arriving
+// past the end of that reply cannot belong to anything we asked for. Rather
+// than carry a buffer that is provably always empty at a command boundary,
+// `read_reply` checks for those bytes and reports the desync as an error. A
+// silent corruption becomes a loud, typed one.
+//
+// Two things that invariant does not cover. Pub/Sub, where the server pushes
+// messages nobody asked for, is why `./redis/pubsub.scrl` has its own
+// buffer-owning `Subscription` type rather than reusing `Conn`. Pipelining —
+// more than one command in flight — would need the same, and is not offered.
+//
+// A `Conn` is also not safe to share between processes: two of them writing
+// commands down one socket would interleave requests and read each other's
+// replies. Give each process its own connection; `with_conn` makes that a
+// one-liner.
+
+import scarlet/array
+import scarlet/binary
+import scarlet/int
+import scarlet/net
+import scarlet/net/error.{NetError, UnexpectedEof}
+import scarlet/net/socket.{Closed, Data, Socket}
+import scarlet/resource
+import scarlet/string
+import ./number.{Score}
+import ./resp.{Bad, Bulk, Done, List, NeedMore, Null, Num, RedisErr, SimpleStr, Value}
+
+// How much to ask the kernel for per read. Replies smaller than this arrive in
+// one call; larger ones simply loop.
+const READ_SIZE = 65536
+
+// Opaque: the only way to get one is `connect` or `with_conn`, so a `Conn` in
+// hand is always a socket that was actually dialled.
+pub opaque type Conn {
+	sock Socket
+}
+
+// The three ways a command fails, kept apart because they call for different
+// responses: `Net` means the connection is gone, `Server` means Redis
+// understood the command and refused it, and `Protocol` means the bytes on the
+// wire were not the RESP we expected — a bug here, a desync, or a server that
+// is not Redis.
+pub type RedisError {
+	Net(err NetError)
+	Server(message String)
+	Protocol(why String)
+}
+
+// ---------------------------------------------------------------------------
+// Connecting.
+// ---------------------------------------------------------------------------
+
+// Connect, run `next` with the connection, and close it on the way out —
+// whether `next` succeeded, failed, or the connect never happened. Written for
+// backpassing, which is what makes a script of commands read like a script:
+//
+//	conn <- redis.with_conn('127.0.0.1', 6379)
+//	...commands...
+//
+// The result is flattened rather than nested: a failure to connect and a
+// failure inside the body are both `RedisError`, and `Result(Result(a, e), e)`
+// would make every caller unwrap the same error type twice.
+pub fn with_conn(host String, port Int, next fn(Conn) Result(a, RedisError)) Result(a, RedisError) {
+	match resource.try_with(fn() connect(host, port), close, next) {
+		Ok(inner) -> inner
+		Err(e) -> Err(e)
+	}
+}
+
+pub fn connect(host String, port Int) Result(Conn, RedisError) {
+	match net.connect(host, port) {
+		Ok(sock) -> Ok(Conn(sock: sock))
+		Err(e) -> Err(Net(e))
+	}
+}
+
+pub fn close(c Conn) Nil {
+	socket.close(c.sock) or Nil
+}
+
+// The underlying socket. Pub/Sub needs it to take the connection over for
+// server-pushed messages; ordinary command code should not.
+pub fn socket_of(c Conn) Socket {
+	c.sock
+}
+
+// ---------------------------------------------------------------------------
+// The request/reply cycle.
+// ---------------------------------------------------------------------------
+
+// Send a command and read its reply. Every typed command in `./redis/` is a
+// thin wrapper over this.
+//
+// An error reply comes back as `Err(Server(..))`, not as an `Ok` holding a
+// `RedisErr` — a caller that forgets to match one variant of a six-variant
+// type would otherwise treat "wrong number of arguments" as a successful
+// result. The connection itself is fine after one: Redis answered, it just
+// said no.
+pub fn command(c Conn, args Array(String)) Result(Value, RedisError) {
+	command_raw(c, array.map(args, binary.from_string))
+}
+
+// `command` for keys and values that are bytes rather than text. Redis keys
+// and values are binary-safe, and a caller storing a JPEG should not have to
+// pretend it is a String.
+pub fn command_raw(c Conn, args Array(Binary)) Result(Value, RedisError) {
+	match socket.write(c.sock, resp.encode_command(args)) {
+		Err(e) -> Err(Net(e))
+		Ok(Nil) -> match read_reply(c.sock, <<>>) {
+			Ok(RedisErr(message)) -> Err(server_error(message))
+			other -> other
+		}
+	}
+}
+
+// Parse from the front of the buffer, reading more bytes whenever the reply is
+// not all there yet. One `socket.read` is not one reply: a big reply arrives
+// over many reads, which is exactly why the parser resumes from offset 0 on
+// the grown buffer instead of trying to parse each chunk on its own.
+fn read_reply(sock Socket, buf Binary) Result(Value, RedisError) {
+	match resp.parse(buf, 0) {
+		Bad(why) -> Err(Protocol(why))
+		Done(value, next) -> {
+			trailing = binary.byte_size(buf) - next
+			if trailing == 0 {
+				Ok(value)
+			} else {
+				// Bytes we never asked for. Reading on would pair every later
+				// command with the wrong reply, so stop here and say so.
+				Err(Protocol('${trailing} bytes arrived past the end of the reply'))
+			}
+		}
+		NeedMore -> match socket.read(sock, READ_SIZE) {
+			Ok(Data(chunk)) -> read_reply(sock, binary.append(buf, chunk))
+			// The peer hung up mid-reply. Not a clean end: we were promised
+			// more bytes.
+			Ok(Closed) -> Err(Net(UnexpectedEof))
+			Err(e) -> Err(Net(e))
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Building arguments.
+// ---------------------------------------------------------------------------
+
+// Optional command modifiers render as argument fragments that are either
+// present or absent, so the command modules below read as a list of pieces to
+// splice together rather than a chain of if/else around array building.
+
+pub fn arg(n Int) String {
+	int.to_string(n)
+}
+
+// `args` when `cond` holds, nothing otherwise.
+pub fn when(cond Bool, args Array(a)) Array(a) {
+	if cond {
+		args
+	} else {
+		[]
+	}
+}
+
+// `f(v)` when the option is present, nothing otherwise.
+pub fn when_some(o Option(a), f fn(a) Array(String)) Array(String) {
+	match o {
+		Some(v) -> f(v)
+		None -> []
+	}
+}
+
+// Splice argument fragments into one argument list. Generic over the element
+// type so the same helper builds a `command_raw` argument list out of Binary
+// pieces — a RESTORE payload is bytes, not text.
+pub fn parts(fragments Array(Array(a))) Array(a) {
+	array.fold(fragments, [], fn(acc, f) array.concat(acc, f))
+}
+
+// Flatten pairs — field/value, member/score, key/value — into the alternating
+// form Redis expects.
+pub fn flatten_pairs(pairs Array((String, String))) Array(String) {
+	array.fold(pairs, [], fn(acc, p) match p {
+		(a, b) -> array.concat(acc, [a, b])
+	})
+}
+
+// ---------------------------------------------------------------------------
+// Decoding replies.
+// ---------------------------------------------------------------------------
+//
+// Each decoder takes the result of `command` and refines it, so a typed
+// command is one line: `expect_int(command(c, ['LLEN', key]))`. An `Err`
+// passes straight through, which is what lets them compose without every
+// command re-matching the error case.
+
+pub fn expect_ok(reply Result(Value, RedisError)) Result(Nil, RedisError) {
+	match expect_status(reply) {
+		Ok('OK') -> Ok(Nil)
+		Ok(other) -> Err(Protocol('expected OK, got ${other}'))
+		Err(e) -> Err(e)
+	}
+}
+
+// Discard the reply, keeping only success or failure.
+pub fn expect_any(reply Result(Value, RedisError)) Result(Nil, RedisError) {
+	match reply {
+		Ok(_) -> Ok(Nil)
+		Err(e) -> Err(e)
+	}
+}
+
+pub fn expect_status(reply Result(Value, RedisError)) Result(String, RedisError) {
+	match reply {
+		Err(e) -> Err(e)
+		Ok(SimpleStr(bytes)) -> text(bytes)
+		Ok(Bulk(bytes)) -> text(bytes)
+		Ok(other) -> Err(Protocol('expected a status reply, got ${describe(other)}'))
+	}
+}
+
+// A string that must be there. Use `expect_bulk` where the server may answer
+// null.
+pub fn expect_string(reply Result(Value, RedisError)) Result(String, RedisError) {
+	match reply {
+		Err(e) -> Err(e)
+		Ok(Null) -> Err(Protocol('expected a string, got null'))
+		other -> expect_status(other)
+	}
+}
+
+pub fn expect_bulk(reply Result(Value, RedisError)) Result(Option(String), RedisError) {
+	match reply {
+		Err(e) -> Err(e)
+		Ok(Null) -> Ok(None)
+		Ok(SimpleStr(bytes)) -> map_ok(text(bytes), fn(s) Some(s))
+		Ok(Bulk(bytes)) -> map_ok(text(bytes), fn(s) Some(s))
+		Ok(other) -> Err(Protocol('expected a bulk string, got ${describe(other)}'))
+	}
+}
+
+// The bytes of a bulk reply, undecoded — for values that are not text.
+pub fn expect_binary(reply Result(Value, RedisError)) Result(Option(Binary), RedisError) {
+	match reply {
+		Err(e) -> Err(e)
+		Ok(Null) -> Ok(None)
+		Ok(Bulk(bytes)) -> Ok(Some(bytes))
+		Ok(SimpleStr(bytes)) -> Ok(Some(bytes))
+		Ok(other) -> Err(Protocol('expected a bulk string, got ${describe(other)}'))
+	}
+}
+
+pub fn expect_int(reply Result(Value, RedisError)) Result(Int, RedisError) {
+	match reply {
+		Err(e) -> Err(e)
+		Ok(Num(n)) -> Ok(n)
+		Ok(other) -> Err(Protocol('expected an integer, got ${describe(other)}'))
+	}
+}
+
+// An integer that may be absent — a null reply, as several commands use for
+// "no such element" (ZRANK, LPOS, OBJECT FREQ).
+pub fn expect_opt_int(reply Result(Value, RedisError)) Result(Option(Int), RedisError) {
+	match reply {
+		Err(e) -> Err(e)
+		Ok(Null) -> Ok(None)
+		Ok(Num(n)) -> Ok(Some(n))
+		Ok(other) -> Err(Protocol('expected an integer or null, got ${describe(other)}'))
+	}
+}
+
+// Redis spells booleans as the integers 0 and 1.
+pub fn expect_bool(reply Result(Value, RedisError)) Result(Bool, RedisError) {
+	map_ok(expect_int(reply), fn(n) n != 0)
+}
+
+// True when the command applied, False when a condition (NX/XX) prevented it.
+// The distinction arrives as OK versus null, not as an integer.
+pub fn expect_applied(reply Result(Value, RedisError)) Result(Bool, RedisError) {
+	match reply {
+		Err(e) -> Err(e)
+		Ok(Null) -> Ok(False)
+		Ok(SimpleStr(_)) -> Ok(True)
+		Ok(other) -> Err(Protocol('expected a status or null, got ${describe(other)}'))
+	}
+}
+
+// A double, which Redis sends as a bulk string.
+pub fn expect_score(reply Result(Value, RedisError)) Result(Score, RedisError) {
+	match expect_string(reply) {
+		Err(e) -> Err(e)
+		Ok(s) -> to_score(s)
+	}
+}
+
+pub fn expect_opt_score(reply Result(Value, RedisError)) Result(Option(Score), RedisError) {
+	match expect_bulk(reply) {
+		Err(e) -> Err(e)
+		Ok(None) -> Ok(None)
+		Ok(Some(s)) -> map_ok(to_score(s), fn(v) Some(v))
+	}
+}
+
+// An array whose every element is a string. A null element is an error here;
+// `expect_opt_strings` is for the commands that can return one.
+pub fn expect_strings(reply Result(Value, RedisError)) Result(Array(String), RedisError) {
+	match expect_values(reply) {
+		Err(e) -> Err(e)
+		Ok(values) -> collect(array.map(values, fn(v) value_text(v)))
+	}
+}
+
+// An array that may hold nulls, as MGET and HMGET do for missing keys and
+// fields. The nulls are positional — element i answers argument i — so they
+// are kept rather than filtered out.
+pub fn expect_opt_strings(
+	reply Result(Value, RedisError),
+) Result(Array(Option(String)), RedisError) {
+	match expect_values(reply) {
+		Err(e) -> Err(e)
+		Ok(values) -> collect(
+			array.map(values, fn(v) match v {
+				Null -> Ok(None)
+				other -> map_ok(value_text(other), fn(s) Some(s))
+			}),
+		)
+	}
+}
+
+// An array that is itself null — a blocking command that timed out, or a
+// transaction that was aborted by WATCH. Distinct from an empty array, which
+// is a real answer meaning "nothing matched".
+pub fn expect_opt_strings_or_nil(
+	reply Result(Value, RedisError),
+) Result(Option(Array(String)), RedisError) {
+	match reply {
+		Err(e) -> Err(e)
+		Ok(Null) -> Ok(None)
+		other -> map_ok(expect_strings(other), fn(xs) Some(xs))
+	}
+}
+
+// A flat array read as pairs: HGETALL, CONFIG GET, and ZRANGE WITHSCORES all
+// send `[a, b, a, b, ...]` under RESP2 rather than a map or nested pairs.
+pub fn expect_pairs(reply Result(Value, RedisError)) Result(Array((String, String)), RedisError) {
+	match expect_strings(reply) {
+		Err(e) -> Err(e)
+		Ok(flat) -> pair_up(flat, [])
+	}
+}
+
+// A flat map whose values are not all strings. HELLO is the case that forces
+// this: most of its fields are text, but `modules` is an array, and decoding
+// the lot as strings fails on that one field. The keys are always text, so
+// only the values stay raw.
+pub fn expect_fields(reply Result(Value, RedisError)) Result(Array((String, Value)), RedisError) {
+	match expect_values(reply) {
+		Err(e) -> Err(e)
+		Ok(flat) -> field_pairs(flat, [])
+	}
+}
+
+fn field_pairs(
+	flat Array(Value),
+	acc Array((String, Value)),
+) Result(Array((String, Value)), RedisError) {
+	match flat {
+		[] -> Ok(acc)
+		[name, value, ..rest] -> match value_text(name) {
+			Err(e) -> Err(e)
+			Ok(field) -> field_pairs(rest, array.concat(acc, [(field, value)]))
+		}
+		_ -> Err(Protocol('expected an even number of elements'))
+	}
+}
+
+// The same shape, where the second of each pair is a score.
+pub fn expect_scored(reply Result(Value, RedisError)) Result(Array((String, Score)), RedisError) {
+	match expect_pairs(reply) {
+		Err(e) -> Err(e)
+		Ok(pairs) -> collect(
+			array.map(pairs, fn(p) match p {
+				(member, raw) -> map_ok(to_score(raw), fn(s) (member, s))
+			}),
+		)
+	}
+}
+
+// How long something has left to live. The two sentinels Redis uses — -1 for
+// "exists but never expires" and -2 for "no such key or field" — become
+// constructors, so a caller cannot mistake them for durations and do
+// arithmetic on them. Shared by the key TTLs and the hash field TTLs, which
+// use the same encoding.
+pub type Remaining {
+	Expires(in_ Int)
+	NoExpiry
+	Missing
+}
+
+pub fn to_remaining(n Int) Remaining {
+	if n == 0 - 1 {
+		NoExpiry
+	} else if n == 0 - 2 {
+		Missing
+	} else {
+		Expires(n)
+	}
+}
+
+pub fn expect_remaining(reply Result(Value, RedisError)) Result(Remaining, RedisError) {
+	map_ok(expect_int(reply), to_remaining)
+}
+
+// A SCAN-family reply: the cursor to resume from, and this batch of elements.
+// A cursor of 0 means the iteration is complete.
+pub fn expect_scan(reply Result(Value, RedisError)) Result((Int, Array(String)), RedisError) {
+	match expect_values(reply) {
+		Err(e) -> Err(e)
+		Ok([cursor, elements]) -> match (value_text(cursor), expect_strings(Ok(elements))) {
+			(Ok(text), Ok(items)) -> match number.parse_int(text) {
+				Ok(n) -> Ok((n, items))
+				Err(Nil) -> Err(Protocol('scan cursor is not an integer: ${text}'))
+			}
+			(Err(e), _) -> Err(e)
+			(_, Err(e)) -> Err(e)
+		}
+		Ok(_) -> Err(Protocol('expected a scan reply of cursor and elements'))
+	}
+}
+
+// The raw elements, for replies whose shape is nested or heterogeneous —
+// XRANGE, GEOPOS, EXEC. The command module that knows the shape decodes it.
+pub fn expect_values(reply Result(Value, RedisError)) Result(Array(Value), RedisError) {
+	match reply {
+		Err(e) -> Err(e)
+		Ok(List(items)) -> Ok(items)
+		Ok(other) -> Err(Protocol('expected an array, got ${describe(other)}'))
+	}
+}
+
+pub fn expect_opt_values(reply Result(Value, RedisError)) Result(Option(Array(Value)), RedisError) {
+	match reply {
+		Err(e) -> Err(e)
+		Ok(Null) -> Ok(None)
+		other -> map_ok(expect_values(other), fn(vs) Some(vs))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Decoding helpers, shared with the command modules.
+// ---------------------------------------------------------------------------
+
+// The text of a single element, for modules decoding a nested reply by hand.
+pub fn value_text(v Value) Result(String, RedisError) {
+	match v {
+		Bulk(bytes) -> text(bytes)
+		SimpleStr(bytes) -> text(bytes)
+		Num(n) -> Ok(int.to_string(n))
+		other -> Err(Protocol('expected a string element, got ${describe(other)}'))
+	}
+}
+
+pub fn value_int(v Value) Result(Int, RedisError) {
+	match v {
+		Num(n) -> Ok(n)
+		Bulk(bytes) -> match number.parse_int_binary(bytes) {
+			Ok(n) -> Ok(n)
+			Err(Nil) -> Err(Protocol('expected an integer element'))
+		}
+		other -> Err(Protocol('expected an integer element, got ${describe(other)}'))
+	}
+}
+
+pub fn value_score(v Value) Result(Score, RedisError) {
+	match value_text(v) {
+		Err(e) -> Err(e)
+		Ok(s) -> to_score(s)
+	}
+}
+
+pub fn to_score(s String) Result(Score, RedisError) {
+	match number.parse_score(s) {
+		Ok(v) -> Ok(v)
+		Err(Nil) -> Err(Protocol('not a number: ${s}'))
+	}
+}
+
+// Turn an array of results into a result of an array, failing on the first
+// error. The shape every element-wise decoder above needs.
+pub fn collect(results Array(Result(a, RedisError))) Result(Array(a), RedisError) {
+	array.fold(results, Ok([]), fn(acc, r) match (acc, r) {
+		(Ok(items), Ok(v)) -> Ok(array.concat(items, [v]))
+		(Err(e), _) -> Err(e)
+		(_, Err(e)) -> Err(e)
+	})
+}
+
+pub fn map_ok(r Result(a, RedisError), f fn(a) b) Result(b, RedisError) {
+	match r {
+		Ok(v) -> Ok(f(v))
+		Err(e) -> Err(e)
+	}
+}
+
+fn pair_up(
+	flat Array(String),
+	acc Array((String, String)),
+) Result(Array((String, String)), RedisError) {
+	match flat {
+		[] -> Ok(acc)
+		[a, b, ..rest] -> pair_up(rest, array.concat(acc, [(a, b)]))
+		_ -> Err(Protocol('expected an even number of elements'))
+	}
+}
+
+fn text(bytes Binary) Result(String, RedisError) {
+	match binary.to_string(bytes) {
+		Ok(s) -> Ok(s)
+		Err(Nil) -> Err(Protocol('reply is not valid UTF-8'))
+	}
+}
+
+fn server_error(message Binary) RedisError {
+	Server(binary.to_string(message) or '<not utf-8>')
+}
+
+// `command` has already turned an error reply into `Err(Server(..))`, so
+// `RedisErr` never reaches the decoders — but `Value` still has the variant,
+// and naming it here keeps the matches exhaustive.
+fn describe(v Value) String {
+	match v {
+		SimpleStr(_) -> 'a status'
+		RedisErr(_) -> 'an error'
+		Num(_) -> 'an integer'
+		Bulk(_) -> 'a bulk string'
+		Null -> 'null'
+		List(_) -> 'an array'
+	}
+}
+
+pub fn show_error(e RedisError) String {
+	match e {
+		Net(err) -> 'network error: ${string.inspect(err)}'
+		Server(message) -> 'server said: ${message}'
+		Protocol(why) -> 'protocol error: ${why}'
+	}
+}

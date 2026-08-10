@@ -1,0 +1,333 @@
+// String commands.
+//
+// Keys and values are `String` throughout. Redis is binary-safe and so is the
+// wire codec underneath; a caller holding bytes that are not text can reach
+// `redis.command_raw` directly without giving up any of the framing.
+
+import scarlet/array
+import ./number.{Score}
+import ./redis.{Conn, RedisError}
+import ./options.{Condition, GetExpiry, SetExpiry}
+
+// ---------------------------------------------------------------------------
+// Reading.
+// ---------------------------------------------------------------------------
+
+// `None` is the key not existing — distinct from `Some('')`, a key holding the
+// empty string, which is why this is an Option and not a bare String.
+pub fn get(c Conn, key String) Result(Option(String), RedisError) {
+	redis.expect_bulk(redis.command(c, ['GET', key]))
+}
+
+// The value as raw bytes, for anything that is not UTF-8.
+pub fn get_binary(c Conn, key String) Result(Option(Binary), RedisError) {
+	redis.expect_binary(redis.command(c, ['GET', key]))
+}
+
+// Read and delete in one atomic step.
+pub fn getdel(c Conn, key String) Result(Option(String), RedisError) {
+	redis.expect_bulk(redis.command(c, ['GETDEL', key]))
+}
+
+// Read and re-arm (or clear) the expiry in one atomic step.
+pub fn getex(c Conn, key String, expiry Option(GetExpiry)) Result(Option(String), RedisError) {
+	redis.expect_bulk(
+		redis.command(
+			c,
+			redis.parts([['GETEX', key], redis.when_some(expiry, options.render_get_expiry)]),
+		),
+	)
+}
+
+// A substring by byte offset. Negative offsets count back from the end, and
+// the range is inclusive at both ends — unlike most languages' slicing.
+pub fn getrange(c Conn, key String, start Int, end Int) Result(String, RedisError) {
+	redis.expect_string(redis.command(c, ['GETRANGE', key, redis.arg(start), redis.arg(end)]))
+}
+
+pub fn substr(c Conn, key String, start Int, end Int) Result(String, RedisError) {
+	redis.expect_string(redis.command(c, ['SUBSTR', key, redis.arg(start), redis.arg(end)]))
+}
+
+pub fn strlen(c Conn, key String) Result(Int, RedisError) {
+	redis.expect_int(redis.command(c, ['STRLEN', key]))
+}
+
+// The values of several keys at once. The result is positional — element i is
+// the value of key i, and `None` where that key does not exist.
+pub fn mget(c Conn, keys Array(String)) Result(Array(Option(String)), RedisError) {
+	redis.expect_opt_strings(redis.command(c, array.concat(['MGET'], keys)))
+}
+
+// The XXH3 hash of a string value, without transferring the value itself.
+pub fn digest(c Conn, key String) Result(Option(String), RedisError) {
+	redis.expect_bulk(redis.command(c, ['DIGEST', key]))
+}
+
+// ---------------------------------------------------------------------------
+// Writing.
+// ---------------------------------------------------------------------------
+
+pub fn set(c Conn, key String, value String) Result(Nil, RedisError) {
+	redis.expect_ok(redis.command(c, ['SET', key, value]))
+}
+
+pub fn set_binary(c Conn, key Binary, value Binary) Result(Nil, RedisError) {
+	redis.expect_ok(redis.command_raw(c, [<<'SET'>>, key, value]))
+}
+
+// SET with its modifiers. Returns whether the write happened: a `condition`
+// the key did not meet comes back as `Ok(False)`, not as an error, because a
+// refused NX is an ordinary outcome rather than a failure.
+pub fn set_opts(
+	c Conn,
+	key String,
+	value String,
+	condition Condition,
+	expiry Option(SetExpiry),
+) Result(Bool, RedisError) {
+	redis.expect_applied(redis.command(c, set_args(key, value, condition, expiry, False)))
+}
+
+// SET ... GET: store the new value and return what was there before. `None`
+// means the key did not exist — or, when `condition` blocked the write, that
+// it still does not.
+pub fn set_and_get(
+	c Conn,
+	key String,
+	value String,
+	condition Condition,
+	expiry Option(SetExpiry),
+) Result(Option(String), RedisError) {
+	redis.expect_bulk(redis.command(c, set_args(key, value, condition, expiry, True)))
+}
+
+fn set_args(
+	key String,
+	value String,
+	condition Condition,
+	expiry Option(SetExpiry),
+	get Bool,
+) Array(String) {
+	redis.parts(
+		[
+			['SET', key, value],
+			options.render_condition(condition),
+			redis.when(get, ['GET']),
+			redis.when_some(expiry, options.render_set_expiry),
+		],
+	)
+}
+
+// Set only if the key is absent. `SET .. NX` in one call; the reply is an
+// integer here rather than OK-or-null.
+pub fn setnx(c Conn, key String, value String) Result(Bool, RedisError) {
+	redis.expect_bool(redis.command(c, ['SETNX', key, value]))
+}
+
+pub fn setex(c Conn, key String, seconds Int, value String) Result(Nil, RedisError) {
+	redis.expect_ok(redis.command(c, ['SETEX', key, redis.arg(seconds), value]))
+}
+
+pub fn psetex(c Conn, key String, millis Int, value String) Result(Nil, RedisError) {
+	redis.expect_ok(redis.command(c, ['PSETEX', key, redis.arg(millis), value]))
+}
+
+// The previous value, replaced. Superseded by `set_and_get` but still the
+// shortest way to say it.
+pub fn getset(c Conn, key String, value String) Result(Option(String), RedisError) {
+	redis.expect_bulk(redis.command(c, ['GETSET', key, value]))
+}
+
+// Overwrite from `offset`, zero-padding if the key is shorter. Returns the new
+// length.
+pub fn setrange(c Conn, key String, offset Int, value String) Result(Int, RedisError) {
+	redis.expect_int(redis.command(c, ['SETRANGE', key, redis.arg(offset), value]))
+}
+
+// Append, returning the new length. Creates the key if it is absent.
+pub fn append(c Conn, key String, value String) Result(Int, RedisError) {
+	redis.expect_int(redis.command(c, ['APPEND', key, value]))
+}
+
+// Set several keys atomically: either all of them are written or, for the NX
+// form, none are.
+pub fn mset(c Conn, pairs Array((String, String))) Result(Nil, RedisError) {
+	redis.expect_ok(redis.command(c, array.concat(['MSET'], redis.flatten_pairs(pairs))))
+}
+
+pub fn msetnx(c Conn, pairs Array((String, String))) Result(Bool, RedisError) {
+	redis.expect_bool(redis.command(c, array.concat(['MSETNX'], redis.flatten_pairs(pairs))))
+}
+
+// MSET with a shared expiry and an optional condition (Redis 8.0+). Returns
+// the number of keys written.
+pub fn msetex(
+	c Conn,
+	pairs Array((String, String)),
+	condition Condition,
+	expiry Option(SetExpiry),
+) Result(Int, RedisError) {
+	redis.expect_int(
+		redis.command(
+			c,
+			redis.parts(
+				[
+					['MSETEX', redis.arg(array.length(pairs))],
+					redis.flatten_pairs(pairs),
+					options.render_condition(condition),
+					redis.when_some(expiry, options.render_set_expiry),
+				],
+			),
+		),
+	)
+}
+
+// ---------------------------------------------------------------------------
+// Counters.
+// ---------------------------------------------------------------------------
+//
+// All of these treat a missing key as 0, and fail with a `Server` error if the
+// key holds something that is not a number.
+
+pub fn incr(c Conn, key String) Result(Int, RedisError) {
+	redis.expect_int(redis.command(c, ['INCR', key]))
+}
+
+pub fn decr(c Conn, key String) Result(Int, RedisError) {
+	redis.expect_int(redis.command(c, ['DECR', key]))
+}
+
+pub fn incrby(c Conn, key String, by Int) Result(Int, RedisError) {
+	redis.expect_int(redis.command(c, ['INCRBY', key, redis.arg(by)]))
+}
+
+pub fn decrby(c Conn, key String, by Int) Result(Int, RedisError) {
+	redis.expect_int(redis.command(c, ['DECRBY', key, redis.arg(by)]))
+}
+
+// The float counter. Comes back as a `Score` because Redis renders it as a
+// double, and a double can be infinite where a Scarlet Float cannot.
+pub fn incrbyfloat(c Conn, key String, by Float) Result(Score, RedisError) {
+	redis.expect_score(
+		redis.command(c, ['INCRBYFLOAT', key, number.score_to_string(number.Finite(by))]),
+	)
+}
+
+// ---------------------------------------------------------------------------
+// Conditional delete, and longest common substring.
+// ---------------------------------------------------------------------------
+
+// The comparison DELEX makes before removing the key (Redis 8.0+).
+pub type DeleteIf {
+	ValueEquals(value String)
+	ValueDiffers(value String)
+	DigestEquals(digest String)
+	DigestDiffers(digest String)
+}
+
+// Delete only if the current value (or its digest) compares as asked. Returns
+// 1 when the key was removed, 0 when the comparison failed, -1 when the key
+// did not exist.
+pub fn delex(c Conn, key String, condition Option(DeleteIf)) Result(Int, RedisError) {
+	redis.expect_int(
+		redis.command(
+			c,
+			redis.parts(
+				[
+					['DELEX', key],
+					redis.when_some(condition, fn(cond) match cond {
+						ValueEquals(v) -> ['IFEQ', v]
+						ValueDiffers(v) -> ['IFNE', v]
+						DigestEquals(d) -> ['IFDEQ', d]
+						DigestDiffers(d) -> ['IFDNE', d]
+					}),
+				],
+			),
+		),
+	)
+}
+
+// The longest common substring of two keys' values.
+pub fn lcs(c Conn, key1 String, key2 String) Result(String, RedisError) {
+	redis.expect_string(redis.command(c, ['LCS', key1, key2]))
+}
+
+// Just its length, without transferring the substring.
+pub fn lcs_len(c Conn, key1 String, key2 String) Result(Int, RedisError) {
+	redis.expect_int(redis.command(c, ['LCS', key1, key2, 'LEN']))
+}
+
+// The match positions. The reply nests deeply enough that it is handed back as
+// raw values rather than given a type that would only ever be used here.
+pub fn lcs_idx(
+	c Conn,
+	key1 String,
+	key2 String,
+	min_match_len Option(Int),
+	with_match_len Bool,
+) Result(Array(resp.Value), RedisError) {
+	redis.expect_values(
+		redis.command(
+			c,
+			redis.parts(
+				[
+					['LCS', key1, key2, 'IDX'],
+					redis.when_some(min_match_len, fn(n) ['MINMATCHLEN', redis.arg(n)]),
+					redis.when(with_match_len, ['WITHMATCHLEN']),
+				],
+			),
+		),
+	)
+}
+
+// ---------------------------------------------------------------------------
+// INCREX (Redis 8.2+).
+// ---------------------------------------------------------------------------
+
+// The amount INCREX adds, which decides whether the counter stays an integer
+// or becomes a double.
+pub type Increment {
+	ByInt(n Int)
+	ByFloat(n Float)
+}
+
+// Increment and set an expiry in one atomic step, optionally clamped.
+//
+// With `saturate`, a result outside the bounds is clipped to them instead of
+// failing — which is what makes this usable as a rate-limit counter that
+// cannot be pushed past its ceiling by a burst. `expire_if_new` (ENX) arms the
+// expiry only when the key did not already exist, so a running window is not
+// extended by every hit.
+pub fn increx(
+	c Conn,
+	key String,
+	by Increment,
+	saturate Bool,
+	lower Option(Float),
+	upper Option(Float),
+	expiry Option(GetExpiry),
+	expire_if_new Bool,
+) Result(Score, RedisError) {
+	amount = match by {
+		ByInt(n) -> ['BYINT', redis.arg(n)]
+		ByFloat(n) -> ['BYFLOAT', number.score_to_string(number.Finite(n))]
+	}
+	match redis.command(
+		c,
+		redis.parts(
+			[
+				['INCREX', key],
+				amount,
+				redis.when(saturate, ['SATURATE']),
+				redis.when_some(lower, fn(v) ['LBOUND', number.score_to_string(number.Finite(v))]),
+				redis.when_some(upper, fn(v) ['UBOUND', number.score_to_string(number.Finite(v))]),
+				redis.when_some(expiry, options.render_get_expiry),
+				redis.when(expire_if_new, ['ENX']),
+			],
+		),
+	) {
+		Err(e) -> Err(e)
+		Ok(value) -> redis.value_score(value)
+	}
+}
