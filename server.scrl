@@ -11,6 +11,7 @@ import scarlet/array
 import scarlet/result
 import ./number
 import ./redis.{Conn, RedisError}
+import ./resp
 
 // ---------------------------------------------------------------------------
 // State of the server.

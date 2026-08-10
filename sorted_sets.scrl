@@ -11,6 +11,7 @@ import scarlet/result
 import ./number.{Finite, NegInf, PosInf, Score}
 import ./redis.{Conn, RedisError}
 import ./options.{Aggregate, Asc, Condition, Desc, Direction, Limit}
+import ./resp.{Value, Null}
 
 // ---------------------------------------------------------------------------
 // Range bounds.

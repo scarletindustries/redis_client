@@ -10,6 +10,7 @@ import scarlet/array
 import scarlet/result
 import scarlet/binary
 import ./redis.{Conn, RedisError}
+import ./resp
 
 // Run a script. Returns whatever the script returned, converted by Redis's own
 // Lua-to-RESP rules — a Lua number becomes an integer (truncated), a Lua table

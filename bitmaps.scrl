@@ -4,6 +4,7 @@
 import scarlet/array
 import scarlet/result
 import ./redis.{Conn, RedisError}
+import ./resp.{Null}
 
 // Whether an offset counts bytes or bits. BITCOUNT and BITPOS take ranges in
 // either, and the default is bytes.

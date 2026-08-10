@@ -8,6 +8,7 @@ import scarlet/array
 import ./number.{Score}
 import ./redis.{Conn, RedisError}
 import ./options.{Condition, GetExpiry, SetExpiry}
+import ./resp
 
 // ---------------------------------------------------------------------------
 // Reading.

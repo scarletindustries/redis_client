@@ -8,6 +8,7 @@
 
 import scarlet/array
 import ./redis.{Conn, RedisError}
+import ./resp
 
 // The hash slot a key maps to, computed by the server with the same CRC16 it
 // uses internally — including the `{...}` hash-tag rule, which is what lets

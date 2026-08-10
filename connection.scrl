@@ -1,8 +1,8 @@
 // Connection-level commands: liveness, authentication, database selection,
 // and the CLIENT family.
 
-import scarlet/array
 import ./redis.{Conn, RedisError}
+import ./resp
 
 // PONG, unless the connection is in subscriber mode.
 pub fn ping(c Conn) Result(String, RedisError) {

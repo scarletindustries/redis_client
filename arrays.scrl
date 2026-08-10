@@ -10,6 +10,7 @@ import scarlet/array
 import scarlet/result
 import ./number.{Score}
 import ./redis.{Conn, RedisError}
+import ./resp
 
 // Write one or more consecutive values starting at `index`. Returns how many
 // were set.

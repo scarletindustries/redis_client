@@ -12,8 +12,8 @@
 import scarlet/array
 import scarlet/option
 import scarlet/result
-import scarlet/result
 import ./redis.{Conn, RedisError}
+import ./resp
 
 // Open a transaction. Commands sent after this are queued rather than run.
 pub fn multi(c Conn) Result(Nil, RedisError) {

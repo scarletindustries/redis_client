@@ -10,8 +10,8 @@
 
 import scarlet/array
 import scarlet/result
-import scarlet/result
 import ./redis.{Conn, RedisError}
+import ./resp.{Null}
 
 // One entry: its ID and its fields, in the order the server returned them.
 pub type Entry {

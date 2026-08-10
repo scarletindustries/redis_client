@@ -9,6 +9,7 @@ import scarlet/result
 import ./number.{Finite, Score}
 import ./redis.{Conn, RedisError}
 import ./options.{Condition, Direction, Unit}
+import ./resp.{Null}
 
 // A longitude/latitude pair, in degrees. Longitude comes first, matching the
 // order Redis takes and returns them — the opposite of the "lat, long" a map

@@ -10,6 +10,7 @@ import scarlet/array
 import scarlet/result
 import ./number
 import ./redis.{Conn, RedisError}
+import ./resp
 
 // Which end of the list an operation works on.
 pub type Side {

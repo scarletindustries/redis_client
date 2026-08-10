@@ -5,6 +5,7 @@ import scarlet/result
 import ./number.{Score}
 import ./redis.{Conn, RedisError}
 import ./options.{Always, Condition, ExpireWhen, GetExpiry, IfExists, IfNotExists, SetExpiry}
+import ./resp
 
 // ---------------------------------------------------------------------------
 // Fields.
