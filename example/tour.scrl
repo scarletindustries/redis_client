@@ -1,6 +1,6 @@
 // A tour of the client.
 //
-//	scarlet run src/main.scrl [host] [port]
+//	scarlet run example/tour.scrl [host] [port]
 //
 // `conn <- redis.with_conn(..)` hands the rest of the block to `with_conn` as a
 // callback, so the connection closes on the way out however the block ends, and
