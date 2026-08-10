@@ -1,6 +1,6 @@
 <img width="128" src="https://github.com/scarletindustries.png" />
 
-### Redis client
+### Redis Client
 
 Talk to Redis from the Scarlet programming language.
 
