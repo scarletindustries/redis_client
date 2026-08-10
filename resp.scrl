@@ -1,5 +1,4 @@
-// RESP2 — the Redis serialization protocol — encoded and decoded as pure
-// bytes.
+// RESP3 — the Redis serialization protocol — encoded and decoded as pure bytes.
 //
 // Sans-IO: nothing here touches a socket. Decoding works over a `Binary` read
 // buffer plus an offset, and every parse ends in one of three answers —
@@ -8,17 +7,29 @@
 // all. That is what lets the connection layer read whatever the kernel
 // happens to hand it and re-parse from the same offset until a reply is whole:
 // a TCP read is not a message boundary.
+//
+// Both protocol versions are decoded. RESP3 replaces `$-1` and `*-1` with a
+// single `_` null, gives maps, sets and doubles their own types instead of
+// flattening them into arrays and strings, and adds out-of-band push frames —
+// but a RESP3 server still answers with `+`, `-`, `:`, `$` and `*` most of the
+// time, so the RESP2 shapes are not a legacy path. They are most of the
+// protocol.
 
 import scarlet/array
 import scarlet/binary.{Dec}
+import ./number.{Score}
 
 // Every RESP frame ends with CRLF. As a binary literal rather than an escaped
 // string so it is bytes on both sides of the comparison.
 pub const CRLF = <<13, 10>>
 
-// The five RESP2 reply types, plus the null that `$-1` and `*-1` both spell.
-// Payloads stay `Binary`: a Redis value is bytes, and only the caller knows
-// whether a given key holds UTF-8 or a JPEG.
+// A decoded reply.
+//
+// The aggregate types stay distinct rather than all collapsing to `List`: a
+// caller that asked for a hash gets a `Map` and one that asked for a set gets
+// a `Set`, which is the whole point of RESP3. The decoders in `redis.scrl`
+// accept either shape so command code does not have to care which protocol
+// produced it.
 pub type Value {
 	SimpleStr(bytes Binary)
 	RedisErr(bytes Binary)
@@ -26,6 +37,24 @@ pub type Value {
 	Bulk(bytes Binary)
 	Null
 	List(items Array(Value))
+	// RESP3 additions.
+	Dbl(value Score)
+	Boolean(value Bool)
+	// Arbitrary precision, kept as its digits: it is by definition a number
+	// that may not fit in an Int.
+	BigNum(digits Binary)
+	// An error carried as a length-prefixed blob rather than a line, so it can
+	// contain CRLF.
+	BlobErr(bytes Binary)
+	// A string with a format hint — `txt` or `mkd`. The hint is what
+	// distinguishes it from a bulk string; the payload is just bytes.
+	Verbatim(format Binary, bytes Binary)
+	Map(entries Array((Value, Value)))
+	Set(items Array(Value))
+	// Out-of-band: a pub/sub message, or a client-tracking invalidation. Can
+	// arrive between a command and its reply, which is why the connection
+	// layer has to recognise it rather than treat it as the answer.
+	Push(items Array(Value))
 }
 
 // The outcome of decoding one reply out of `buf` starting at an offset.
@@ -45,6 +74,8 @@ pub type Parsed {
 // modern server needs to accept, and the only one that is safe: the length
 // prefix means an argument containing CRLF (or spaces, or nothing at all)
 // cannot be read as anything but one argument.
+//
+// Requests stay RESP2-shaped in RESP3; only replies gained new types.
 pub fn encode_command(parts Array(Binary)) Binary {
 	count = binary.from_int_ascii(array.length(parts), Dec)
 	head = <<'*', count:binary, CRLF:binary>>
@@ -62,16 +93,31 @@ fn encode_bulk(b Binary) Binary {
 
 // Decode one reply from `buf` at `off`. Call again with the same offset after
 // reading more bytes when the answer is `NeedMore`.
+//
+// An attribute frame is metadata attached to the reply that follows it, and no
+// core command's meaning depends on one, so it is parsed and dropped here
+// rather than surfaced — a caller matching on `Value` never has to consider a
+// case that only client-side caching produces.
 pub fn parse(buf Binary, off Int) Parsed {
 	if off >= binary.byte_size(buf) {
 		NeedMore
 	} else {
 		match binary.byte_at(buf, off) {
-			43 -> parse_simple(buf, off)
-			45 -> parse_error(buf, off)
+			43 -> parse_line(buf, off, SimpleStr)
+			45 -> parse_line(buf, off, RedisErr)
 			58 -> parse_num(buf, off)
-			36 -> parse_bulk(buf, off)
-			42 -> parse_list(buf, off)
+			36 -> parse_bulk(buf, off, fn(bytes) Bulk(bytes))
+			42 -> parse_aggregate(buf, off, 1, fn(items) List(items))
+			95 -> parse_null(buf, off)
+			44 -> parse_double(buf, off)
+			35 -> parse_boolean(buf, off)
+			40 -> parse_line(buf, off, BigNum)
+			33 -> parse_bulk(buf, off, fn(bytes) BlobErr(bytes))
+			61 -> parse_verbatim(buf, off)
+			37 -> parse_map(buf, off)
+			126 -> parse_aggregate(buf, off, 1, fn(items) Set(items))
+			62 -> parse_aggregate(buf, off, 1, fn(items) Push(items))
+			124 -> parse_attribute(buf, off)
 			tag -> Bad('not a RESP reply: leading byte ${tag}')
 		}
 	}
@@ -86,16 +132,9 @@ fn line(buf Binary, off Int) Option((Binary, Int)) {
 	}
 }
 
-fn parse_simple(buf Binary, off Int) Parsed {
+fn parse_line(buf Binary, off Int, wrap fn(Binary) Value) Parsed {
 	match line(buf, off) {
-		Some((payload, next)) -> Done(SimpleStr(payload), next)
-		None -> NeedMore
-	}
-}
-
-fn parse_error(buf Binary, off Int) Parsed {
-	match line(buf, off) {
-		Some((payload, next)) -> Done(RedisErr(payload), next)
+		Some((payload, next)) -> Done(wrap(payload), next)
 		None -> NeedMore
 	}
 }
@@ -103,21 +142,58 @@ fn parse_error(buf Binary, off Int) Parsed {
 fn parse_num(buf Binary, off Int) Parsed {
 	match line(buf, off) {
 		None -> NeedMore
-		Some((digits, next)) -> match parse_signed(digits) {
+		Some((digits, next)) -> match number.parse_int_binary(digits) {
 			Ok(n) -> Done(Num(n), next)
 			Err(Nil) -> Bad('integer reply is not an integer')
 		}
 	}
 }
 
-// A bulk string announces its own byte count, so its payload is taken by
-// length and never scanned — a value holding CRLF stays one value. A negative
-// count is the RESP2 null.
-fn parse_bulk(buf Binary, off Int) Parsed {
+// `_\r\n`. RESP2 spelled null as a negative length on a bulk string or array;
+// RESP3 gives it one spelling, and both decode to the same `Null`.
+fn parse_null(buf Binary, off Int) Parsed {
 	match line(buf, off) {
 		None -> NeedMore
-		Some((digits, after_head)) -> match parse_signed(digits) {
-			Err(Nil) -> Bad('bulk length is not an integer')
+		Some((payload, next)) -> if binary.byte_size(payload) == 0 {
+			Done(Null, next)
+		} else {
+			Bad('null reply carried a payload')
+		}
+	}
+}
+
+// `,1.5\r\n`, `,inf\r\n`, `,-inf\r\n`. A double is where RESP3 stops making the
+// client parse a bulk string to find out it was a number.
+fn parse_double(buf Binary, off Int) Parsed {
+	match line(buf, off) {
+		None -> NeedMore
+		Some((text, next)) -> match number.parse_score_binary(text) {
+			Ok(value) -> Done(Dbl(value), next)
+			Err(Nil) -> Bad('double reply is not a number')
+		}
+	}
+}
+
+// `#t\r\n` / `#f\r\n`.
+fn parse_boolean(buf Binary, off Int) Parsed {
+	match line(buf, off) {
+		None -> NeedMore
+		Some((flag, next)) -> match binary.byte_at(flag, 0) {
+			116 -> Done(Boolean(True), next)
+			102 -> Done(Boolean(False), next)
+			_ -> Bad('boolean reply is neither t nor f')
+		}
+	}
+}
+
+// A length-prefixed payload announces its own byte count, so it is taken by
+// length and never scanned — a value holding CRLF stays one value. A negative
+// count is the RESP2 null.
+fn parse_bulk(buf Binary, off Int, wrap fn(Binary) Value) Parsed {
+	match line(buf, off) {
+		None -> NeedMore
+		Some((digits, after_head)) -> match number.parse_int_binary(digits) {
+			Err(Nil) -> Bad('length prefix is not an integer')
 			Ok(size) -> if size < 0 {
 				Done(Null, after_head)
 			} else if binary.byte_size(buf) < after_head + size + 2 {
@@ -125,59 +201,105 @@ fn parse_bulk(buf Binary, off Int) Parsed {
 				// arrived yet.
 				NeedMore
 			} else {
-				Done(Bulk(binary.slice_bytes(buf, after_head, size)), after_head + size + 2)
+				Done(wrap(binary.slice_bytes(buf, after_head, size)), after_head + size + 2)
 			}
 		}
 	}
 }
 
-fn parse_list(buf Binary, off Int) Parsed {
+// `=15\r\ntxt:hello world\r\n` — a bulk string whose first four bytes are a
+// three-letter format and a colon.
+fn parse_verbatim(buf Binary, off Int) Parsed {
+	match parse_bulk(buf, off, fn(bytes) Bulk(bytes)) {
+		Done(Bulk(payload), next) -> if binary.byte_size(payload) < 4 {
+			Bad('verbatim string is too short to carry a format')
+		} else {
+			Done(
+				Verbatim(
+					binary.slice_bytes(payload, 0, 3),
+					binary.slice_bytes(payload, 4, binary.byte_size(payload) - 4),
+				),
+				next,
+			)
+		}
+		Done(other, next) -> Done(other, next)
+		NeedMore -> NeedMore
+		Bad(why) -> Bad(why)
+	}
+}
+
+// Arrays, sets and pushes share a shape: a count, then that many values.
+// `stride` is how many values make one element — 1 here, 2 for a map.
+fn parse_aggregate(buf Binary, off Int, stride Int, wrap fn(Array(Value)) Value) Parsed {
 	match line(buf, off) {
 		None -> NeedMore
-		Some((digits, after_head)) -> match parse_signed(digits) {
-			Err(Nil) -> Bad('array length is not an integer')
+		Some((digits, after_head)) -> match number.parse_int_binary(digits) {
+			Err(Nil) -> Bad('aggregate length is not an integer')
 			Ok(count) -> if count < 0 {
 				Done(Null, after_head)
 			} else {
-				match parse_items(buf, after_head, count, []) {
-					ItemsDone(items, next) -> Done(List(items), next)
-					ItemsNeedMore -> NeedMore
-					ItemsBad(why) -> Bad(why)
+				match take(buf, after_head, count * stride, []) {
+					TookDone(items, next) -> Done(wrap(items), next)
+					TookMore -> NeedMore
+					TookBad(why) -> Bad(why)
 				}
 			}
 		}
 	}
 }
 
-// The element loop's three answers, mirroring `Parsed` — an array is only
-// `Done` once every one of its elements is, and a partial element makes the
-// whole array `NeedMore` from its original offset.
-type Items {
-	ItemsDone(values Array(Value), next Int)
-	ItemsNeedMore
-	ItemsBad(why String)
-}
-
-fn parse_items(buf Binary, off Int, remaining Int, acc Array(Value)) Items {
-	if remaining <= 0 {
-		ItemsDone(array.reverse(acc), off)
-	} else {
-		match parse(buf, off) {
-			Done(value, next) -> parse_items(buf, next, remaining - 1, [value, ..acc])
-			NeedMore -> ItemsNeedMore
-			Bad(why) -> ItemsBad(why)
+// `%2\r\n` then two key/value pairs laid out flat. Parsed as a run of 2n
+// values and paired up afterwards, so the element loop stays one function.
+fn parse_map(buf Binary, off Int) Parsed {
+	match parse_aggregate(buf, off, 2, fn(items) List(items)) {
+		Done(List(flat), next) -> match pair_up(flat) {
+			Some(entries) -> Done(Map(entries), next)
+			None -> Bad('map reply has an odd number of elements')
 		}
+		Done(other, next) -> Done(other, next)
+		NeedMore -> NeedMore
+		Bad(why) -> Bad(why)
 	}
 }
 
-// RESP integers and lengths are signed — `:-1`, `$-1` — and binary.parse_int
-// reads unsigned digits only, so the sign is peeled off here.
-fn parse_signed(b Binary) Result(Int, Nil) {
-	match binary.byte_at(b, 0) {
-		45 -> match binary.parse_int(binary.slice_bytes(b, 1, binary.byte_size(b) - 1), Dec) {
-			Ok(n) -> Ok(0 - n)
-			Err(Nil) -> Err(Nil)
+// `|1\r\n` then a map's worth of metadata, then the reply it decorates. The
+// attribute is consumed and the reply behind it returned in its place.
+fn parse_attribute(buf Binary, off Int) Parsed {
+	match parse_aggregate(buf, off, 2, fn(items) List(items)) {
+		Done(_, next) -> parse(buf, next)
+		NeedMore -> NeedMore
+		Bad(why) -> Bad(why)
+	}
+}
+
+fn pair_up(flat Array(Value)) Option(Array((Value, Value))) {
+	match flat {
+		[] -> Some([])
+		[k, v, ..rest] -> match pair_up(rest) {
+			Some(more) -> Some(array.concat([(k, v)], more))
+			None -> None
 		}
-		_ -> binary.parse_int(b, Dec)
+		_ -> None
+	}
+}
+
+// The element loop's three answers, mirroring `Parsed` — an aggregate is only
+// `Done` once every one of its elements is, and a partial element makes the
+// whole thing `NeedMore` from its original offset.
+type Took {
+	TookDone(values Array(Value), next Int)
+	TookMore
+	TookBad(why String)
+}
+
+fn take(buf Binary, off Int, remaining Int, acc Array(Value)) Took {
+	if remaining <= 0 {
+		TookDone(array.reverse(acc), off)
+	} else {
+		match parse(buf, off) {
+			Done(value, next) -> take(buf, next, remaining - 1, [value, ..acc])
+			NeedMore -> TookMore
+			Bad(why) -> TookBad(why)
+		}
 	}
 }

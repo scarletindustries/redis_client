@@ -590,6 +590,19 @@ fn test_transactions(c Conn) Result(Array(Check), RedisError) {
 	aborted <- result.then(transactions.exec(c))
 	after <- result.then(strings.get(c, key))
 
+	// A command the server will not queue poisons the transaction. The useful
+	// error is that one, not the EXECABORT it causes.
+	rejected = match transactions.transaction(c, [['SET', key, 'x'], ['NOSUCHCOMMAND']]) {
+		Err(Server(_)) -> True
+		_ -> False
+	}
+	alive <- result.then(connection.ping(c))
+
+	third <- result.then(match replies {
+		Some([_, _, get]) -> redis.expect_bulk(get)
+		_ -> Err(redis.Protocol('expected three replies'))
+	})
+
 	_ <- result.then(keys.del(c, [key]))
 	Ok(
 		[
@@ -601,9 +614,12 @@ fn test_transactions(c Conn) Result(Array(Check), RedisError) {
 				},
 				3,
 			),
+			eq('each reply inside EXEC decodes on its own', third, Some('2')),
 			eq('transaction applied', value, Some('2')),
 			eq('a touched WATCH aborts EXEC', aborted, None),
 			eq('the aborted write did not happen', after, Some('changed-by-someone-else')),
+			that('a command refused at queue time is reported', rejected),
+			eq('the connection survives an aborted transaction', alive, 'PONG'),
 		],
 	)
 }
@@ -681,6 +697,120 @@ fn test_arrays(c Conn) Result(Array(Check), RedisError) {
 			eq('ardel', deleted, 1),
 			eq('arop SUM', total, Finite(6.0)),
 		],
+	)
+}
+
+// ---------------------------------------------------------------------------
+// RESP3 shapes.
+// ---------------------------------------------------------------------------
+//
+// These assert the decoders absorb the types RESP3 introduced, since a RESP2
+// server would answer the same commands with different frames entirely.
+
+fn test_resp3(c Conn) Result(Array(Check), RedisError) {
+	_ <- result.then(keys.del(c, [k('r3h'), k('r3z'), k('r3s')]))
+
+	// HGETALL and CONFIG GET are maps under RESP3, not flat arrays.
+	_ <- result.then(hashes.hset_many(c, k('r3h'), [('a', '1'), ('b', '2')]))
+	as_map <- result.then(hashes.hgetall(c, k('r3h')))
+	config <- result.then(server.config_get(c, ['maxmemory']))
+
+	// A score is a real double now.
+	_ <- result.then(sorted_sets.zadd(c, k('r3z'), [('m', Finite(1.5))]))
+	score <- result.then(sorted_sets.zscore(c, k('r3z'), 'm'))
+	// ...and WITHSCORES nests member/score instead of flattening them.
+	nested <- result.then(sorted_sets.zrange_withscores(c, k('r3z'), 0, 0 - 1, False))
+	// ...while ZSCAN still sends the flat form. Same decoder, both shapes.
+	flat <- result.then(sorted_sets.zscan(c, k('r3z'), 0, None, None))
+
+	// A set reply, not an array.
+	_ <- result.then(sets.sadd(c, k('r3s'), ['x']))
+	members <- result.then(sets.smembers(c, k('r3s')))
+
+	// A null is `_` rather than a negative length.
+	absent <- result.then(strings.get(c, k('nothing-here')))
+	// A verbatim string, which only exists in RESP3.
+	info <- result.then(connection.client_info(c))
+	// The handshake itself reports the protocol it settled on.
+	greeting <- result.then(connection.hello(c))
+
+	_ <- result.then(keys.del(c, [k('r3h'), k('r3z'), k('r3s')]))
+	Ok(
+		[
+			eq('a map reply decodes as pairs', as_map, [('a', '1'), ('b', '2')]),
+			eq('CONFIG GET decodes as pairs', array.length(config), 1),
+			eq('a double reply decodes as a score', score, Some(Finite(1.5))),
+			eq('nested WITHSCORES pairs decode', nested, [('m', Finite(1.5))]),
+			eq(
+				'flat ZSCAN pairs decode too',
+				match flat {
+					(_, pairs) -> pairs
+				},
+				[('m', Finite(1.5))],
+			),
+			eq('a set reply decodes as an array', members, ['x']),
+			eq('a null reply is None', absent, None),
+			that('a verbatim string decodes', string.contains(info, 'id=')),
+			that(
+				'the server confirmed protocol 3',
+				array.any(greeting, fn(p) match p {
+					(field, value) -> field == 'proto' && string.inspect(value) == 'Num(3)'
+				}),
+			),
+		],
+	)
+}
+
+// ---------------------------------------------------------------------------
+// Pipelining.
+// ---------------------------------------------------------------------------
+
+fn test_pipeline(c Conn) Result(Array(Check), RedisError) {
+	_ <- result.then(keys.del(c, [k('pl'), k('pl2')]))
+
+	replies <- result.then(
+		redis.pipeline(
+			c,
+			[
+				['SET', k('pl'), '1'],
+				['INCR', k('pl')],
+				// Deliberately wrong for the type: this one command must fail without
+				// disturbing the others.
+				['LLEN', k('pl')],
+				['SET', k('pl2'), 'two'],
+				['MGET', k('pl'), k('pl2')],
+			],
+		),
+	)
+
+	empty <- result.then(redis.pipeline(c, []))
+
+	counted <- result.then(match replies {
+		[_, incr, wrong, _, mget] -> {
+			n <- result.then(redis.expect_int(incr))
+			values <- result.then(redis.expect_opt_strings(mget))
+			Ok(
+				[
+					eq('a pipelined reply decodes', n, 2),
+					eq('replies come back in order', values, [Some('2'), Some('two')]),
+					that('one failed command does not sink the batch', match wrong {
+						Err(Server(_)) -> True
+						_ -> False
+					}),
+				],
+			)
+		}
+		_ -> Err(redis.Protocol('expected five replies'))
+	})
+
+	Ok(
+		array.concat(
+			[
+				eq('one reply per command', array.length(replies), 5),
+				eq('an empty pipeline is not an error', array.length(empty), 0),
+			],
+			counted,
+		),
 	)
 }
 
@@ -847,6 +977,8 @@ fn main(host String, port Int) Nil {
 				('transactions', test_transactions),
 				('scripting', test_scripting),
 				('arrays', test_arrays),
+				('resp3 shapes', test_resp3),
+				('pipelining', test_pipeline),
 				('connection and server', test_connection),
 				('errors', test_errors),
 			],

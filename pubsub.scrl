@@ -23,7 +23,7 @@ import scarlet/binary
 import scarlet/net/error.{NetError, TimedOut, UnexpectedEof}
 import scarlet/net/socket.{Closed, Data, Socket}
 import ./redis.{Conn, Net, RedisError}
-import ./resp.{Bad, Done, NeedMore}
+import ./resp.{Bad, Done, List, NeedMore, Push as PushFrame}
 
 const READ_SIZE = 65536
 
@@ -34,7 +34,7 @@ pub opaque type Subscription {
 }
 
 // What the server can send to a subscriber.
-pub type Push {
+pub type Event {
 	// A message on a channel subscribed to by name.
 	Message(channel String, payload String)
 	// A message on a channel that matched a pattern subscription. Both the
@@ -211,7 +211,7 @@ pub fn close(s Subscription) Nil {
 
 // Wait for the next message, parking this process until one arrives. Other
 // processes keep running; this one is idle, not spinning.
-pub fn next_message(s Subscription) (Subscription, Result(Push, RedisError)) {
+pub fn next_message(s Subscription) (Subscription, Result(Event, RedisError)) {
 	match take(s) {
 		(next, Ok(value)) -> (next, decode(value))
 		(next, Err(e)) -> (next, Err(e))
@@ -224,7 +224,7 @@ pub fn next_message(s Subscription) (Subscription, Result(Push, RedisError)) {
 pub fn next_message_within(
 	s Subscription,
 	timeout_ms Int,
-) (Subscription, Result(Option(Push), RedisError)) {
+) (Subscription, Result(Option(Event), RedisError)) {
 	match take_within(s, timeout_ms) {
 		(next, Ok(None)) -> (next, Ok(None))
 		(next, Ok(Some(value))) -> match decode(value) {
@@ -274,8 +274,8 @@ fn rest(buf Binary, from Int) Binary {
 }
 
 // Every push is an array whose first element names the kind.
-fn decode(value resp.Value) Result(Push, RedisError) {
-	parts <- result.then(redis.expect_values(Ok(value)))
+fn decode(value resp.Value) Result(Event, RedisError) {
+	parts <- result.then(frame_items(value))
 	match parts {
 		[kind, a, b] -> {
 			name <- result.then(redis.value_text(kind))
@@ -289,7 +289,18 @@ fn decode(value resp.Value) Result(Push, RedisError) {
 	}
 }
 
-fn two(name String, a resp.Value, b resp.Value) Result(Push, RedisError) {
+// RESP3 delivers pub/sub out of band as a `>` push frame. RESP2 sent the same
+// three elements as an ordinary array, and the contents are identical, so only
+// the wrapper differs.
+fn frame_items(v resp.Value) Result(Array(resp.Value), RedisError) {
+	match v {
+		PushFrame(items) -> Ok(items)
+		List(items) -> Ok(items)
+		other -> redis.expect_values(Ok(other))
+	}
+}
+
+fn two(name String, a resp.Value, b resp.Value) Result(Event, RedisError) {
 	match name {
 		'message' -> {
 			channel <- result.then(redis.value_text(a))
@@ -311,7 +322,7 @@ fn two(name String, a resp.Value, b resp.Value) Result(Push, RedisError) {
 	}
 }
 
-fn three(name String, a resp.Value, b resp.Value, c resp.Value) Result(Push, RedisError) {
+fn three(name String, a resp.Value, b resp.Value, c resp.Value) Result(Event, RedisError) {
 	match name {
 		'pmessage' -> {
 			pattern <- result.then(redis.value_text(a))
@@ -324,7 +335,7 @@ fn three(name String, a resp.Value, b resp.Value, c resp.Value) Result(Push, Red
 }
 
 // An unsubscribe-all reports a null channel, since it names no one channel.
-fn confirmation(a resp.Value, b resp.Value, subscribed Bool) Result(Push, RedisError) {
+fn confirmation(a resp.Value, b resp.Value, subscribed Bool) Result(Event, RedisError) {
 	channel = match redis.value_text(a) {
 		Ok(name) -> name
 		Err(_) -> ''

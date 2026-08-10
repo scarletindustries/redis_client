@@ -34,7 +34,26 @@ import scarlet/net/socket.{Closed, Data, Socket}
 import scarlet/resource
 import scarlet/string
 import ./number.{Score}
-import ./resp.{Bad, Bulk, Done, List, NeedMore, Null, Num, RedisErr, SimpleStr, Value}
+import ./resp.{
+	Bad,
+	BigNum,
+	BlobErr,
+	Boolean,
+	Bulk,
+	Dbl,
+	Done,
+	List,
+	Map,
+	NeedMore,
+	Null,
+	Num,
+	Push,
+	RedisErr,
+	Set,
+	SimpleStr,
+	Value,
+	Verbatim,
+}
 
 // How much to ask the kernel for per read. Replies smaller than this arrive in
 // one call; larger ones simply loop.
@@ -78,10 +97,26 @@ pub fn with_conn(host String, port Int, next fn(Conn) Result(a, RedisError)) Res
 	}
 }
 
+// Dial, then negotiate RESP3 before handing the connection back, so a `Conn`
+// in hand is always one whose replies this client can read.
+//
+// `HELLO 3` is not optional here. A server that refuses it — anything before
+// Redis 6 — would keep answering in RESP2, where a map is a flat array and a
+// double is a bulk string, and the decoders would misread those shapes
+// quietly. Failing at connect is the only honest option.
 pub fn connect(host String, port Int) Result(Conn, RedisError) {
-	match net.connect(host, port) {
-		Ok(sock) -> Ok(Conn(sock: sock))
-		Err(e) -> Err(Net(e))
+	sock <- result.then(net_err(net.connect(host, port)))
+	c = Conn(sock: sock)
+	match command(c, ['HELLO', '3']) {
+		Ok(_) -> Ok(c)
+		Err(Server(message)) -> {
+			close(c)
+			Err(Protocol('server refused RESP3 (needs Redis 6 or newer): ${message}'))
+		}
+		Err(e) -> {
+			close(c)
+			Err(e)
+		}
 	}
 }
 
@@ -118,7 +153,103 @@ pub fn command_raw(c Conn, args Array(Binary)) Result(Value, RedisError) {
 	_ <- result.then(net_err(socket.write(c.sock, resp.encode_command(args))))
 	match read_reply(c.sock, <<>>) {
 		Ok(RedisErr(message)) -> Err(server_error(message))
+		// RESP3 can carry an error as a length-prefixed blob, so that it may
+		// contain a newline. Same meaning, different framing.
+		Ok(BlobErr(message)) -> Err(server_error(message))
 		other -> other
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Pipelining.
+// ---------------------------------------------------------------------------
+
+// Send several commands in one go and collect every reply, in order.
+//
+// A round trip costs a network latency whether it carries one command or a
+// hundred, so a hundred commands sent one at a time cost a hundred latencies
+// and pipelined cost one. That is the whole of it.
+//
+// The outer `Result` is the connection: a failed write, or bytes that were not
+// RESP. The inner one is each command's own answer, so a single `SET` that was
+// refused does not discard the ninety-nine replies around it. The `expect_*`
+// decoders take exactly that inner type, so a reply is read the same way it
+// would be from `command`:
+//
+//	replies <- result.then(redis.pipeline(c, [['GET', 'a'], ['LLEN', 'b']]))
+//	match replies {
+//		[a, b] -> {
+//			value <- result.then(redis.expect_bulk(a))
+//			count <- result.then(redis.expect_int(b))
+//			...
+//		}
+//		_ -> Err(redis.Protocol('expected two replies'))
+//	}
+//
+// This is not a transaction. The commands are not atomic and another client's
+// work can interleave with them; `transactions.transaction` wraps a pipeline
+// in MULTI/EXEC when that matters.
+pub fn pipeline(
+	c Conn,
+	commands Array(Array(String)),
+) Result(Array(Result(Value, RedisError)), RedisError) {
+	pipeline_raw(c, array.map(commands, fn(args) array.map(args, binary.from_string)))
+}
+
+pub fn pipeline_raw(
+	c Conn,
+	commands Array(Array(Binary)),
+) Result(Array(Result(Value, RedisError)), RedisError) {
+	count = array.length(commands)
+	if count == 0 {
+		Ok([])
+	} else {
+		// One vectored write: every request reaches the kernel in a single
+		// syscall, without first being concatenated into one big binary.
+		_ <- result.then(
+			net_err(socket.write_parts(c.sock, array.map(commands, resp.encode_command))),
+		)
+		read_replies(c.sock, <<>>, 0, count, [])
+	}
+}
+
+// Read exactly `remaining` replies out of the buffer, reading more bytes only
+// when the one being parsed is incomplete. Unlike `read_reply` this cannot
+// treat leftover bytes as a desync until the last reply is in, because the
+// bytes after reply one are reply two.
+fn read_replies(
+	sock Socket,
+	buf Binary,
+	off Int,
+	remaining Int,
+	acc Array(Result(Value, RedisError)),
+) Result(Array(Result(Value, RedisError)), RedisError) {
+	if remaining == 0 {
+		trailing = binary.byte_size(buf) - off
+		if trailing == 0 {
+			Ok(array.reverse(acc))
+		} else {
+			Err(Protocol('${trailing} bytes arrived past the end of the last reply'))
+		}
+	} else {
+		match resp.parse(buf, off) {
+			Bad(why) -> Err(Protocol(why))
+			// Out of band, and not one of the replies we are counting.
+			Done(Push(_), next) -> read_replies(sock, buf, next, remaining, acc)
+			Done(RedisErr(message), next) ->
+				read_replies(sock, buf, next, remaining - 1, [Err(server_error(message)), ..acc])
+			Done(BlobErr(message), next) ->
+				read_replies(sock, buf, next, remaining - 1, [Err(server_error(message)), ..acc])
+			Done(value, next) -> read_replies(sock, buf, next, remaining - 1, [Ok(value), ..acc])
+			NeedMore -> {
+				read <- result.then(net_err(socket.read(sock, READ_SIZE)))
+				match read {
+					Data(chunk) ->
+						read_replies(sock, binary.append(buf, chunk), off, remaining, acc)
+					Closed -> Err(Net(UnexpectedEof))
+				}
+			}
+		}
 	}
 }
 
@@ -134,8 +265,18 @@ pub fn net_err(r Result(a, NetError)) Result(a, RedisError) {
 // over many reads, which is exactly why the parser resumes from offset 0 on
 // the grown buffer instead of trying to parse each chunk on its own.
 fn read_reply(sock Socket, buf Binary) Result(Value, RedisError) {
-	match resp.parse(buf, 0) {
+	read_from(sock, buf, 0)
+}
+
+fn read_from(sock Socket, buf Binary, off Int) Result(Value, RedisError) {
+	match resp.parse(buf, off) {
 		Bad(why) -> Err(Protocol(why))
+		// A push frame is not the answer to anything — it is a pub/sub message
+		// or a tracking invalidation that happened to arrive first. Step over
+		// it and keep reading for the reply we are actually owed. Pushes are
+		// delivered through `pubsub.Subscription`; a command connection that
+		// has not subscribed will never see one.
+		Done(Push(_), next) -> read_from(sock, buf, next)
 		Done(value, next) -> {
 			trailing = binary.byte_size(buf) - next
 			if trailing == 0 {
@@ -149,7 +290,7 @@ fn read_reply(sock Socket, buf Binary) Result(Value, RedisError) {
 		NeedMore -> {
 			read <- result.then(net_err(socket.read(sock, READ_SIZE)))
 			match read {
-				Data(chunk) -> read_reply(sock, binary.append(buf, chunk))
+				Data(chunk) -> read_from(sock, binary.append(buf, chunk), off)
 				// The peer hung up mid-reply. Not a clean end: we were promised
 				// more bytes.
 				Closed -> Err(Net(UnexpectedEof))
@@ -229,6 +370,9 @@ pub fn expect_status(reply Result(Value, RedisError)) Result(String, RedisError)
 	match value {
 		SimpleStr(bytes) -> text(bytes)
 		Bulk(bytes) -> text(bytes)
+		// CLIENT INFO and LOLWUT answer with a verbatim string under RESP3;
+		// the format hint is metadata about how to display it, not content.
+		Verbatim(_, bytes) -> text(bytes)
 		other -> Err(Protocol('expected a status reply, got ${describe(other)}'))
 	}
 }
@@ -249,6 +393,7 @@ pub fn expect_bulk(reply Result(Value, RedisError)) Result(Option(String), Redis
 		Null -> Ok(None)
 		SimpleStr(bytes) -> result.map(text(bytes), Some)
 		Bulk(bytes) -> result.map(text(bytes), Some)
+		Verbatim(_, bytes) -> result.map(text(bytes), Some)
 		other -> Err(Protocol('expected a bulk string, got ${describe(other)}'))
 	}
 }
@@ -260,6 +405,7 @@ pub fn expect_binary(reply Result(Value, RedisError)) Result(Option(Binary), Red
 		Null -> Ok(None)
 		Bulk(bytes) -> Ok(Some(bytes))
 		SimpleStr(bytes) -> Ok(Some(bytes))
+		Verbatim(_, bytes) -> Ok(Some(bytes))
 		other -> Err(Protocol('expected a bulk string, got ${describe(other)}'))
 	}
 }
@@ -284,8 +430,15 @@ pub fn expect_opt_int(reply Result(Value, RedisError)) Result(Option(Int), Redis
 }
 
 // Redis spells booleans as the integers 0 and 1.
+// Redis spells most booleans as the integers 0 and 1, but RESP3 has a real
+// boolean and scripts can return one, so both are accepted.
 pub fn expect_bool(reply Result(Value, RedisError)) Result(Bool, RedisError) {
-	result.map(expect_int(reply), fn(n) n != 0)
+	value <- result.then(reply)
+	match value {
+		Boolean(b) -> Ok(b)
+		Num(n) -> Ok(n != 0)
+		other -> Err(Protocol('expected a boolean, got ${describe(other)}'))
+	}
 }
 
 // True when the command applied, False when a condition (NX/XX) prevented it.
@@ -301,14 +454,15 @@ pub fn expect_applied(reply Result(Value, RedisError)) Result(Bool, RedisError) 
 
 // A double, which Redis sends as a bulk string.
 pub fn expect_score(reply Result(Value, RedisError)) Result(Score, RedisError) {
-	result.then(expect_string(reply), to_score)
+	value <- result.then(reply)
+	value_score(value)
 }
 
 pub fn expect_opt_score(reply Result(Value, RedisError)) Result(Option(Score), RedisError) {
-	raw <- result.then(expect_bulk(reply))
-	match raw {
-		None -> Ok(None)
-		Some(s) -> result.map(to_score(s), Some)
+	value <- result.then(reply)
+	match value {
+		Null -> Ok(None)
+		other -> result.map(value_score(other), Some)
 	}
 }
 
@@ -349,9 +503,65 @@ pub fn expect_opt_strings_or_nil(
 
 // A flat array read as pairs: HGETALL, CONFIG GET, and ZRANGE WITHSCORES all
 // send `[a, b, a, b, ...]` under RESP2 rather than a map or nested pairs.
+// Pairs, however this server chose to shape them. RESP3 answers HGETALL and
+// CONFIG GET with a real map, HRANDFIELD WITHVALUES with an array of
+// two-element arrays, and HSCAN with the flat alternating array RESP2 always
+// used — three shapes for one idea. Absorbing that here is what keeps every
+// command module identical across the two protocols.
 pub fn expect_pairs(reply Result(Value, RedisError)) Result(Array((String, String)), RedisError) {
-	flat <- result.then(expect_strings(reply))
-	pair_up(flat, [])
+	entries <- result.then(expect_entries(reply))
+	collect(
+		array.map(entries, fn(e) match e {
+			(k, v) -> {
+				name <- result.then(value_text(k))
+				body <- result.then(value_text(v))
+				Ok((name, body))
+			}
+		}),
+	)
+}
+
+// The shape-tolerant core the pair decoders share.
+pub fn expect_entries(reply Result(Value, RedisError)) Result(Array((Value, Value)), RedisError) {
+	value <- result.then(reply)
+	match value {
+		Map(entries) -> Ok(entries)
+		List(items) -> entries_of(items)
+		Set(items) -> entries_of(items)
+		other -> Err(Protocol('expected pairs, got ${describe(other)}'))
+	}
+}
+
+// An array of pairs is either nested — `[[k, v], [k, v]]` — or flat, and the
+// first element is enough to tell which.
+fn entries_of(items Array(Value)) Result(Array((Value, Value)), RedisError) {
+	match items {
+		[] -> Ok([])
+		[first, .._] -> match first {
+			List([_, _]) -> collect(array.map(items, as_entry))
+			Set([_, _]) -> collect(array.map(items, as_entry))
+			_ -> flat_entries(items, [])
+		}
+	}
+}
+
+fn as_entry(v Value) Result((Value, Value), RedisError) {
+	match v {
+		List([k, x]) -> Ok((k, x))
+		Set([k, x]) -> Ok((k, x))
+		other -> Err(Protocol('expected a pair, got ${describe(other)}'))
+	}
+}
+
+fn flat_entries(
+	items Array(Value),
+	acc Array((Value, Value)),
+) Result(Array((Value, Value)), RedisError) {
+	match items {
+		[] -> Ok(acc)
+		[k, v, ..rest] -> flat_entries(rest, array.concat(acc, [(k, v)]))
+		_ -> Err(Protocol('expected an even number of elements'))
+	}
 }
 
 // A flat map whose values are not all strings. HELLO is the case that forces
@@ -359,30 +569,27 @@ pub fn expect_pairs(reply Result(Value, RedisError)) Result(Array((String, Strin
 // the lot as strings fails on that one field. The keys are always text, so
 // only the values stay raw.
 pub fn expect_fields(reply Result(Value, RedisError)) Result(Array((String, Value)), RedisError) {
-	flat <- result.then(expect_values(reply))
-	field_pairs(flat, [])
-}
-
-fn field_pairs(
-	flat Array(Value),
-	acc Array((String, Value)),
-) Result(Array((String, Value)), RedisError) {
-	match flat {
-		[] -> Ok(acc)
-		[name, value, ..rest] -> {
-			field <- result.then(value_text(name))
-			field_pairs(rest, array.concat(acc, [(field, value)]))
-		}
-		_ -> Err(Protocol('expected an even number of elements'))
-	}
+	entries <- result.then(expect_entries(reply))
+	collect(
+		array.map(entries, fn(e) match e {
+			(k, v) -> result.map(value_text(k), fn(name) (name, v))
+		}),
+	)
 }
 
 // The same shape, where the second of each pair is a score.
+// Member/score pairs. RESP3 nests them and sends the score as a double, RESP2
+// flattened them and sent it as a bulk string, and ZSCAN uses the flat form
+// under both — all three land here.
 pub fn expect_scored(reply Result(Value, RedisError)) Result(Array((String, Score)), RedisError) {
-	pairs <- result.then(expect_pairs(reply))
+	entries <- result.then(expect_entries(reply))
 	collect(
-		array.map(pairs, fn(p) match p {
-			(member, raw) -> result.map(to_score(raw), fn(s) (member, s))
+		array.map(entries, fn(e) match e {
+			(m, s) -> {
+				member <- result.then(value_text(m))
+				score <- result.then(value_score(s))
+				Ok((member, score))
+			}
 		}),
 	)
 }
@@ -435,6 +642,9 @@ pub fn expect_values(reply Result(Value, RedisError)) Result(Array(Value), Redis
 	value <- result.then(reply)
 	match value {
 		List(items) -> Ok(items)
+		// A RESP3 set is an array whose order the server does not promise —
+		// which it never did for SMEMBERS anyway.
+		Set(items) -> Ok(items)
 		other -> Err(Protocol('expected an array, got ${describe(other)}'))
 	}
 }
@@ -456,7 +666,9 @@ pub fn value_text(v Value) Result(String, RedisError) {
 	match v {
 		Bulk(bytes) -> text(bytes)
 		SimpleStr(bytes) -> text(bytes)
+		Verbatim(_, bytes) -> text(bytes)
 		Num(n) -> Ok(int.to_string(n))
+		BigNum(digits) -> text(digits)
 		other -> Err(Protocol('expected a string element, got ${describe(other)}'))
 	}
 }
@@ -472,9 +684,16 @@ pub fn value_int(v Value) Result(Int, RedisError) {
 	}
 }
 
+// A score arrives as a real double under RESP3 and as a bulk string under
+// RESP2 — and INCRBYFLOAT still answers with a bulk string under both.
 pub fn value_score(v Value) Result(Score, RedisError) {
-	s <- result.then(value_text(v))
-	to_score(s)
+	match v {
+		Dbl(value) -> Ok(value)
+		other -> {
+			s <- result.then(value_text(other))
+			to_score(s)
+		}
+	}
 }
 
 pub fn to_score(s String) Result(Score, RedisError) {
@@ -482,6 +701,17 @@ pub fn to_score(s String) Result(Score, RedisError) {
 		Ok(v) -> Ok(v)
 		Err(Nil) -> Err(Protocol('not a number: ${s}'))
 	}
+}
+
+// Read an array of replies — EXEC's, for instance — as per-command results, so
+// an error inside it is an `Err` a caller cannot walk past rather than a
+// `Value` variant they might forget to match.
+pub fn as_replies(values Array(Value)) Array(Result(Value, RedisError)) {
+	array.map(values, fn(v) match v {
+		RedisErr(message) -> Err(server_error(message))
+		BlobErr(message) -> Err(server_error(message))
+		other -> Ok(other)
+	})
 }
 
 // Turn an array of results into a result of an array, failing on the first
@@ -492,17 +722,6 @@ pub fn collect(results Array(Result(a, RedisError))) Result(Array(a), RedisError
 		v <- result.then(r)
 		Ok(array.concat(items, [v]))
 	})
-}
-
-fn pair_up(
-	flat Array(String),
-	acc Array((String, String)),
-) Result(Array((String, String)), RedisError) {
-	match flat {
-		[] -> Ok(acc)
-		[a, b, ..rest] -> pair_up(rest, array.concat(acc, [(a, b)]))
-		_ -> Err(Protocol('expected an even number of elements'))
-	}
 }
 
 fn text(bytes Binary) Result(String, RedisError) {
@@ -523,10 +742,18 @@ fn describe(v Value) String {
 	match v {
 		SimpleStr(_) -> 'a status'
 		RedisErr(_) -> 'an error'
+		BlobErr(_) -> 'an error'
 		Num(_) -> 'an integer'
 		Bulk(_) -> 'a bulk string'
+		Verbatim(_, _) -> 'a verbatim string'
 		Null -> 'null'
 		List(_) -> 'an array'
+		Set(_) -> 'a set'
+		Map(_) -> 'a map'
+		Push(_) -> 'a push message'
+		Dbl(_) -> 'a double'
+		Boolean(_) -> 'a boolean'
+		BigNum(_) -> 'a big number'
 	}
 }
 

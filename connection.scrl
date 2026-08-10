@@ -39,12 +39,13 @@ pub fn auth_as(c Conn, username String, password String) Result(Nil, RedisError)
 // role, protocol and so on. The values stay as raw replies because they are
 // not uniformly text: `modules` is an array of module descriptions.
 //
-// This client speaks RESP2 and only RESP2: the decoders assume the RESP2
-// spellings, where a map is a flat array and a double is a bulk string.
-// Requesting protocol 3 here would change those shapes underneath and is not
-// supported, so `hello` deliberately does not take a version.
+// `redis.connect` already performs this handshake, so calling it again is only
+// useful to read the greeting back. It deliberately takes no version argument:
+// this client decodes RESP3, and a `HELLO 2` here would silently switch the
+// live connection back to RESP2 — where a map is a flat array and a double is
+// a bulk string — leaving every later reply misread.
 pub fn hello(c Conn) Result(Array((String, resp.Value)), RedisError) {
-	redis.expect_fields(redis.command(c, ['HELLO', '2']))
+	redis.expect_fields(redis.command(c, ['HELLO', '3']))
 }
 
 pub fn hello_auth(
@@ -58,7 +59,7 @@ pub fn hello_auth(
 			c,
 			redis.parts(
 				[
-					['HELLO', '2', 'AUTH', username, password],
+					['HELLO', '3', 'AUTH', username, password],
 					redis.when_some(client_name, fn(n) ['SETNAME', n]),
 				],
 			),

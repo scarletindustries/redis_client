@@ -561,22 +561,26 @@ fn decode_entry(item resp.Value) Result(Entry, RedisError) {
 fn streams_reply(
 	reply Result(resp.Value, RedisError),
 ) Result(Option(Array(StreamEntries)), RedisError) {
-	found <- result.then(redis.expect_opt_values(reply))
-	match found {
-		None -> Ok(None)
-		Some(items) -> result.map(redis.collect(array.map(items, decode_stream)), Some)
+	value <- result.then(reply)
+	match value {
+		// A blocking read that timed out.
+		Null -> Ok(None)
+		other -> {
+			// RESP3 answers with a map of stream name to entries; RESP2 sent an
+			// array of `[name, entries]` pairs. Both are pairs.
+			named <- result.then(redis.expect_entries(Ok(other)))
+			result.map(redis.collect(array.map(named, decode_stream)), Some)
+		}
 	}
 }
 
-fn decode_stream(item resp.Value) Result(StreamEntries, RedisError) {
-	parts <- result.then(redis.expect_values(Ok(item)))
-	match parts {
-		[name, es] -> {
+fn decode_stream(named (resp.Value, resp.Value)) Result(StreamEntries, RedisError) {
+	match named {
+		(name, es) -> {
 			stream <- result.then(redis.value_text(name))
 			decoded <- result.then(entries(Ok(es)))
 			Ok(StreamEntries(stream, decoded))
 		}
-		_ -> Err(redis.Protocol('expected a stream name and its entries'))
 	}
 }
 

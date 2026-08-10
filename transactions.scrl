@@ -10,6 +10,8 @@
 // holding a lock.
 
 import scarlet/array
+import scarlet/option
+import scarlet/result
 import scarlet/result
 import ./redis.{Conn, RedisError}
 
@@ -53,31 +55,56 @@ pub fn unwatch(c Conn) Result(Nil, RedisError) {
 	redis.expect_ok(redis.command(c, ['UNWATCH']))
 }
 
-// Queue a whole batch and run it: MULTI, each command, EXEC. If queuing any of
-// them fails the transaction is discarded rather than left open on the
-// connection, which would break every command that followed.
+// Queue a whole batch and run it in a single round trip: MULTI, every command,
+// and EXEC all go out together and the replies come back together.
+//
+// The step-by-step form above costs a round trip per command, because each one
+// waits for its own QUEUED. That is two round trips plus one per command; this
+// is one, whatever the batch size. For a transaction of twenty commands over a
+// 1ms link that is the difference between 22ms and 1ms.
+//
+// `None` means a watched key changed and the transaction was abandoned — not
+// an error, but the signal to read the values again and retry. Each reply
+// inside is its own result, since a command can fail at runtime without
+// stopping the ones after it: a Redis transaction is isolation, not rollback.
 pub fn transaction(
 	c Conn,
 	commands Array(Array(String)),
-) Result(Option(Array(resp.Value)), RedisError) {
-	opened <- result.then(multi(c))
-	match opened {
-		Nil -> match queue_all(c, commands) {
-			Ok(Nil) -> exec(c)
-			Err(e) -> {
-				discard(c) or Nil
-				Err(e)
+) Result(Option(Array(Result(resp.Value, RedisError))), RedisError) {
+	replies <- result.then(redis.pipeline(c, redis.parts([[['MULTI']], commands, [['EXEC']]])))
+	match split_last(replies) {
+		None -> Err(redis.Protocol('no replies from a transaction'))
+		Some((head, exec)) -> match head {
+			[] -> Err(redis.Protocol('no replies from a transaction'))
+			[opened, ..queued] -> {
+				_ <- result.then(redis.expect_ok(opened))
+				// A command the server would not queue poisons the whole
+				// transaction: EXEC then answers EXECABORT, which says nothing
+				// about which command was at fault. The queue-time error does.
+				_ <- result.then(first_error(queued))
+				values <- result.then(redis.expect_opt_values(exec))
+				Ok(option.map(values, redis.as_replies))
 			}
 		}
 	}
 }
 
-fn queue_all(c Conn, commands Array(Array(String))) Result(Nil, RedisError) {
-	match commands {
+fn split_last(xs Array(a)) Option((Array(a), a)) {
+	match xs {
+		[] -> None
+		[only] -> Some(([], only))
+		[first, ..rest] -> option.map(split_last(rest), fn(split) match split {
+			(head, last) -> (array.concat([first], head), last)
+		})
+	}
+}
+
+fn first_error(replies Array(Result(resp.Value, RedisError))) Result(Nil, RedisError) {
+	match replies {
 		[] -> Ok(Nil)
-		[first, ..rest] -> match queue(c, first) {
-			Ok(Nil) -> queue_all(c, rest)
+		[first, ..rest] -> match first {
 			Err(e) -> Err(e)
+			Ok(_) -> first_error(rest)
 		}
 	}
 }
