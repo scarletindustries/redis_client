@@ -4,7 +4,7 @@
 
 Talk to Redis from the Scarlet programming language.
 
-[Documentation](https://scarlet.industries) • [Redis commands](https://redis.io/docs/latest/commands/)
+[Documentation](https://scarlet.industries/docs/redis) • [Redis commands](https://redis.io/docs/latest/commands/)
 
 ---
 
