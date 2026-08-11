@@ -36,6 +36,83 @@ plumbing between the lines you care about.
 A missing key is `None`, not `''`. A refused command is an `Err` you can match
 on, and the connection stays usable afterwards.
 
+## Pooling
+
+One connection per process is a fine rule for a script and an awkward one for a
+server, where the work is spread across processes that each need Redis and none
+of them wants to own a connection. A pool inverts it — the connections sit in
+processes of their own, and the *work* travels:
+
+```scarlet
+import ./lib/redis/pool
+
+// A process with a job to do and no connection of its own. It takes one for as
+// long as the command needs it and gives it straight back.
+fn handle(p Conn, job String) Nil {
+	match strings.incr(p, 'processed') {
+		Ok(n) -> println('${job} done, ${n} so far')
+		Err(e) -> println(redis.show_error(e))
+	}
+}
+
+fn run(p Conn) Result(Nil, redis.RedisError) {
+	// Both of these share the same four connections.
+	scheduler.spawn(fn() handle(p, 'job:1'))
+	scheduler.spawn(fn() handle(p, 'job:2'))
+	Ok(Nil)
+}
+
+pool.with_pool('127.0.0.1', 6379, 4, run)
+```
+
+A pool *is* a `Conn` — the same type one socket is. That is what keeps it from
+costing anything at the call site: every command module takes a `Conn`, so every
+command works on a pool with no wrapper and nothing to re-export.
+
+```scarlet
+value <- result.then(strings.get(p, 'greeting'))
+```
+
+The line is identical whether `p` came from `redis.connect` or `pool.start`, so
+a function written against one connection runs against eight unchanged. What
+differs is only what the two promise: a socket-backed `Conn` belongs to one
+process, while a pooled one is a mailbox address — copying it costs nothing, so
+hand it to as many processes as you like.
+
+One command is one checkout, and two commands may land on two connections. When
+that matters, `with_conn` holds one for the length of a block, which is the unit
+of exclusivity WATCH/MULTI needs:
+
+```scarlet
+pool.with_conn(p, fn(c) transactions.transaction(c, [
+	['DECRBY', 'stock:42', '1'],
+	['LPUSH', 'orders', 'order:99'],
+]))
+```
+
+Given a plain connection that is just `next(c)`, so a block written for a pool
+costs nothing when it runs unpooled.
+
+`start` dials every connection before it returns, so a server that is down is
+one error where the program can still act on it, rather than a surprise
+attached to whichever request arrives first. After that the pool is a fixed set
+of connections: a request arriving when all of them are busy waits its turn
+rather than opening one more, which is what keeps a burst of traffic from
+becoming a burst of connections for the server to police. `stop` drains what is
+queued before it closes, and `with_pool` ties both ends to a block.
+
+A connection the server hangs up on is not handed to the next caller. The
+caller holding it at the time gets the error — the pool will not resend a
+command it cannot prove was never applied — and the connection is dialled again
+for the caller after that. A refused command is different: that is Redis
+answering, so the connection goes straight back to the pool.
+
+Subscribers still want a connection of their own. `pubsub.subscribe` takes the
+socket over for as long as the `Subscription` lives, which is exactly what a
+pooled connection cannot do — a connection lent for a subscription would never
+come back, so subscribing on a pool is `Err(Misuse(..))` rather than a lease
+that never returns.
+
 ## Pub/Sub
 
 Publishing is an ordinary command:
@@ -140,7 +217,7 @@ redis.command_raw(c, [<<'SET'>>, key, jpeg])
   and `vendor/scarlet_redis` are fine; `vendor/scarlet-redis` is a parse error,
   because the hyphen reads as subtraction.
 - One connection per process. Two processes sharing one would read each
-  other's replies.
+  other's replies — which is what `pool` is for.
 - RESP3, so Redis 6 or newer. The connection negotiates it at connect and
   fails loudly rather than quietly misreading a RESP2 server's replies.
 
@@ -148,6 +225,8 @@ redis.command_raw(c, [<<'SET'>>, key, jpeg])
 
 ```
 docker compose up -d          # redis on :5379
-scarlet run example/tour.scrl
+scarlet run example/tour.scrl # one connection, one command after another
+scarlet run example/pool.scrl # twelve processes over four connections
 scarlet run test/suite.scrl   # 162 assertions against a live server
+scarlet run test/pool.scrl    # the pool's own, which are about lifecycle
 ```

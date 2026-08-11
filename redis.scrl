@@ -5,7 +5,7 @@
 // command group, and every one of them is built from `command` plus the
 // `expect_*` decoders below.
 //
-// A `Conn` is just the socket — no read buffer threaded through the caller's
+// A `Conn` is a socket — no read buffer threaded through the caller's
 // code, because under strict request/response there is nothing to thread. We
 // write one command and read until exactly one reply is complete; Redis sends
 // exactly one reply per command and never speaks unbidden, so bytes arriving
@@ -19,10 +19,23 @@
 // buffer-owning `Subscription` type rather than reusing `Conn`. Pipelining —
 // more than one command in flight — would need the same, and is not offered.
 //
-// A `Conn` is also not safe to share between processes: two of them writing
-// commands down one socket would interleave requests and read each other's
-// replies. Give each process its own connection; `with_conn` makes that a
-// one-liner.
+// A `Conn` is a socket, or else it is a pool of them. The second kind holds no
+// socket at all: it forwards each command to `./redis/pool.scrl`, which runs it
+// on whichever of its connections is free and sends the reply back. The two are
+// one type because every command in this library is a function of a `Conn`, and
+// making a pool a second type would mean either writing all of them twice or
+// wrapping every call in a block to bridge the gap. They are the same type
+// instead, so `strings.get(c, k)` is the same line of code whether `c` is one
+// connection or eight, and a function written against one works against the
+// other unchanged.
+//
+// What differs is what the two promise. A socket-backed `Conn` must not be
+// shared between processes: two of them writing down one socket would
+// interleave requests and read each other's replies. A pool-backed one is built
+// to be shared — it is a mailbox address, and the socket never leaves the
+// process that dialled it. What a pool cannot promise is that two consecutive
+// commands land on the same connection, which WATCH/MULTI needs and
+// `pool.with_conn` is for.
 
 import scarlet/array
 import scarlet/binary
@@ -32,6 +45,8 @@ import scarlet/result
 import scarlet/net/error.{NetError, UnexpectedEof}
 import scarlet/net/socket.{Closed, Data, Socket}
 import scarlet/resource
+import scarlet/scheduler
+import scarlet/scheduler.{Subject}
 import scarlet/string
 import ./number.{Score}
 import ./resp.{
@@ -59,21 +74,60 @@ import ./resp.{
 // one call; larger ones simply loop.
 const READ_SIZE = 65536
 
-// Opaque: the only way to get one is `connect` or `with_conn`, so a `Conn` in
-// hand is always a socket that was actually dialled.
+// Opaque: the only way to get one is `connect`, `with_conn` or `pool.start`, so
+// a `Conn` in hand is always a socket that was actually dialled, or a pool
+// whose connections were.
 pub opaque type Conn {
-	sock Socket
+	Direct(sock Socket)
+	// A pool, reached through the closure the pool handed us. It is a closure
+	// rather than the pool's own mailbox because the two modules would
+	// otherwise have to import each other: this way `pool` says how a pool is
+	// built and who gets a connection next, and this module knows only that
+	// there is somewhere to send a command.
+	Pooled(control fn(Control) Nil)
 }
 
-// The three ways a command fails, kept apart because they call for different
+// What a pooled `Conn` can ask of the pool behind it. Two variants because
+// those are the two things a *client* wants — run this, and close up — while
+// how a pool matches work to connections stays the pool's own business.
+pub type Control {
+	Dispatch(job Job)
+	Shutdown(done Subject(Nil))
+}
+
+// A unit of work with the caller's result type erased.
+//
+// `lease` is generic in what your block returns, but a mailbox carries one type
+// and a pool queues jobs from every caller in the program. So the job closes
+// over its own reply subject and does the sending itself: the type stays inside
+// the closure, where it is still checked, and what the pool queues mentions no
+// caller's type at all.
+//
+// It takes a `Result` rather than a `Conn` because a pool whose dial failed
+// still owes an answer. It passes that failure in, and the caller gets it as
+// the result of their command.
+pub type Job = fn(Result(Conn, RedisError)) Health
+
+// Whether the connection a job ran on is fit to hand to the next caller. The
+// pool acts on this; the judgement is made here, because it is read off the
+// error variants this module defines.
+pub type Health {
+	Healthy
+	Broken
+}
+
+// The four ways a command fails, kept apart because they call for different
 // responses: `Net` means the connection is gone, `Server` means Redis
-// understood the command and refused it, and `Protocol` means the bytes on the
+// understood the command and refused it, `Protocol` means the bytes on the
 // wire were not the RESP we expected — a bug here, a desync, or a server that
-// is not Redis.
+// is not Redis — and `Misuse` means the call was wrong before it ever reached
+// the wire, which is the price of letting one connection and a pool of them
+// share a type.
 pub type RedisError {
 	Net(err NetError)
 	Server(message String)
 	Protocol(why String)
+	Misuse(why String)
 }
 
 // ---------------------------------------------------------------------------
@@ -106,7 +160,7 @@ pub fn with_conn(host String, port Int, next fn(Conn) Result(a, RedisError)) Res
 // quietly. Failing at connect is the only honest option.
 pub fn connect(host String, port Int) Result(Conn, RedisError) {
 	sock <- result.then(net_err(net.connect(host, port)))
-	c = Conn(sock: sock)
+	c = Direct(sock: sock)
 	match command(c, ['HELLO', '3']) {
 		Ok(_) -> Ok(c)
 		Err(Server(message)) -> {
@@ -121,13 +175,104 @@ pub fn connect(host String, port Int) Result(Conn, RedisError) {
 }
 
 pub fn close(c Conn) Nil {
-	socket.close(c.sock) or Nil
+	match c {
+		Direct(sock) -> socket.close(sock) or Nil
+		// A pooled handle is a copy, and closing a copy must not take the
+		// pool's connections out from under everyone else holding one.
+		// `pool.stop` is the single way to end a pool.
+		Pooled(_) -> Nil
+	}
 }
 
 // The underlying socket. Pub/Sub needs it to take the connection over for
 // server-pushed messages; ordinary command code should not.
-pub fn socket_of(c Conn) Socket {
-	c.sock
+//
+// A pool has no one socket to give, and could not lend one either: a
+// `Subscription` owns its socket for as long as it lives, so a connection
+// leased for a subscription would never come back. Hence the `Result` — a
+// subscriber wants a connection of its own.
+pub fn socket_of(c Conn) Result(Socket, RedisError) {
+	match c {
+		Direct(sock) -> Ok(sock)
+		Pooled(_) -> Err(Misuse('this needs a connection of its own, not a pooled one'))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// One connection, start to finish.
+// ---------------------------------------------------------------------------
+
+// Run `next` on a single connection, whatever kind of `Conn` this is.
+//
+// On a socket-backed one that is just `next(c)`. On a pooled one it is the
+// point of the pool: the block travels to whichever connection comes free, runs
+// there, and its answer travels back. What `next` captures is copied there and
+// what it returns is copied back — ordinary values, so ordinary code.
+//
+// This is what every command below goes through, and `pool.with_conn` is its
+// public name. Reach for it directly when a run of commands must share one
+// connection — WATCH/MULTI is the case that cannot do without it — since two
+// separate commands on a pool may land on two different connections.
+//
+// The `Conn` handed to `next` must not outlive the block: on a pool it is a
+// borrowed connection that goes back the moment `next` returns.
+pub fn lease(c Conn, next fn(Conn) Result(a, RedisError)) Result(a, RedisError) {
+	match c {
+		Direct(_) -> next(c)
+		Pooled(control) -> {
+			reply = scheduler.subject()
+			control(
+				Dispatch(
+					job: fn(leased) {
+						outcome = result.then(leased, next)
+						scheduler.send(reply, outcome)
+						health(outcome)
+					},
+				),
+			)
+			scheduler.receive(reply)
+		}
+	}
+}
+
+// Whether a finished job leaves its connection fit for the next caller.
+//
+// A `Server` error is Redis answering: it read the command, disliked it, and
+// said so, and the connection is exactly where it was. A `Misuse` never reached
+// the wire at all. `Net` and `Protocol` are not like that. One is a socket that
+// is gone; the other is bytes that were not the reply we expected, and a stream
+// that may be one reply out of step would hand the wrong answer to every
+// command after it. A connection that might be desynced is worth less than the
+// reconnect it costs, so the pool drops it.
+pub fn health(outcome Result(a, RedisError)) Health {
+	match outcome {
+		Ok(_) -> Healthy
+		Err(Server(_)) -> Healthy
+		Err(Misuse(_)) -> Healthy
+		Err(Net(_)) -> Broken
+		Err(Protocol(_)) -> Broken
+	}
+}
+
+// Build a pooled connection out of the pool's own sending code. `pool.start` is
+// the only sensible caller.
+pub fn pooled(control fn(Control) Nil) Conn {
+	Pooled(control: control)
+}
+
+// Release whatever is behind this `Conn` and wait until it is released: a pool
+// drains and closes every connection, a plain one closes its socket. `pool.stop`
+// is the public name; it lives here because only this module can see which kind
+// of `Conn` it was handed.
+pub fn shutdown(c Conn) Nil {
+	match c {
+		Direct(_) -> close(c)
+		Pooled(control) -> {
+			done = scheduler.subject()
+			control(Shutdown(done))
+			scheduler.receive(done)
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -149,9 +294,20 @@ pub fn command(c Conn, args Array(String)) Result(Value, RedisError) {
 // `command` for keys and values that are bytes rather than text. Redis keys
 // and values are binary-safe, and a caller storing a JPEG should not have to
 // pretend it is a String.
+// On a pool this is one checkout: the command goes to a free connection and the
+// reply comes back. Ten commands in a row are ten checkouts, and may land on ten
+// different connections — cheap, and exactly what you want for independent work.
+// When they are not independent, put them in one `pool.with_conn`.
 pub fn command_raw(c Conn, args Array(Binary)) Result(Value, RedisError) {
-	_ <- result.then(net_err(socket.write(c.sock, resp.encode_command(args))))
-	match read_reply(c.sock, <<>>) {
+	match c {
+		Direct(sock) -> exchange(sock, args)
+		Pooled(_) -> lease(c, fn(direct) command_raw(direct, args))
+	}
+}
+
+fn exchange(sock Socket, args Array(Binary)) Result(Value, RedisError) {
+	_ <- result.then(net_err(socket.write(sock, resp.encode_command(args))))
+	match read_reply(sock, <<>>) {
 		Ok(RedisErr(message)) -> Err(server_error(message))
 		// RESP3 can carry an error as a length-prefixed blob, so that it may
 		// contain a newline. Same meaning, different framing.
@@ -200,6 +356,18 @@ pub fn pipeline_raw(
 	c Conn,
 	commands Array(Array(Binary)),
 ) Result(Array(Result(Value, RedisError)), RedisError) {
+	match c {
+		Direct(sock) -> exchange_many(sock, commands)
+		// The whole batch goes to one connection and comes back as one round
+		// trip, exactly as it would unpooled.
+		Pooled(_) -> lease(c, fn(direct) pipeline_raw(direct, commands))
+	}
+}
+
+fn exchange_many(
+	sock Socket,
+	commands Array(Array(Binary)),
+) Result(Array(Result(Value, RedisError)), RedisError) {
 	count = array.length(commands)
 	if count == 0 {
 		Ok([])
@@ -207,9 +375,9 @@ pub fn pipeline_raw(
 		// One vectored write: every request reaches the kernel in a single
 		// syscall, without first being concatenated into one big binary.
 		_ <- result.then(
-			net_err(socket.write_parts(c.sock, array.map(commands, resp.encode_command))),
+			net_err(socket.write_parts(sock, array.map(commands, resp.encode_command))),
 		)
-		read_replies(c.sock, <<>>, 0, count, [])
+		read_replies(sock, <<>>, 0, count, [])
 	}
 }
 
@@ -762,5 +930,6 @@ pub fn show_error(e RedisError) String {
 		Net(err) -> 'network error: ${string.inspect(err)}'
 		Server(message) -> 'server said: ${message}'
 		Protocol(why) -> 'protocol error: ${why}'
+		Misuse(why) -> 'misused: ${why}'
 	}
 }

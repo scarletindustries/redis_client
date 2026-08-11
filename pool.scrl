@@ -1,0 +1,416 @@
+// A pool of connections, each in a process of its own.
+//
+// A `Conn` belongs to one process. Two processes writing commands down one
+// socket would interleave their requests and read each other's replies, so the
+// rule for a bare connection is one per process — fine for a script, awkward
+// for a server, where the work is spread across processes that each need Redis
+// and none of them wants to own a connection, dial one, or hand it back.
+//
+// A pool turns that around. The connections stay where they are, one process
+// each, dialled once and kept; the *work* travels. A command ships to a free
+// connection's process, which runs it there and sends the answer back. What
+// crosses between processes is a message, never the socket, so the rule above
+// is kept rather than worked around — and the handle is then just a mailbox
+// address, free to copy, safe to hand to every process in the program.
+//
+// That handle is a `Conn`, the same type one socket is, which is what keeps the
+// pool from costing anything at the call site:
+//
+//	c <- result.then(pool.start('127.0.0.1', 6379, 8))
+//	greeting <- result.then(strings.get(c, 'greeting'))
+//
+// Every command in this library takes a `Conn`, so every one of them works on a
+// pool with no wrapper, no re-export, and nothing to keep in step as commands
+// are added. `redis.connect` and `pool.start` differ in what they return only
+// by how many sockets are behind it.
+//
+// One command is one checkout. When a run of them must share a connection —
+// WATCH/MULTI is the case that cannot do without it — `with_conn` holds one for
+// the length of a block.
+//
+// Between `start` and `stop` the pool is a fixed set of connections. A request
+// arriving when all of them are busy waits its turn rather than opening a ninth
+// connection, which is what keeps a burst of traffic from becoming a burst of
+// connections for the server to police.
+
+import scarlet/array
+import scarlet/int
+import scarlet/resource
+import scarlet/result
+import scarlet/scheduler
+import scarlet/scheduler.{Subject}
+import ./redis.{Broken, Conn, Dispatch, Health, Healthy, Job, RedisError, Shutdown}
+
+// ---------------------------------------------------------------------------
+// The protocol between the three kinds of process: callers, the gateway, and
+// the workers that hold the connections.
+// ---------------------------------------------------------------------------
+
+// What the gateway accepts once it is serving.
+type Request {
+	// Run this on whichever connection comes free first.
+	Run(job Job)
+	// A worker reporting that its job is done and it is free again.
+	Ready(worker Subject(Task))
+	// Drain what is queued, close every connection, then answer.
+	Stop(done Subject(Nil))
+}
+
+// What a worker accepts.
+type Task {
+	Work(job Job)
+	Quit
+}
+
+// A worker reporting for duty, carrying the outcome of its first dial.
+// Delivered to a mailbox of its own rather than to the gateway's, which is what
+// lets the boot loop below handle exactly one kind of message.
+type Boot {
+	worker Subject(Task)
+	opened Result(Nil, RedisError)
+}
+
+// ---------------------------------------------------------------------------
+// Starting and stopping.
+// ---------------------------------------------------------------------------
+
+// Start a pool of `size` connections, and wait for every one of them to be up.
+//
+// Dialling eagerly is what makes the error worth having: a server that is down,
+// a port that is wrong, a Redis too old for RESP3 — each is one `Err` here, at
+// the point where the program can still do something about it, rather than a
+// surprise attached to whichever request happens to arrive first. The dials all
+// go out at once, so this costs one connect, not `size` of them.
+//
+// A size below one is one. A pool that can serve nothing would park every
+// caller for ever, which is never what the caller meant.
+pub fn start(host String, port Int, size Int) Result(Conn, RedisError) {
+	ack = scheduler.subject()
+	scheduler.spawn(fn() manage(host, port, int.max(1, size), ack))
+	// What the caller gets is a `Conn` that carries this closure and knows
+	// nothing else about the pool. Copying it into another process copies the
+	// gateway's address, which is the whole of what sharing a pool means.
+	result.map(scheduler.receive(ack), fn(gateway) redis.pooled(fn(msg) match msg {
+		Dispatch(job) -> scheduler.send(gateway, Run(job))
+		Shutdown(done) -> scheduler.send(gateway, Stop(done))
+	}))
+}
+
+// Close the pool, and wait until it is closed. Work already queued runs first,
+// so a `stop` racing the last few requests does not strand them; every
+// connection is closed and every worker finished by the time this returns.
+//
+// Stop once, and only after the pool's users are done with it. A command that
+// arrives after the gateway is gone has nowhere to send its job and nothing to
+// wait for, and parks for ever — `with_pool` ties the pool to a block so that
+// cannot happen by accident.
+//
+// Given a plain connection rather than a pool this closes it, so a function
+// that takes a `Conn` and tidies up after itself does the right thing either
+// way.
+pub fn stop(c Conn) Nil {
+	redis.shutdown(c)
+}
+
+// Start a pool, run `next` with it, and stop it on the way out — the pool's
+// answer to `redis.with_conn`, and written for the same backpassing:
+//
+//	c <- pool.with_pool('127.0.0.1', 6379, 8)
+//	...commands, in as many processes as you like...
+//
+// Note the shape it shares with `redis.with_conn`: both hand a block a `Conn`
+// and close it afterwards, so moving a program from one connection to eight is
+// a change to this line and nothing below it.
+//
+// The result is flattened rather than nested, for the reason `with_conn` gives:
+// a pool that could not start and a failure inside the block are both
+// `RedisError`, and nesting them would make every caller unwrap twice.
+pub fn with_pool(
+	host String,
+	port Int,
+	size Int,
+	next fn(Conn) Result(a, RedisError),
+) Result(a, RedisError) {
+	match resource.try_with(fn() start(host, port, size), stop, next) {
+		Ok(inner) -> inner
+		Err(e) -> Err(e)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Using the pool.
+// ---------------------------------------------------------------------------
+
+// Hold one connection for the length of `next`, waiting for one to come free.
+//
+// Most code does not need this. `strings.get(c, k)` already works on a pool, and
+// a command that stands on its own should just be written that way. Reach for
+// this when a run of commands must share a connection:
+//
+//	applied <- result.then(pool.with_conn(c, fn(c) {
+//		_ <- result.then(transactions.watch(c, ['balance']))
+//		...
+//	}))
+//
+// `next` runs in the connection's own process, not the calling one. What it
+// captures travels there as a copy and what it returns travels back the same
+// way — ordinary values, so ordinary code — and two things follow from it.
+//
+// The block is the unit of exclusivity: commands inside one `with_conn` are
+// guaranteed the same connection, which is what WATCH/MULTI needs, while two
+// separate ones may land on two different ones. And the `Conn` must not outlive
+// the block, since it goes back to the pool the moment `next` returns.
+//
+// Given a plain connection this is just `next(c)`, so a block written for a pool
+// costs nothing when it runs unpooled.
+pub fn with_conn(c Conn, next fn(Conn) Result(a, RedisError)) Result(a, RedisError) {
+	redis.lease(c, next)
+}
+
+// ---------------------------------------------------------------------------
+// The gateway.
+// ---------------------------------------------------------------------------
+
+// The gateway process: one mailbox, `size` workers, and a queue at each end of
+// it. It holds no connection itself, so nothing it does can block on the
+// network — matching a request to a free worker, or parking it behind the
+// requests before it, is a value moving between two queues.
+fn manage(
+	host String,
+	port Int,
+	size Int,
+	ack Subject(Result(Subject(Request), RedisError)),
+) Nil {
+	booting = scheduler.subject()
+	gateway = scheduler.subject()
+	hire(host, port, size, booting, gateway)
+	await(booting, gateway, ack, size, empty(), None)
+}
+
+fn hire(host String, port Int, left Int, booting Subject(Boot), gateway Subject(Request)) Nil {
+	if left == 0 {
+		Nil
+	} else {
+		scheduler.spawn(fn() work(host, port, booting, gateway))
+		hire(host, port, left - 1, booting, gateway)
+	}
+}
+
+// Collect every worker's first dial before publishing the gateway. A failure
+// does not end the boot early: the rest of the workers are still on their way
+// in, and a worker left parked on a mailbox nobody will ever send to would keep
+// the program alive for ever. So every one of them is accounted for, told to
+// quit, and only then is the failure reported.
+fn await(
+	booting Subject(Boot),
+	gateway Subject(Request),
+	ack Subject(Result(Subject(Request), RedisError)),
+	pending Int,
+	idle Fifo(Subject(Task)),
+	failed Option(RedisError),
+) Nil {
+	if pending == 0 {
+		match failed {
+			None -> {
+				scheduler.send(ack, Ok(gateway))
+				serve(gateway, idle, empty(), depth(idle), [])
+			}
+			Some(e) -> scheduler.send(ack, Err(e))
+		}
+	} else {
+		match scheduler.receive(booting) {
+			Boot(worker, Ok(Nil)) -> match failed {
+				None -> await(booting, gateway, ack, pending - 1, enqueue(idle, worker), failed)
+				// This pool is not going to exist. Retire the worker as it
+				// arrives rather than let it park.
+				Some(_) -> {
+					scheduler.send(worker, Quit)
+					await(booting, gateway, ack, pending - 1, idle, failed)
+				}
+			}
+			Boot(worker, Err(e)) -> {
+				scheduler.send(worker, Quit)
+				array.each(drain(idle), fn(w) scheduler.send(w, Quit))
+				await(booting, gateway, ack, pending - 1, empty(), Some(first_of(failed, e)))
+			}
+		}
+	}
+}
+
+// The first failure is the one worth reporting: the ones after it are usually
+// the same server refusing the same thing.
+fn first_of(seen Option(RedisError), e RedisError) RedisError {
+	match seen {
+		Some(first) -> first
+		None -> e
+	}
+}
+
+// The serving loop.
+//
+// `idle` and `queued` are never both occupied — a job is queued only when no
+// worker is free, and a worker is idled only when no job is waiting — so the
+// two queues together are one line of traffic, and neither can hide work from
+// the other. `live` counts the workers that have not been told to quit;
+// `closing` holds whoever is waiting to hear that they all have.
+fn serve(
+	gateway Subject(Request),
+	idle Fifo(Subject(Task)),
+	queued Fifo(Job),
+	live Int,
+	closing Array(Subject(Nil)),
+) Nil {
+	if live == 0 {
+		// Every connection is closed. Answer the `stop` (or stops) that asked
+		// for it and let this process end, which takes the gateway's mailbox
+		// with it.
+		array.each(closing, fn(done) scheduler.send(done, Nil))
+	} else {
+		match scheduler.receive(gateway) {
+			Run(job) -> match dequeue(idle) {
+				Some((worker, rest)) -> {
+					scheduler.send(worker, Work(job))
+					serve(gateway, rest, queued, live, closing)
+				}
+				None -> serve(gateway, idle, enqueue(queued, job), live, closing)
+			}
+			Ready(worker) -> match dequeue(queued) {
+				Some((job, rest)) -> {
+					scheduler.send(worker, Work(job))
+					serve(gateway, idle, rest, live, closing)
+				}
+				// Nothing waiting: park the worker, or retire it if the pool is
+				// closing and its queue has drained.
+				None -> if array.length(closing) == 0 {
+					serve(gateway, enqueue(idle, worker), queued, live, closing)
+				} else {
+					scheduler.send(worker, Quit)
+					serve(gateway, idle, queued, live - 1, closing)
+				}
+			}
+			// Workers that are busy keep their jobs and quit as they report
+			// back; the idle ones have nothing left to finish, so they go now.
+			Stop(done) -> {
+				waiting = drain(idle)
+				array.each(waiting, fn(w) scheduler.send(w, Quit))
+				serve(
+					gateway,
+					empty(),
+					queued,
+					live - array.length(waiting),
+					array.concat(closing, [done]),
+				)
+			}
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The workers.
+// ---------------------------------------------------------------------------
+
+// One connection, one process, for the life of the pool. The socket is dialled
+// here, used here and closed here, and never crosses to another process — which
+// is the point of the whole arrangement.
+fn work(host String, port Int, booting Subject(Boot), gateway Subject(Request)) Nil {
+	inbox = scheduler.subject()
+	opened = redis.connect(host, port)
+	scheduler.send(booting, Boot(worker: inbox, opened: result.map(opened, fn(_) Nil)))
+	labour(host, port, gateway, inbox, held(opened))
+}
+
+fn labour(
+	host String,
+	port Int,
+	gateway Subject(Request),
+	inbox Subject(Task),
+	conn Option(Conn),
+) Nil {
+	match scheduler.receive(inbox) {
+		Quit -> release(conn)
+		Work(job) -> {
+			// A worker without a connection dials again here — the pool's first
+			// attempt may have failed, or the last job may have broken it. One
+			// attempt per job, so a server that is down costs each caller an
+			// error rather than a wait.
+			lease = match conn {
+				Some(c) -> Ok(c)
+				None -> redis.connect(host, port)
+			}
+			kept = retain(lease, job(lease))
+			scheduler.send(gateway, Ready(inbox))
+			labour(host, port, gateway, inbox, kept)
+		}
+	}
+}
+
+// Keep the connection unless the job left it in doubt.
+fn retain(lease Result(Conn, RedisError), verdict Health) Option(Conn) {
+	match (lease, verdict) {
+		(Ok(c), Healthy) -> Some(c)
+		(Ok(c), Broken) -> {
+			redis.close(c)
+			None
+		}
+		(Err(_), _) -> None
+	}
+}
+
+fn held(opened Result(Conn, RedisError)) Option(Conn) {
+	match opened {
+		Ok(c) -> Some(c)
+		Err(_) -> None
+	}
+}
+
+fn release(conn Option(Conn)) Nil {
+	match conn {
+		Some(c) -> redis.close(c)
+		None -> Nil
+	}
+}
+
+// ---------------------------------------------------------------------------
+// A queue.
+// ---------------------------------------------------------------------------
+
+// Two stacks: `back` takes what arrives, `front` serves what leaves, and `back`
+// is reversed onto `front` when `front` runs out. Each element is moved once,
+// so a queue that grows to a thousand pending jobs costs the same per job as
+// one that never holds more than two — where appending to an array would make
+// a busy pool quadratic in its own backlog.
+type Fifo(a) {
+	front Array(a)
+	back Array(a)
+}
+
+fn empty() Fifo(a) {
+	Fifo([], [])
+}
+
+fn enqueue(q Fifo(a), v a) Fifo(a) {
+	match q {
+		Fifo(front, back) -> Fifo(front, [v, ..back])
+	}
+}
+
+fn dequeue(q Fifo(a)) Option((a, Fifo(a))) {
+	match q {
+		Fifo([head, ..rest], back) -> Some((head, Fifo(rest, back)))
+		Fifo(_, []) -> None
+		Fifo(_, back) -> dequeue(Fifo(array.reverse(back), []))
+	}
+}
+
+// Everything in the queue, in order.
+fn drain(q Fifo(a)) Array(a) {
+	match q {
+		Fifo(front, back) -> array.concat(front, array.reverse(back))
+	}
+}
+
+fn depth(q Fifo(a)) Int {
+	match q {
+		Fifo(front, back) -> array.length(front) + array.length(back)
+	}
+}

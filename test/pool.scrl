@@ -1,0 +1,381 @@
+// Integration tests for the pool, run against a live Redis.
+//
+//	scarlet run test/pool.scrl [host] [port]
+//
+// Its own file rather than a group inside `suite.scrl`, because what it checks
+// is not a command's reply but a lifecycle: which connection a block lands on,
+// what happens to a connection the server hangs up on, and what `stop` owes the
+// work already queued. Those want their own connections and their own
+// processes.
+//
+// The checks run in order of how much they stir the scheduler, quietest first.
+
+import scarlet/array
+import scarlet/int
+import scarlet/process
+import scarlet/result
+import scarlet/scheduler
+import scarlet/scheduler.{Subject}
+import scarlet/string
+import ../number
+import ../pool
+import ../redis.{Conn, Misuse, RedisError, Server}
+import ../connection
+import ../keys
+import ../pubsub
+import ../strings
+
+const PREFIX = 'scrl:pool:'
+
+fn k(name String) String {
+	'${PREFIX}${name}'
+}
+
+// ---------------------------------------------------------------------------
+// Assertions.
+// ---------------------------------------------------------------------------
+
+type Check {
+	name String
+	ok Bool
+	detail String
+}
+
+fn eq(name String, actual a, expected a) Check {
+	got = string.inspect(actual)
+	want = string.inspect(expected)
+	Check(name, got == want, 'expected ${want}, got ${got}')
+}
+
+fn that(name String, ok Bool) Check {
+	Check(name, ok, 'expected True')
+}
+
+// ---------------------------------------------------------------------------
+// Starting.
+// ---------------------------------------------------------------------------
+
+// A pool that cannot dial has to say so at `start`, where the program can still
+// do something about it, rather than at whichever command arrives first.
+fn test_start(host String) Array(Check) {
+	refused = match pool.start(host, 1, 2) {
+		Ok(_) -> False
+		Err(_) -> True
+	}
+	[that('a port nothing listens on fails start', refused)]
+}
+
+// ---------------------------------------------------------------------------
+// Which connection a block lands on.
+// ---------------------------------------------------------------------------
+
+fn test_blocks(p Conn) Result(Array(Check), RedisError) {
+	// A command module called straight on the pool, with no block in sight.
+	// This is the whole point of a pool being a `Conn`: `strings.set` was
+	// written against one connection and knows nothing about pools.
+	_ <- result.then(strings.set(p, k('direct'), 'hello'))
+	direct <- result.then(strings.get(p, k('direct')))
+
+	// Commands inside one block share a connection. WATCH/MULTI depends on it.
+	one_each <- result.then(
+		pool.with_conn(p, fn(c) {
+			first <- result.then(connection.client_id(c))
+			second <- result.then(connection.client_id(c))
+			Ok(first == second)
+		}),
+	)
+
+	// A refused command is Redis answering, not the connection failing, so the
+	// connection goes back to the pool rather than being thrown away.
+	rejected = match redis.command(p, ['NOSUCHCOMMAND']) {
+		Err(Server(_)) -> True
+		_ -> False
+	}
+	alive <- result.then(pool.with_conn(p, fn(c) connection.ping(c)))
+
+	replies <- result.then(redis.pipeline(p, [['SET', k('pl'), '7'], ['INCR', k('pl')]]))
+	incremented <- result.then(match replies {
+		[_, incr] -> redis.expect_int(incr)
+		_ -> Err(redis.Protocol('expected two replies'))
+	})
+
+	// A subscription would own its connection for as long as it lived, so the
+	// pool refuses to lend one rather than never getting it back.
+	refused = match pubsub.subscribe(p, ['news']) {
+		Err(Misuse(_)) -> True
+		_ -> False
+	}
+
+	_ <- result.then(keys.del(p, [k('pl'), k('direct')]))
+	Ok(
+		[
+			eq('a command module called straight on the pool', direct, Some('hello')),
+			that('a block keeps one connection throughout', one_each),
+			that('a refused command is a Server error', rejected),
+			eq('the pool is usable after one', alive, 'PONG'),
+			eq('a pipeline through the pool', incremented, 8),
+			that('subscribing on a pool is a Misuse error', refused),
+		],
+	)
+}
+
+// ---------------------------------------------------------------------------
+// A connection the server hangs up on.
+// ---------------------------------------------------------------------------
+
+// Killed from outside the pool, so the pool meets it the way it would meet a
+// server restart: on next use. The caller holding the dead connection gets the
+// error — the pool does not retry, because a command it cannot prove was never
+// applied must not be sent twice — and every caller after that gets a
+// connection the pool dialled again for itself.
+fn test_recovery(host String, port Int) Array(Check) {
+	match pool.start(host, port, 1) {
+		Err(e) -> [Check('recovery pool', False, redis.show_error(e))]
+		Ok(p) -> {
+			checks = match pool.with_conn(p, fn(c) connection.client_id(c)) {
+				Err(e) -> [Check('recovery client id', False, redis.show_error(e))]
+				Ok(id) -> {
+					gone = redis.with_conn(host, port, fn(c) connection.client_kill_by_id(c, id))
+					[
+						eq('the pooled connection was killed', gone, Ok(1)),
+						that('the pool dials again and serves on', beat(p, 10, 0) >= 9),
+					]
+				}
+			}
+			pool.stop(p)
+			checks
+		}
+	}
+}
+
+fn beat(p Conn, left Int, ok Int) Int {
+	if left == 0 {
+		ok
+	} else {
+		match pool.with_conn(p, fn(c) connection.ping(c)) {
+			Ok(_) -> beat(p, left - 1, ok + 1)
+			Err(_) -> beat(p, left - 1, ok)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Stopping.
+// ---------------------------------------------------------------------------
+
+// A stop that arrives while work is queued still owes that work: it drains
+// first, and only then closes the connections and answers.
+fn test_stop(host String, port Int) Array(Check) {
+	match pool.start(host, port, 1) {
+		Err(e) -> [Check('stop pool', False, redis.show_error(e))]
+		Ok(p) -> {
+			done = scheduler.subject()
+			// One caller holds the single connection; three more pile up.
+			scheduler.spawn(fn() slow(p, done, 200))
+			scheduler.spawn(fn() slow(p, done, 0))
+			scheduler.spawn(fn() slow(p, done, 0))
+			scheduler.spawn(fn() slow(p, done, 0))
+			// Long enough that all four are at the gateway before the stop is.
+			scheduler.sleep(80)
+			pool.stop(p)
+			[eq('stop drains the queue before closing', tally(done, 4, 0), 4)]
+		}
+	}
+}
+
+fn slow(p Conn, done Subject(Int), ms Int) Nil {
+	served = pool.with_conn(p, fn(c) {
+		scheduler.sleep(ms)
+		connection.ping(c)
+	})
+	scheduler.send(done, if served == Ok('PONG') {
+		1
+	} else {
+		0
+	})
+}
+
+fn tally(done Subject(Int), left Int, acc Int) Int {
+	if left == 0 {
+		acc
+	} else {
+		tally(done, left - 1, acc + scheduler.receive(done))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Many callers, few connections.
+// ---------------------------------------------------------------------------
+
+fn test_sharing(p Conn) Result(Array(Check), RedisError) {
+	_ <- result.then(pool.with_conn(p, fn(c) keys.del(c, [k('counter')])))
+
+	// Three blocks that overlap in time cannot be sharing a connection, so
+	// three distinct client ids is three open sockets.
+	spread = distinct_ids(p, 3)
+
+	// Twenty callers over three connections. The counter they share is what
+	// proves none of them was quietly dropped.
+	served = fan_out(p, 20)
+	counted <- result.then(pool.with_conn(p, fn(c) strings.get(c, k('counter'))))
+
+	_ <- result.then(pool.with_conn(p, fn(c) keys.del(c, [k('counter')])))
+	Ok(
+		[
+			eq('three overlapping blocks, three connections', spread, 3),
+			eq('twenty callers over three connections are all served', served, 20),
+			eq('and every one of their writes landed', counted, Some('20')),
+		],
+	)
+}
+
+// Ask `n` blocks at once who they are, each holding its connection long enough
+// that they must overlap, and count the distinct answers.
+fn distinct_ids(p Conn, n Int) Int {
+	done = scheduler.subject()
+	ask_ids(p, done, n)
+	array.length(
+		array.fold(gather_ints(done, n, []), [], fn(seen, id) if array.contains(seen, id) {
+			seen
+		} else {
+			array.concat(seen, [id])
+		}),
+	)
+}
+
+fn ask_ids(p Conn, done Subject(Int), left Int) Nil {
+	if left == 0 {
+		Nil
+	} else {
+		scheduler.spawn(fn() scheduler.send(
+			done,
+			pool.with_conn(p, fn(c) {
+				scheduler.sleep(30)
+				connection.client_id(c)
+			}) or 0,
+		))
+		ask_ids(p, done, left - 1)
+	}
+}
+
+fn gather_ints(done Subject(Int), left Int, acc Array(Int)) Array(Int) {
+	if left == 0 {
+		acc
+	} else {
+		gather_ints(done, left - 1, array.concat(acc, [scheduler.receive(done)]))
+	}
+}
+
+fn fan_out(p Conn, n Int) Int {
+	done = scheduler.subject()
+	ask_incr(p, done, n)
+	gather_ok(done, n, 0)
+}
+
+fn ask_incr(p Conn, done Subject(Bool), left Int) Nil {
+	if left == 0 {
+		Nil
+	} else {
+		scheduler.spawn(fn() scheduler.send(
+			done,
+			result.is_ok(pool.with_conn(p, fn(c) strings.incr(c, k('counter')))),
+		))
+		ask_incr(p, done, left - 1)
+	}
+}
+
+fn gather_ok(done Subject(Bool), left Int, ok Int) Int {
+	if left == 0 {
+		ok
+	} else {
+		gather_ok(done, left - 1, if scheduler.receive(done) {
+			ok + 1
+		} else {
+			ok
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Running.
+// ---------------------------------------------------------------------------
+
+type Score {
+	failed Int
+	total Int
+}
+
+fn plus(a Score, b Score) Score {
+	match (a, b) {
+		(Score(af, at), Score(bf, bt)) -> Score(af + bf, at + bt)
+	}
+}
+
+fn run(name String, p Conn, body fn(Conn) Result(Array(Check), RedisError)) Array(Check) {
+	match body(p) {
+		Ok(checks) -> checks
+		// A group that died partway still reports — as one failure naming the
+		// group, rather than vanishing from the count.
+		Err(e) -> [Check('${name} (group aborted)', False, redis.show_error(e))]
+	}
+}
+
+// Reported as each group finishes rather than all at the end, so a group that
+// never returns still leaves behind everything that passed before it.
+fn report(name String, checks Array(Check)) Score {
+	println('${name}:')
+	array.each(checks, fn(ch) match ch {
+		Check(label, True, _) -> println('  ok    ${label}')
+		Check(label, False, detail) -> println('  FAIL  ${label}: ${detail}')
+	})
+	Score(
+		array.length(
+			array.filter(checks, fn(ch) match ch {
+				Check(_, ok, _) -> ok == False
+			}),
+		),
+		array.length(checks),
+	)
+}
+
+fn main(host String, port Int) Nil {
+	starting = report('starting', test_start(host))
+	outcome = pool.with_pool(host, port, 3, fn(p) Ok(
+		plus(
+			report('one block, one connection', run('blocks', p, test_blocks)),
+			report('many callers, few connections', run('sharing', p, test_sharing)),
+		),
+	))
+	match outcome {
+		Err(e) -> println('pool tests could not run: ${redis.show_error(e)}')
+		Ok(shared) -> {
+			total = plus(
+				plus(starting, shared),
+				plus(
+					report('a killed connection', test_recovery(host, port)),
+					report('stopping', test_stop(host, port)),
+				),
+			)
+			match total {
+				Score(failed, count) -> {
+					println('')
+					if failed == 0 {
+						println('${int.to_string(count)} checks, all passed')
+					} else {
+						println('${int.to_string(count)} checks, ${int.to_string(failed)} FAILED')
+					}
+				}
+			}
+		}
+	}
+}
+
+// Defaults match the docker-compose in this repo.
+match process.argv() {
+	[_, host, port] -> match number.parse_int(port) {
+		Ok(p) -> main(host, p)
+		Err(Nil) -> println('port must be a number')
+	}
+	[_, host] -> main(host, 5379)
+	_ -> main('127.0.0.1', 5379)
+}

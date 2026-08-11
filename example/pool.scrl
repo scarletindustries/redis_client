@@ -1,0 +1,155 @@
+// A tour of the pool.
+//
+//	scarlet run example/pool.scrl [host] [port]
+//
+// The single-connection tour next door is a script: one process, one
+// connection, one command after another. This is the other shape — a program
+// whose work is spread across processes, none of which owns a connection or
+// knows how many there are.
+//
+// `p <- pool.with_pool(..)` starts the connections, hands the block a handle,
+// and closes them on the way out. The handle is a mailbox address, so it copies
+// into a spawned process for nothing: every worker below shares the same four
+// connections without any of them dialling one.
+//
+// The handle is a `Conn`, so the commands read exactly as they do next door —
+// `strings.incr(p, ..)` on four connections is the same line it is on one. The
+// only place this tour says the word `with_conn` is the transaction, which is
+// the one thing here that genuinely needs a connection to itself.
+
+import scarlet/array
+import scarlet/float
+import scarlet/int
+import scarlet/process
+import scarlet/result
+import scarlet/scheduler
+import scarlet/scheduler.{Subject}
+import ../number.{Finite}
+import ../pool
+import ../redis.{Conn, RedisError}
+import ../connection
+import ../keys
+import ../sorted_sets
+import ../strings
+import ../transactions
+
+const PREFIX = 'scrl:pool-demo:'
+const CONNECTIONS = 4
+const WORKERS = 12
+
+fn k(name String) String {
+	'${PREFIX}${name}'
+}
+
+// ---------------------------------------------------------------------------
+// One worker.
+// ---------------------------------------------------------------------------
+
+// A process with a job to do and no connection of its own. It takes one for as
+// long as each command needs it and gives it straight back — and while it waits
+// on Redis, the other eleven are using the other three connections.
+fn worker(p Conn, id Int, done Subject(Result(Int, RedisError))) Nil {
+	scheduler.send(done, record(p, id))
+}
+
+// Two commands and two checkouts. Neither needs the other's connection, so
+// neither asks for one, and the two may well run on different sockets — which
+// is what lets twelve of these overlap on four connections.
+//
+// Nothing here mentions the pool. Hand this function a `redis.connect` instead
+// and it runs unchanged on the one socket.
+fn record(p Conn, id Int) Result(Int, RedisError) {
+	_ <- result.then(sorted_sets.zadd(p, k('board'), [('player:${id}', Finite(float.from_int(id)))]))
+	strings.incr(p, k('processed'))
+}
+
+fn collect(done Subject(Result(Int, RedisError)), left Int, ok Int) Int {
+	if left == 0 {
+		ok
+	} else {
+		match scheduler.receive(done) {
+			Ok(_) -> collect(done, left - 1, ok + 1)
+			Err(e) -> {
+				println('  a worker failed: ${redis.show_error(e)}')
+				collect(done, left - 1, ok)
+			}
+		}
+	}
+}
+
+fn spawn_workers(p Conn, done Subject(Result(Int, RedisError)), left Int) Nil {
+	if left == 0 {
+		Nil
+	} else {
+		scheduler.spawn(fn() worker(p, left, done))
+		spawn_workers(p, done, left - 1)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The tour.
+// ---------------------------------------------------------------------------
+
+fn tour(p Conn) Result(Nil, RedisError) {
+	_ <- result.then(keys.del(p, [k('board'), k('processed')]))
+
+	// Twelve processes, four connections, no coordination between them.
+	done = scheduler.subject()
+	spawn_workers(p, done, WORKERS)
+	served = collect(done, WORKERS, 0)
+	println('${int.to_string(served)} workers finished over ${int.to_string(CONNECTIONS)} connections')
+
+	// A block is the unit of exclusivity: everything inside it runs on one
+	// connection, which is what a transaction needs. Two separate commands
+	// would not promise that; one `with_conn` does.
+	replies <- result.then(
+		pool.with_conn(p, fn(c) transactions.transaction(c, [
+			['INCR', k('processed')],
+			['ZCARD', k('board')],
+		])),
+	)
+	match replies {
+		Some([_, card]) -> println('leaderboard holds ${redis.expect_int(card) or 0} players')
+		Some(_) -> println('unexpected transaction reply')
+		None -> println('the transaction was abandoned')
+	}
+
+	// A typed command, a one-off, and a pipeline, none of them naming a
+	// connection. The pipeline is one round trip on one connection, as it
+	// would be unpooled.
+	top <- result.then(sorted_sets.zrange(p, k('board'), 0, 2, True))
+	println('top three: ${string_of(top)}')
+
+	counted <- result.then(redis.command(p, ['GET', k('processed')]))
+	println('processed counter: ${redis.value_text(counted) or '(nil)'}')
+
+	_ <- result.then(redis.pipeline(p, [['DEL', k('board')], ['DEL', k('processed')]]))
+	Ok(Nil)
+}
+
+fn string_of(names Array(String)) String {
+	array.fold(names, '', fn(acc, name) if acc == '' {
+		name
+	} else {
+		'${acc}, ${name}'
+	})
+}
+
+fn main(host String, port Int) Nil {
+	// `with_pool` dials every connection before the block starts, so a server
+	// that is down is one error here rather than twelve errors later.
+	match pool.with_pool(host, port, CONNECTIONS, tour) {
+		Ok(Nil) -> println('done')
+		Err(e) -> println('could not run: ${redis.show_error(e)}')
+	}
+}
+
+// Defaults match the docker-compose in this repo.
+match process.argv() {
+	[_, host, port] -> match number.parse_int(port) {
+		Ok(p) -> main(host, p)
+		Err(Nil) -> println('port must be a number')
+	}
+	[_, host] -> main(host, 5379)
+	_ -> main('127.0.0.1', 5379)
+}

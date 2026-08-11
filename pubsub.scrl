@@ -136,7 +136,9 @@ pub fn ssubscribe(c Conn, to_channels Array(String)) Result(Subscription, RedisE
 }
 
 fn start(c Conn, verb String, names Array(String)) Result(Subscription, RedisError) {
-	sock = redis.socket_of(c)
+	// A `Subscription` owns its socket for as long as it lives, so a pooled
+	// connection is refused here rather than leased and never given back.
+	sock <- result.then(redis.socket_of(c))
 	match socket.write(
 		sock,
 		resp.encode_command(array.map(array.concat([verb], names), binary.from_string)),
