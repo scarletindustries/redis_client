@@ -39,7 +39,7 @@ import scarlet/process
 import scarlet/process.{Subject}
 import scarlet/resource
 import scarlet/result
-import ./redis.{Broken, Conn, Dispatch, Health, Healthy, Job, Pool, RedisError, Shutdown}
+import ./redis.{Broken, Conn, Dispatch, Health, Healthy, Job, RedisError, Shutdown}
 
 // ---------------------------------------------------------------------------
 // The protocol between the three kinds of process: callers, the gateway, and
@@ -122,7 +122,7 @@ fn start_with(
 	// A pool that dies while starting still owes an answer to `start`. Without
 	// this the boot would be waited on for ever, which is the one failure a
 	// caller cannot even time out of.
-	watch = process.monitor(pid, ack, fn(_) Err(Pool('the pool ended while starting')))
+	watch = process.monitor(pid, ack, fn(down) Err(redis.pool_ended(down)))
 	booted = process.receive(ack)
 	process.demonitor(watch)
 	// What the caller gets is a `Conn` that carries this closure and knows

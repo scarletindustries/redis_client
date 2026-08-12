@@ -116,6 +116,12 @@ only ever going to be told about it. What every caller gets instead is
 commands already queued and `stop` itself. Nothing parks on a mailbox with
 nobody left to send to.
 
+What that error carries is a `PoolFault`, not a sentence: `Forgotten` for a pool
+that is well and truly gone, `Killed`, `Stopped`, or `Crashed` holding the
+runtime error it died of. Mostly it is `Forgotten`, because the runtime keeps
+nothing about a process once it has finished, and the useful part is the same in
+every case: there is no point asking again.
+
 Subscribers still want a connection of their own. `pubsub.subscribe` takes the
 socket over for as long as the `Subscription` lives, which is exactly what a
 pooled connection cannot do — a connection lent for a subscription would never

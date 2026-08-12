@@ -327,24 +327,25 @@ fn test_crash(host String, port Int) Array(Check) {
 			after = pool.with_conn(p, fn(c) connection.ping(c))
 			checks = [
 				eq('the pool serves before the crash', before, Ok('PONG')),
-				that('the crashing caller is answered', ended(died)),
-				that('a caller after it is answered too', ended(after)),
+				// The worker's crash reaches the pool over the link, so what
+				// the caller is told is that the pool was killed, not that it
+				// crashed: the fault ended the worker, the link ended the pool.
+				that('the crashing caller is told the pool was killed', match died {
+					Err(redis.Pool(redis.Killed)) -> True
+					_ -> False
+				}),
+				// By now the runtime has let go of it, and a pool it no longer
+				// remembers is one no caller can be told anything more about.
+				that('a caller after it is told the pool is gone', match after {
+					Err(redis.Pool(redis.Forgotten)) -> True
+					_ -> False
+				}),
 			]
 			// And this returns rather than parking, which is the same fault
 			// wearing the other hat: `stop` waits for a gateway that is gone.
 			pool.stop(p)
 			array.concat(checks, [that('stop returns on a dead pool', True)])
 		}
-	}
-}
-
-// Whether a command came back with the pool's own error — the one that says
-// the machinery in between ended before it could answer.
-fn ended(r Result(a, RedisError)) Bool {
-	match r {
-		Err(redis.Pool(_)) -> True
-		Err(_) -> False
-		Ok(_) -> False
 	}
 }
 

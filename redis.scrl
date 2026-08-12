@@ -45,7 +45,7 @@ import scarlet/result
 import scarlet/net/error.{NetError, UnexpectedEof}
 import scarlet/net/socket.{Closed, Data, Socket}
 import scarlet/process
-import scarlet/process.{Pid, Subject}
+import scarlet/process.{Crash, Down, Pid, Subject}
 import scarlet/resource
 import scarlet/string
 import ./number.{Score}
@@ -139,7 +139,52 @@ pub type RedisError {
 	Server(message String)
 	Protocol(why String)
 	Misuse(why String)
-	Pool(why String)
+	Pool(fault PoolFault)
+}
+
+// Why a pooled command has no answer.
+//
+// A pool runs in a process of its own, so every one of these is that process
+// being gone; they differ in what the runtime could still say about it at the
+// moment the command asked. That timing matters more than it looks: the
+// runtime keeps nothing about a process once it has finished, so how a pool
+// died is knowable only while it is dying.
+//
+// Which makes `Forgotten` the common answer and the others the narrow ones. A
+// pool that was stopped, crashed or killed at any point before this command
+// all read the same afterwards, and a caller that wants to tell them apart
+// wants the failure at `start`, or the stderr line a crash prints, rather than
+// this. What this is for is the decision every caller does have to make:
+// whether there is any point asking again. There is not.
+pub type PoolFault {
+	// It was already gone when the command asked. The ordinary reading of a
+	// pool that is well and truly finished, whatever finished it.
+	Forgotten
+	// It ended by returning, which is what `stop` makes it do — so the command
+	// was sent to a pool the program had already finished with. Seen only when
+	// the two race closely enough that the runtime has not let go yet; a pool
+	// stopped a moment earlier reads as `Forgotten`.
+	Stopped
+	// It was killed, or something linked to it was. A worker of this library
+	// crashing arrives here rather than as `Crashed`, since what reaches the
+	// pool's own process is the link, not the fault.
+	Killed
+	// The pool's own process raised a runtime error. A bug in this library
+	// rather than in the program using it, and the error is carried rather
+	// than described so that a report can say which one it was.
+	Crashed(crash Crash)
+}
+
+// Read a monitor's notice as the fault it is. The one place that turns the
+// runtime's account of a dead process into this library's, and total in both
+// directions, so a pool can never fail in a way it has no name for.
+pub fn pool_ended(down Down) RedisError {
+	Pool(match down.reason {
+		process.Normal -> Stopped
+		process.Crashed(crash) -> Crashed(crash)
+		process.Killed -> Killed
+		process.NoProcess -> Forgotten
+	})
 }
 
 // ---------------------------------------------------------------------------
@@ -276,11 +321,7 @@ pub fn lease(c Conn, next fn(Conn) Result(a, RedisError)) Result(a, RedisError) 
 			// waited on past the other. The monitor goes on before the job does:
 			// a pool that is already gone fires it at once, which is the case
 			// this exists for.
-			watch = process.monitor(
-				gateway,
-				reply,
-				fn(_) Err(Pool('the pool ended before this command was answered')),
-			)
+			watch = process.monitor(gateway, reply, fn(down) Err(pool_ended(down)))
 			control(
 				Dispatch(job: fn(leased) {
 					outcome = result.then(leased, next)
@@ -1002,6 +1043,15 @@ pub fn show_error(e RedisError) String {
 		Server(message) -> 'server said: ${message}'
 		Protocol(why) -> 'protocol error: ${why}'
 		Misuse(why) -> 'misused: ${why}'
-		Pool(why) -> 'pool error: ${why}'
+		Pool(fault) -> 'pool error: ${show_pool_fault(fault)}'
+	}
+}
+
+pub fn show_pool_fault(f PoolFault) String {
+	match f {
+		Stopped -> 'the pool had already been stopped'
+		Crashed(crash) -> 'the pool crashed: ${string.inspect(crash)}'
+		Killed -> 'the pool was killed'
+		Forgotten -> 'the pool was already gone'
 	}
 }
