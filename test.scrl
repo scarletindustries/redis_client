@@ -1,0 +1,117 @@
+// A pool-shaped scheduler program with no sockets in it: one gateway process,
+// three workers, and rounds of spawned callers that each post a job and wait on
+// a reply subject of their own.
+
+import scarlet/array
+import scarlet/int
+import scarlet/scheduler
+import scarlet/scheduler.{Subject}
+
+type Job {
+    Job(run fn(Int) Nil)
+}
+
+type Req {
+    Run(job Job)
+    Ready(worker Subject(Task))
+}
+
+type Task {
+    Work(job Job)
+    Quit
+}
+
+// The gateway: hand each job to a free worker, or queue it.
+fn serve(gate Subject(Req), idle Array(Subject(Task)), queued Array(Job)) Nil {
+    match scheduler.receive(gate) {
+        Run(job) -> match idle {
+            [w, ..rest] -> {
+                scheduler.send(w, Work(job))
+                serve(gate, rest, queued)
+            }
+            [] -> serve(gate, idle, array.concat(queued, [job]))
+        }
+        Ready(w) -> match queued {
+            [j, ..rest] -> {
+                scheduler.send(w, Work(j))
+                serve(gate, idle, rest)
+            }
+            [] -> serve(gate, array.concat(idle, [w]), queued)
+        }
+    }
+}
+
+fn work(gate Subject(Req), id Int) Nil {
+    inbox = scheduler.subject()
+    scheduler.send(gate, Ready(inbox))
+    labour(gate, inbox, id)
+}
+
+fn labour(gate Subject(Req), inbox Subject(Task), id Int) Nil {
+    match scheduler.receive(inbox) {
+        Quit -> Nil
+        Work(job) -> {
+            match job {
+                Job(f) -> f(id)
+            }
+            scheduler.send(gate, Ready(inbox))
+            labour(gate, inbox, id)
+        }
+    }
+}
+
+fn hire(gate Subject(Req), left Int) Nil {
+    if left == 0 {
+        Nil
+    } else {
+        scheduler.spawn(fn() work(gate, left))
+        hire(gate, left - 1)
+    }
+}
+
+// A caller: posts a job that closes over its own reply subject, then waits.
+fn caller(gate Subject(Req), done Subject(Int)) Nil {
+    reply = scheduler.subject()
+    scheduler.send(gate, Run(Job(run: fn(id) scheduler.send(reply, id))))
+    scheduler.send(done, scheduler.receive(reply))
+}
+
+fn spawn_callers(gate Subject(Req), done Subject(Int), left Int) Nil {
+    if left == 0 {
+        Nil
+    } else {
+        scheduler.spawn(fn() caller(gate, done))
+        spawn_callers(gate, done, left - 1)
+    }
+}
+
+fn gather(done Subject(Int), left Int, acc Array(Int)) Array(Int) {
+    if left == 0 {
+        acc
+    } else {
+        gather(done, left - 1, array.concat(acc, [scheduler.receive(done)]))
+    }
+}
+
+fn rounds(gate Subject(Req), left Int, n Int) Nil {
+    if left == 0 {
+        println('survived every round')
+    } else {
+        done = scheduler.subject()
+        spawn_callers(gate, done, n)
+        println('round ok, ${int.to_string(array.length(gather(done, n, [])))} back')
+        rounds(gate, left - 1, n)
+    }
+}
+
+// The gateway owns its own mailbox and publishes it, as `pool.manage` does.
+fn manage(ack Subject(Subject(Req))) Nil {
+    gate = scheduler.subject()
+    hire(gate, 3)
+    scheduler.send(ack, gate)
+    serve(gate, [], [])
+}
+
+ack = scheduler.subject()
+scheduler.spawn(fn() manage(ack))
+rounds(scheduler.receive(ack), 20, 3)
