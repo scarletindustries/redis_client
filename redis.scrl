@@ -44,9 +44,9 @@ import scarlet/net
 import scarlet/result
 import scarlet/net/error.{NetError, UnexpectedEof}
 import scarlet/net/socket.{Closed, Data, Socket}
+import scarlet/process
+import scarlet/process.{Subject}
 import scarlet/resource
-import scarlet/scheduler
-import scarlet/scheduler.{Subject}
 import scarlet/string
 import ./number.{Score}
 import ./resp.{
@@ -258,17 +258,15 @@ pub fn lease(c Conn, next fn(Conn) Result(a, RedisError)) Result(a, RedisError) 
 	match c {
 		Direct(_) -> next(c)
 		Pooled(control) -> {
-			reply = scheduler.subject()
+			reply = process.subject()
 			control(
-				Dispatch(
-					job: fn(leased) {
-						outcome = result.then(leased, next)
-						scheduler.send(reply, outcome)
-						health(outcome)
-					},
-				),
+				Dispatch(job: fn(leased) {
+					outcome = result.then(leased, next)
+					process.send(reply, outcome)
+					health(outcome)
+				}),
 			)
-			scheduler.receive(reply)
+			process.receive(reply)
 		}
 	}
 }
@@ -306,9 +304,9 @@ pub fn shutdown(c Conn) Nil {
 	match c {
 		Direct(_) -> close(c)
 		Pooled(control) -> {
-			done = scheduler.subject()
+			done = process.subject()
 			control(Shutdown(done))
-			scheduler.receive(done)
+			process.receive(done)
 		}
 	}
 }

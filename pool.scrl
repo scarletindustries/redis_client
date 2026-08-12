@@ -35,10 +35,10 @@
 
 import scarlet/array
 import scarlet/int
+import scarlet/process
+import scarlet/process.{Subject}
 import scarlet/resource
 import scarlet/result
-import scarlet/scheduler
-import scarlet/scheduler.{Subject}
 import ./redis.{Broken, Conn, Dispatch, Health, Healthy, Job, RedisError, Shutdown}
 
 // ---------------------------------------------------------------------------
@@ -110,14 +110,14 @@ fn start_with(
 	size Int,
 	creds Option((String, String)),
 ) Result(Conn, RedisError) {
-	ack = scheduler.subject()
-	scheduler.spawn(fn() manage(host, port, int.max(1, size), creds, ack))
+	ack = process.subject()
+	_ = process.spawn(fn() manage(host, port, int.max(1, size), creds, ack))
 	// What the caller gets is a `Conn` that carries this closure and knows
 	// nothing else about the pool. Copying it into another process copies the
 	// gateway's address, which is the whole of what sharing a pool means.
-	result.map(scheduler.receive(ack), fn(gateway) redis.pooled(fn(msg) match msg {
-		Dispatch(job) -> scheduler.send(gateway, Run(job))
-		Shutdown(done) -> scheduler.send(gateway, Stop(done))
+	result.map(process.receive(ack), fn(gateway) redis.pooled(fn(msg) match msg {
+		Dispatch(job) -> process.send(gateway, Run(job))
+		Shutdown(done) -> process.send(gateway, Stop(done))
 	}))
 }
 
@@ -222,8 +222,8 @@ fn manage(
 	creds Option((String, String)),
 	ack Subject(Result(Subject(Request), RedisError)),
 ) Nil {
-	booting = scheduler.subject()
-	gateway = scheduler.subject()
+	booting = process.subject()
+	gateway = process.subject()
 	hire(host, port, size, creds, booting, gateway)
 	await(booting, gateway, ack, size, empty(), None)
 }
@@ -239,7 +239,7 @@ fn hire(
 	if left == 0 {
 		Nil
 	} else {
-		scheduler.spawn(fn() work(host, port, creds, booting, gateway))
+		_ = process.spawn(fn() work(host, port, creds, booting, gateway))
 		hire(host, port, left - 1, creds, booting, gateway)
 	}
 }
@@ -260,25 +260,25 @@ fn await(
 	if pending == 0 {
 		match failed {
 			None -> {
-				scheduler.send(ack, Ok(gateway))
+				process.send(ack, Ok(gateway))
 				serve(gateway, idle, empty(), depth(idle), [])
 			}
-			Some(e) -> scheduler.send(ack, Err(e))
+			Some(e) -> process.send(ack, Err(e))
 		}
 	} else {
-		match scheduler.receive(booting) {
+		match process.receive(booting) {
 			Boot(worker, Ok(Nil)) -> match failed {
 				None -> await(booting, gateway, ack, pending - 1, enqueue(idle, worker), failed)
 				// This pool is not going to exist. Retire the worker as it
 				// arrives rather than let it park.
 				Some(_) -> {
-					scheduler.send(worker, Quit)
+					process.send(worker, Quit)
 					await(booting, gateway, ack, pending - 1, idle, failed)
 				}
 			}
 			Boot(worker, Err(e)) -> {
-				scheduler.send(worker, Quit)
-				array.each(drain(idle), fn(w) scheduler.send(w, Quit))
+				process.send(worker, Quit)
+				array.each(drain(idle), fn(w) process.send(w, Quit))
 				await(booting, gateway, ack, pending - 1, empty(), Some(first_of(failed, e)))
 			}
 		}
@@ -312,19 +312,19 @@ fn serve(
 		// Every connection is closed. Answer the `stop` (or stops) that asked
 		// for it and let this process end, which takes the gateway's mailbox
 		// with it.
-		array.each(closing, fn(done) scheduler.send(done, Nil))
+		array.each(closing, fn(done) process.send(done, Nil))
 	} else {
-		match scheduler.receive(gateway) {
+		match process.receive(gateway) {
 			Run(job) -> match dequeue(idle) {
 				Some((worker, rest)) -> {
-					scheduler.send(worker, Work(job))
+					process.send(worker, Work(job))
 					serve(gateway, rest, queued, live, closing)
 				}
 				None -> serve(gateway, idle, enqueue(queued, job), live, closing)
 			}
 			Ready(worker) -> match dequeue(queued) {
 				Some((job, rest)) -> {
-					scheduler.send(worker, Work(job))
+					process.send(worker, Work(job))
 					serve(gateway, idle, rest, live, closing)
 				}
 				// Nothing waiting: park the worker, or retire it if the pool is
@@ -332,7 +332,7 @@ fn serve(
 				None -> if array.length(closing) == 0 {
 					serve(gateway, enqueue(idle, worker), queued, live, closing)
 				} else {
-					scheduler.send(worker, Quit)
+					process.send(worker, Quit)
 					serve(gateway, idle, queued, live - 1, closing)
 				}
 			}
@@ -340,7 +340,7 @@ fn serve(
 			// back; the idle ones have nothing left to finish, so they go now.
 			Stop(done) -> {
 				waiting = drain(idle)
-				array.each(waiting, fn(w) scheduler.send(w, Quit))
+				array.each(waiting, fn(w) process.send(w, Quit))
 				serve(
 					gateway,
 					empty(),
@@ -367,9 +367,9 @@ fn work(
 	booting Subject(Boot),
 	gateway Subject(Request),
 ) Nil {
-	inbox = scheduler.subject()
+	inbox = process.subject()
 	opened = dial(host, port, creds)
-	scheduler.send(booting, Boot(worker: inbox, opened: result.map(opened, fn(_) Nil)))
+	process.send(booting, Boot(worker: inbox, opened: result.map(opened, fn(_) Nil)))
 	labour(host, port, creds, gateway, inbox, held(opened))
 }
 
@@ -381,7 +381,7 @@ fn labour(
 	inbox Subject(Task),
 	conn Option(Conn),
 ) Nil {
-	match scheduler.receive(inbox) {
+	match process.receive(inbox) {
 		Quit -> release(conn)
 		Work(job) -> {
 			// A worker without a connection dials again here — the pool's first
@@ -393,7 +393,7 @@ fn labour(
 				None -> dial(host, port, creds)
 			}
 			kept = retain(lease, job(lease))
-			scheduler.send(gateway, Ready(inbox))
+			process.send(gateway, Ready(inbox))
 			labour(host, port, creds, gateway, inbox, kept)
 		}
 	}

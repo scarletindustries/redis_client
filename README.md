@@ -57,8 +57,8 @@ fn handle(p Conn, job String) Nil {
 
 fn run(p Conn) Result(Nil, redis.RedisError) {
 	// Both of these share the same four connections.
-	scheduler.spawn(fn() handle(p, 'job:1'))
-	scheduler.spawn(fn() handle(p, 'job:2'))
+	_ = process.spawn(fn() handle(p, 'job:1'))
+	_ = process.spawn(fn() handle(p, 'job:2'))
 	Ok(Nil)
 }
 

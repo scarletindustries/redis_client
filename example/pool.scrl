@@ -20,10 +20,10 @@
 import scarlet/array
 import scarlet/float
 import scarlet/int
+import scarlet/os
 import scarlet/process
+import scarlet/process.{Subject}
 import scarlet/result
-import scarlet/scheduler
-import scarlet/scheduler.{Subject}
 import ../number.{Finite}
 import ../pool
 import ../redis.{Conn, RedisError}
@@ -49,7 +49,7 @@ fn k(name String) String {
 // long as each command needs it and gives it straight back — and while it waits
 // on Redis, the other eleven are using the other three connections.
 fn worker(p Conn, id Int, done Subject(Result(Int, RedisError))) Nil {
-	scheduler.send(done, record(p, id))
+	process.send(done, record(p, id))
 }
 
 // Two commands and two checkouts. Neither needs the other's connection, so
@@ -59,7 +59,9 @@ fn worker(p Conn, id Int, done Subject(Result(Int, RedisError))) Nil {
 // Nothing here mentions the pool. Hand this function a `redis.connect` instead
 // and it runs unchanged on the one socket.
 fn record(p Conn, id Int) Result(Int, RedisError) {
-	_ <- result.then(sorted_sets.zadd(p, k('board'), [('player:${id}', Finite(float.from_int(id)))]))
+	_ <- result.then(
+		sorted_sets.zadd(p, k('board'), [('player:${id}', Finite(float.from_int(id)))]),
+	)
 	strings.incr(p, k('processed'))
 }
 
@@ -67,7 +69,7 @@ fn collect(done Subject(Result(Int, RedisError)), left Int, ok Int) Int {
 	if left == 0 {
 		ok
 	} else {
-		match scheduler.receive(done) {
+		match process.receive(done) {
 			Ok(_) -> collect(done, left - 1, ok + 1)
 			Err(e) -> {
 				println('  a worker failed: ${redis.show_error(e)}')
@@ -81,7 +83,7 @@ fn spawn_workers(p Conn, done Subject(Result(Int, RedisError)), left Int) Nil {
 	if left == 0 {
 		Nil
 	} else {
-		scheduler.spawn(fn() worker(p, left, done))
+		_ = process.spawn(fn() worker(p, left, done))
 		spawn_workers(p, done, left - 1)
 	}
 }
@@ -94,19 +96,21 @@ fn tour(p Conn) Result(Nil, RedisError) {
 	_ <- result.then(keys.del(p, [k('board'), k('processed')]))
 
 	// Twelve processes, four connections, no coordination between them.
-	done = scheduler.subject()
+	done = process.subject()
 	spawn_workers(p, done, WORKERS)
 	served = collect(done, WORKERS, 0)
-	println('${int.to_string(served)} workers finished over ${int.to_string(CONNECTIONS)} connections')
+	println(
+		'${int.to_string(served)} workers finished over ${int.to_string(CONNECTIONS)} connections',
+	)
 
 	// A block is the unit of exclusivity: everything inside it runs on one
 	// connection, which is what a transaction needs. Two separate commands
 	// would not promise that; one `with_conn` does.
 	replies <- result.then(
-		pool.with_conn(p, fn(c) transactions.transaction(c, [
-			['INCR', k('processed')],
-			['ZCARD', k('board')],
-		])),
+		pool.with_conn(
+			p,
+			fn(c) transactions.transaction(c, [['INCR', k('processed')], ['ZCARD', k('board')]]),
+		),
 	)
 	match replies {
 		Some([_, card]) -> println('leaderboard holds ${redis.expect_int(card) or 0} players')
@@ -145,7 +149,7 @@ fn main(host String, port Int) Nil {
 }
 
 // Defaults match the docker-compose in this repo.
-match process.argv() {
+match os.argv() {
 	[_, host, port] -> match number.parse_int(port) {
 		Ok(p) -> main(host, p)
 		Err(Nil) -> println('port must be a number')

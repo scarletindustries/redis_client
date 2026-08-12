@@ -12,10 +12,10 @@
 
 import scarlet/array
 import scarlet/int
+import scarlet/os
 import scarlet/process
+import scarlet/process.{Subject}
 import scarlet/result
-import scarlet/scheduler
-import scarlet/scheduler.{Subject}
 import scarlet/string
 import ../number
 import ../pool
@@ -169,14 +169,14 @@ fn test_stop(host String, port Int) Array(Check) {
 	match pool.start(host, port, 1) {
 		Err(e) -> [Check('stop pool', False, redis.show_error(e))]
 		Ok(p) -> {
-			done = scheduler.subject()
+			done = process.subject()
 			// One caller holds the single connection; three more pile up.
-			scheduler.spawn(fn() slow(p, done, 200))
-			scheduler.spawn(fn() slow(p, done, 0))
-			scheduler.spawn(fn() slow(p, done, 0))
-			scheduler.spawn(fn() slow(p, done, 0))
+			_ = process.spawn(fn() slow(p, done, 200))
+			_ = process.spawn(fn() slow(p, done, 0))
+			_ = process.spawn(fn() slow(p, done, 0))
+			_ = process.spawn(fn() slow(p, done, 0))
 			// Long enough that all four are at the gateway before the stop is.
-			scheduler.sleep(80)
+			process.sleep(80)
 			pool.stop(p)
 			[eq('stop drains the queue before closing', tally(done, 4, 0), 4)]
 		}
@@ -185,21 +185,17 @@ fn test_stop(host String, port Int) Array(Check) {
 
 fn slow(p Conn, done Subject(Int), ms Int) Nil {
 	served = pool.with_conn(p, fn(c) {
-		scheduler.sleep(ms)
+		process.sleep(ms)
 		connection.ping(c)
 	})
-	scheduler.send(done, if served == Ok('PONG') {
-		1
-	} else {
-		0
-	})
+	process.send(done, if served == Ok('PONG') { 1 } else { 0 })
 }
 
 fn tally(done Subject(Int), left Int, acc Int) Int {
 	if left == 0 {
 		acc
 	} else {
-		tally(done, left - 1, acc + scheduler.receive(done))
+		tally(done, left - 1, acc + process.receive(done))
 	}
 }
 
@@ -232,7 +228,7 @@ fn test_sharing(p Conn) Result(Array(Check), RedisError) {
 // Ask `n` blocks at once who they are, each holding its connection long enough
 // that they must overlap, and count the distinct answers.
 fn distinct_ids(p Conn, n Int) Int {
-	done = scheduler.subject()
+	done = process.subject()
 	ask_ids(p, done, n)
 	array.length(
 		array.fold(gather_ints(done, n, []), [], fn(seen, id) if array.contains(seen, id) {
@@ -247,10 +243,10 @@ fn ask_ids(p Conn, done Subject(Int), left Int) Nil {
 	if left == 0 {
 		Nil
 	} else {
-		scheduler.spawn(fn() scheduler.send(
+		_ = process.spawn(fn() process.send(
 			done,
 			pool.with_conn(p, fn(c) {
-				scheduler.sleep(30)
+				process.sleep(30)
 				connection.client_id(c)
 			}) or 0,
 		))
@@ -262,12 +258,12 @@ fn gather_ints(done Subject(Int), left Int, acc Array(Int)) Array(Int) {
 	if left == 0 {
 		acc
 	} else {
-		gather_ints(done, left - 1, array.concat(acc, [scheduler.receive(done)]))
+		gather_ints(done, left - 1, array.concat(acc, [process.receive(done)]))
 	}
 }
 
 fn fan_out(p Conn, n Int) Int {
-	done = scheduler.subject()
+	done = process.subject()
 	ask_incr(p, done, n)
 	gather_ok(done, n, 0)
 }
@@ -276,10 +272,12 @@ fn ask_incr(p Conn, done Subject(Bool), left Int) Nil {
 	if left == 0 {
 		Nil
 	} else {
-		scheduler.spawn(fn() scheduler.send(
-			done,
-			result.is_ok(pool.with_conn(p, fn(c) strings.incr(c, k('counter')))),
-		))
+		_ = process.spawn(
+			fn() process.send(
+				done,
+				result.is_ok(pool.with_conn(p, fn(c) strings.incr(c, k('counter')))),
+			),
+		)
 		ask_incr(p, done, left - 1)
 	}
 }
@@ -288,7 +286,7 @@ fn gather_ok(done Subject(Bool), left Int, ok Int) Int {
 	if left == 0 {
 		ok
 	} else {
-		gather_ok(done, left - 1, if scheduler.receive(done) {
+		gather_ok(done, left - 1, if process.receive(done) {
 			ok + 1
 		} else {
 			ok
@@ -340,7 +338,9 @@ fn report(name String, checks Array(Check)) Score {
 
 fn main(host String, port Int) Nil {
 	starting = report('starting', test_start(host))
-	outcome = pool.with_pool(host, port, 3, fn(p) Ok(
+	outcome = pool.with_pool(host, port, 3, fn(
+		p,
+	) Ok(
 		plus(
 			report('one block, one connection', run('blocks', p, test_blocks)),
 			report('many callers, few connections', run('sharing', p, test_sharing)),
@@ -371,7 +371,7 @@ fn main(host String, port Int) Nil {
 }
 
 // Defaults match the docker-compose in this repo.
-match process.argv() {
+match os.argv() {
 	[_, host, port] -> match number.parse_int(port) {
 		Ok(p) -> main(host, p)
 		Err(Nil) -> println('port must be a number')

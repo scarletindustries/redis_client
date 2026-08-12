@@ -8,9 +8,9 @@
 
 import scarlet/array
 import scarlet/int
+import scarlet/os
 import scarlet/process
 import scarlet/result
-import scarlet/scheduler
 import scarlet/string
 import ../number.{Finite, PosInf}
 import ../redis.{Conn, Expires, Missing, NoExpiry, RedisError, Server}
@@ -870,7 +870,7 @@ fn test_pubsub(host String, port Int) Array(Check) {
 		Ok(c) -> match pubsub.subscribe(c, [channel]) {
 			Err(e) -> [Check('subscribe', False, redis.show_error(e))]
 			Ok(sub) -> {
-				scheduler.spawn(fn() publish_later(host, port, channel))
+				_ = process.spawn(fn() publish_later(host, port, channel))
 				// A generous timeout: this asserts a message arrives, not how
 				// fast the scheduler got to the publisher.
 				(sub1, first) = pubsub.next_message_within(sub, 3000)
@@ -890,7 +890,7 @@ fn test_pubsub(host String, port Int) Array(Check) {
 
 fn publish_later(host String, port Int, channel String) Nil {
 	// Long enough that the subscriber is parked in a read before this fires.
-	scheduler.sleep(100)
+	process.sleep(100)
 	match redis.with_conn(host, port, fn(c) pubsub.publish(c, channel, 'ping')) {
 		Ok(_) -> Nil
 		Err(e) -> println('publisher failed: ${redis.show_error(e)}')
@@ -1011,7 +1011,7 @@ fn main(host String, port Int) Nil {
 }
 
 // Defaults match the docker-compose in this repo.
-match process.argv() {
+match os.argv() {
 	[_, host, port] -> match number.parse_int(port) {
 		Ok(p) -> main(host, p)
 		Err(Nil) -> println('port must be a number')

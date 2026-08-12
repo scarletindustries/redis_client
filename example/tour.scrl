@@ -8,9 +8,9 @@
 // Err. Between them a sequence of commands reads as a sequence of commands.
 
 import scarlet/array
+import scarlet/os
 import scarlet/process
 import scarlet/result
-import scarlet/scheduler
 import scarlet/string
 import ../number.{Finite}
 import ../redis.{Conn, RedisError}
@@ -120,7 +120,7 @@ fn pubsub_demo(host String, port Int) Nil {
 		Ok(c) -> match pubsub.subscribe(c, [channel]) {
 			Err(e) -> println('pubsub  subscribe failed: ${redis.show_error(e)}')
 			Ok(sub) -> {
-				scheduler.spawn(fn() publish_later(host, port, channel))
+				_ = process.spawn(fn() publish_later(host, port, channel))
 				(after, first) = pubsub.next_message_within(sub, 3000)
 				match first {
 					Ok(Some(Message(from, payload))) -> println('pubsub  ${from} -> ${payload}')
@@ -135,7 +135,7 @@ fn pubsub_demo(host String, port Int) Nil {
 }
 
 fn publish_later(host String, port Int, channel String) Nil {
-	scheduler.sleep(100)
+	process.sleep(100)
 	match redis.with_conn(host, port, fn(c) pubsub.publish(c, channel, 'scarlet speaks resp')) {
 		Ok(_) -> Nil
 		Err(e) -> println('publisher failed: ${redis.show_error(e)}')
@@ -174,7 +174,7 @@ fn main(host String, port Int) Nil {
 	}
 }
 
-match process.argv() {
+match os.argv() {
 	[_, host, port] -> match number.parse_int(port) {
 		Ok(p) -> main(host, p)
 		Err(Nil) -> println('port must be a number')
