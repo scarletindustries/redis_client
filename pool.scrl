@@ -39,7 +39,7 @@ import scarlet/process
 import scarlet/process.{Subject}
 import scarlet/resource
 import scarlet/result
-import ./redis.{Broken, Conn, Dispatch, Health, Healthy, Job, RedisError, Shutdown}
+import ./redis.{Broken, Conn, Dispatch, Health, Healthy, Job, Pool, RedisError, Shutdown}
 
 // ---------------------------------------------------------------------------
 // The protocol between the three kinds of process: callers, the gateway, and
@@ -111,14 +111,30 @@ fn start_with(
 	creds Option((String, String)),
 ) Result(Conn, RedisError) {
 	ack = process.subject()
-	_ = process.spawn(fn() manage(host, port, int.max(1, size), creds, ack))
+	// Unlinked, deliberately. A pool is shared: its handle is copied to every
+	// process that needs Redis, and the one that happened to call `start` is
+	// not its owner in any sense the others would recognise. Linking would make
+	// that process's failure everyone else's, and — the other way round — would
+	// let a fault inside the pool take down a caller that was only ever going
+	// to be told about it. What the pool owes its users is an error, which is
+	// what the monitors here and in `lease` deliver.
+	pid = process.spawn_unlinked(fn() manage(host, port, int.max(1, size), creds, ack))
+	// A pool that dies while starting still owes an answer to `start`. Without
+	// this the boot would be waited on for ever, which is the one failure a
+	// caller cannot even time out of.
+	watch = process.monitor(pid, ack, fn(_) Err(Pool('the pool ended while starting')))
+	booted = process.receive(ack)
+	process.demonitor(watch)
 	// What the caller gets is a `Conn` that carries this closure and knows
 	// nothing else about the pool. Copying it into another process copies the
 	// gateway's address, which is the whole of what sharing a pool means.
-	result.map(process.receive(ack), fn(gateway) redis.pooled(fn(msg) match msg {
-		Dispatch(job) -> process.send(gateway, Run(job))
-		Shutdown(done) -> process.send(gateway, Stop(done))
-	}))
+	result.map(booted, fn(gateway) redis.pooled(
+		fn(msg) match msg {
+			Dispatch(job) -> process.send(gateway, Run(job))
+			Shutdown(done) -> process.send(gateway, Stop(done))
+		},
+		pid,
+	))
 }
 
 // Close the pool, and wait until it is closed. Work already queued runs first,
@@ -239,6 +255,15 @@ fn hire(
 	if left == 0 {
 		Nil
 	} else {
+		// Linked, deliberately, and the only link in this file. A worker
+		// crashing is not a Redis that is down or a reply that would not parse
+		// — those are `Err`s it hands back and carries on from. It is this
+		// library reaching past the end of something, and the connection it was
+		// in the middle of is then in a state no one can describe. The link
+		// makes that one bug end the whole pool, and the gateway's end is what
+		// every caller is already watching for, so the bug is reported to all of
+		// them at once instead of stranding whichever one it happened to be
+		// serving. Loud and contained: the pool dies, the program does not.
 		_ = process.spawn(fn() work(host, port, creds, booting, gateway))
 		hire(host, port, left - 1, creds, booting, gateway)
 	}

@@ -295,6 +295,60 @@ fn gather_ok(done Subject(Bool), left Int, ok Int) Int {
 }
 
 // ---------------------------------------------------------------------------
+// A worker that dies mid-job.
+// ---------------------------------------------------------------------------
+
+// The loudest group, and last for that reason: it ends a pool by killing one
+// of its connections outright, from inside a block.
+//
+// A block runs in the worker's own process, so a runtime error in one is a
+// worker crash — this library reaching past the end of something, which is the
+// only way a worker dies that its own reconnect cannot answer. Every caller is
+// then owed an error, and what this pins is that they get one: before monitors
+// they waited on a mailbox nobody was left to send to, which is a wait no
+// timeout ever ends.
+//
+// The runtime prints the crash to stderr as it happens. That line in the middle
+// of this group's output is the test working, not the test failing.
+fn test_crash(host String, port Int) Array(Check) {
+	match pool.start(host, port, 2) {
+		Err(e) -> [Check('crash pool', False, redis.show_error(e))]
+		Ok(p) -> {
+			before = pool.with_conn(p, fn(c) connection.ping(c))
+			// Receiving on a subject this process owns, from the worker's
+			// process, is a ForeignReceive: a crash, in a worker, mid-job.
+			mine = process.subject()
+			died = pool.with_conn(p, fn(c) {
+				process.receive(mine)
+				connection.ping(c)
+			})
+			// Long enough for the pool's end to have reached the gateway.
+			process.sleep(50)
+			after = pool.with_conn(p, fn(c) connection.ping(c))
+			checks = [
+				eq('the pool serves before the crash', before, Ok('PONG')),
+				that('the crashing caller is answered', ended(died)),
+				that('a caller after it is answered too', ended(after)),
+			]
+			// And this returns rather than parking, which is the same fault
+			// wearing the other hat: `stop` waits for a gateway that is gone.
+			pool.stop(p)
+			array.concat(checks, [that('stop returns on a dead pool', True)])
+		}
+	}
+}
+
+// Whether a command came back with the pool's own error — the one that says
+// the machinery in between ended before it could answer.
+fn ended(r Result(a, RedisError)) Bool {
+	match r {
+		Err(redis.Pool(_)) -> True
+		Err(_) -> False
+		Ok(_) -> False
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Running.
 // ---------------------------------------------------------------------------
 
@@ -353,7 +407,10 @@ fn main(host String, port Int) Nil {
 				plus(starting, shared),
 				plus(
 					report('a killed connection', test_recovery(host, port)),
-					report('stopping', test_stop(host, port)),
+					plus(
+						report('stopping', test_stop(host, port)),
+						report('a worker that dies mid-job', test_crash(host, port)),
+					),
 				),
 			)
 			match total {

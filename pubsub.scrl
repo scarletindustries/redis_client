@@ -23,7 +23,7 @@ import scarlet/binary
 import scarlet/net/error.{NetError, TimedOut, UnexpectedEof}
 import scarlet/net/socket.{Closed, Data, Socket}
 import ./redis.{Conn, Net, RedisError}
-import ./resp.{Bad, Done, List, NeedMore, Push as PushFrame}
+import ./resp.{Bad, Done, List, NeedMore, Push}
 
 const READ_SIZE = 65536
 
@@ -296,7 +296,7 @@ fn decode(value resp.Value) Result(Event, RedisError) {
 // the wrapper differs.
 fn frame_items(v resp.Value) Result(Array(resp.Value), RedisError) {
 	match v {
-		PushFrame(items) -> Ok(items)
+		Push(items) -> Ok(items)
 		List(items) -> Ok(items)
 		other -> redis.expect_values(Ok(other))
 	}

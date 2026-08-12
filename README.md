@@ -107,6 +107,15 @@ command it cannot prove was never applied — and the connection is dialled agai
 for the caller after that. A refused command is different: that is Redis
 answering, so the connection goes straight back to the pool.
 
+A pool that fails outright is the one case a caller cannot recover from, so it
+is reported rather than waited on. The pool runs in processes of its own,
+unlinked from whoever started it: a caller that crashes does not take the pool
+down, and a fault inside the pool does not reach back into a caller that was
+only ever going to be told about it. What every caller gets instead is
+`Err(Pool(..))` — the pool ended before it could answer — and that includes the
+commands already queued and `stop` itself. Nothing parks on a mailbox with
+nobody left to send to.
+
 Subscribers still want a connection of their own. `pubsub.subscribe` takes the
 socket over for as long as the `Subscription` lives, which is exactly what a
 pooled connection cannot do — a connection lent for a subscription would never

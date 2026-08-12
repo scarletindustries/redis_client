@@ -45,7 +45,7 @@ import scarlet/result
 import scarlet/net/error.{NetError, UnexpectedEof}
 import scarlet/net/socket.{Closed, Data, Socket}
 import scarlet/process
-import scarlet/process.{Subject}
+import scarlet/process.{Pid, Subject}
 import scarlet/resource
 import scarlet/string
 import ./number.{Score}
@@ -84,7 +84,13 @@ pub opaque type Conn {
 	// otherwise have to import each other: this way `pool` says how a pool is
 	// built and who gets a connection next, and this module knows only that
 	// there is somewhere to send a command.
-	Pooled(control fn(Control) Nil)
+	//
+	// `gateway` is that pool's process, carried alongside the closure for the
+	// one thing a closure cannot express: whether there is still anyone on the
+	// other end of it. A `send` to a process that has ended is silently
+	// dropped, so without this a caller would wait for ever for a reply nobody
+	// is left to compute. Monitoring it turns that wait into an error.
+	Pooled(control fn(Control) Nil, gateway Pid)
 }
 
 // What a pooled `Conn` can ask of the pool behind it. Two variants because
@@ -116,18 +122,24 @@ pub type Health {
 	Broken
 }
 
-// The four ways a command fails, kept apart because they call for different
+// The five ways a command fails, kept apart because they call for different
 // responses: `Net` means the connection is gone, `Server` means Redis
 // understood the command and refused it, `Protocol` means the bytes on the
 // wire were not the RESP we expected — a bug here, a desync, or a server that
 // is not Redis — and `Misuse` means the call was wrong before it ever reached
 // the wire, which is the price of letting one connection and a pool of them
 // share a type.
+//
+// `Pool` is the fifth and belongs only to a pooled `Conn`: the pool that owed
+// this command an answer ended before it gave one. It is not the network, not
+// the server, not the wire and not the caller — it is the machinery in
+// between, and it is the answer a caller gets instead of waiting for ever.
 pub type RedisError {
 	Net(err NetError)
 	Server(message String)
 	Protocol(why String)
 	Misuse(why String)
+	Pool(why String)
 }
 
 // ---------------------------------------------------------------------------
@@ -218,7 +230,7 @@ pub fn close(c Conn) Nil {
 		// A pooled handle is a copy, and closing a copy must not take the
 		// pool's connections out from under everyone else holding one.
 		// `pool.stop` is the single way to end a pool.
-		Pooled(_) -> Nil
+		Pooled(_, _) -> Nil
 	}
 }
 
@@ -232,7 +244,7 @@ pub fn close(c Conn) Nil {
 pub fn socket_of(c Conn) Result(Socket, RedisError) {
 	match c {
 		Direct(sock) -> Ok(sock)
-		Pooled(_) -> Err(Misuse('this needs a connection of its own, not a pooled one'))
+		Pooled(_, _) -> Err(Misuse('this needs a connection of its own, not a pooled one'))
 	}
 }
 
@@ -257,8 +269,18 @@ pub fn socket_of(c Conn) Result(Socket, RedisError) {
 pub fn lease(c Conn, next fn(Conn) Result(a, RedisError)) Result(a, RedisError) {
 	match c {
 		Direct(_) -> next(c)
-		Pooled(control) -> {
+		Pooled(control, gateway) -> {
 			reply = process.subject()
+			// The reply and the pool's death arrive in the same mailbox, as the
+			// same type, so exactly one of them is received and neither can be
+			// waited on past the other. The monitor goes on before the job does:
+			// a pool that is already gone fires it at once, which is the case
+			// this exists for.
+			watch = process.monitor(
+				gateway,
+				reply,
+				fn(_) Err(Pool('the pool ended before this command was answered')),
+			)
 			control(
 				Dispatch(job: fn(leased) {
 					outcome = result.then(leased, next)
@@ -266,7 +288,9 @@ pub fn lease(c Conn, next fn(Conn) Result(a, RedisError)) Result(a, RedisError) 
 					health(outcome)
 				}),
 			)
-			process.receive(reply)
+			answer = process.receive(reply)
+			process.demonitor(watch)
+			answer
 		}
 	}
 }
@@ -287,13 +311,18 @@ pub fn health(outcome Result(a, RedisError)) Health {
 		Err(Misuse(_)) -> Healthy
 		Err(Net(_)) -> Broken
 		Err(Protocol(_)) -> Broken
+		// Never actually reached: a `Pool` error is made by the caller when its
+		// monitor fires, not by a job, and a job is the only thing whose health
+		// is judged. Answered rather than ignored, because the connection it
+		// would be judging is one whose process has just ended.
+		Err(Pool(_)) -> Broken
 	}
 }
 
-// Build a pooled connection out of the pool's own sending code. `pool.start` is
-// the only sensible caller.
-pub fn pooled(control fn(Control) Nil) Conn {
-	Pooled(control: control)
+// Build a pooled connection out of the pool's own sending code and the process
+// behind it. `pool.start` is the only sensible caller.
+pub fn pooled(control fn(Control) Nil, gateway Pid) Conn {
+	Pooled(control: control, gateway: gateway)
 }
 
 // Release whatever is behind this `Conn` and wait until it is released: a pool
@@ -303,10 +332,16 @@ pub fn pooled(control fn(Control) Nil) Conn {
 pub fn shutdown(c Conn) Nil {
 	match c {
 		Direct(_) -> close(c)
-		Pooled(control) -> {
+		Pooled(control, gateway) -> {
 			done = process.subject()
+			// A pool that crashed is also a pool that is closed, and the caller
+			// asked to be told when it was closed. Both answers are `Nil`, so
+			// this is `stop` returning rather than parking on a mailbox whose
+			// sender has already gone.
+			watch = process.monitor(gateway, done, fn(_) Nil)
 			control(Shutdown(done))
 			process.receive(done)
+			process.demonitor(watch)
 		}
 	}
 }
@@ -337,7 +372,7 @@ pub fn command(c Conn, args Array(String)) Result(Value, RedisError) {
 pub fn command_raw(c Conn, args Array(Binary)) Result(Value, RedisError) {
 	match c {
 		Direct(sock) -> exchange(sock, args)
-		Pooled(_) -> lease(c, fn(direct) command_raw(direct, args))
+		Pooled(_, _) -> lease(c, fn(direct) command_raw(direct, args))
 	}
 }
 
@@ -396,7 +431,7 @@ pub fn pipeline_raw(
 		Direct(sock) -> exchange_many(sock, commands)
 		// The whole batch goes to one connection and comes back as one round
 		// trip, exactly as it would unpooled.
-		Pooled(_) -> lease(c, fn(direct) pipeline_raw(direct, commands))
+		Pooled(_, _) -> lease(c, fn(direct) pipeline_raw(direct, commands))
 	}
 }
 
@@ -967,5 +1002,6 @@ pub fn show_error(e RedisError) String {
 		Server(message) -> 'server said: ${message}'
 		Protocol(why) -> 'protocol error: ${why}'
 		Misuse(why) -> 'misused: ${why}'
+		Pool(why) -> 'pool error: ${why}'
 	}
 }
