@@ -245,3 +245,39 @@ scarlet run example/pool.scrl # twelve processes over four connections
 scarlet run test/suite.scrl   # 162 assertions against a live server
 scarlet run test/pool.scrl    # the pool's own, which are about lifecycle
 ```
+
+### TLS
+
+`Conn` cannot yet be TLS-backed, so there is no `rediss://` to use. What exists
+is the rig that the transport will be built against, because verification is
+the hard part of TLS and a rig that cannot tell an encrypted connection from a
+credulous one proves nothing:
+
+```
+./scripts/tls-certs.sh                                    # once, mints test/tls/
+docker compose --profile tls up -d                        # redis TLS on :6380
+SSL_CERT_FILE=test/tls/ca.crt scarlet run test/tls.scrl   # PONG + two refusals
+scarlet run test/tls.scrl                                 # the untrusted-issuer refusal
+```
+
+**Trusting the test CA is one environment variable, on both macOS and Linux.**
+`SSL_CERT_FILE` is what `rustls-native-certs` reads on Unix, so nothing is
+installed into the machine's trust store, nothing needs root, and there is
+nothing to undo after a run. It grants a root; it does not stop the checking —
+the wrong-name check below fails *while it is set*, which is what proves it.
+There is no way to ask Scarlet to skip verification, and the rig does not want
+one.
+
+The two invocations are two processes because the untrusted-issuer arm needs
+`SSL_CERT_FILE` absent and the other three need it present. The program prints
+which mode it ran: a run reporting one check is not a run that passed four.
+
+Certificates are minted per checkout rather than committed — a private key in a
+public repository is a private key everyone has — so `test/tls/` is ignored and
+the TLS service sits behind a compose profile it cannot start without.
+
+**Do not point the rig at the plaintext port.** Redis never answers a TLS
+ClientHello there, and `tls.handshake` has no deadline, so it parks for ever
+rather than erring — measured 3/3 at a 20s bound on linux x86_64, and the same
+on macOS. `openssl s_client` hangs identically, so it is the peer's silence
+rather than anything Scarlet does.

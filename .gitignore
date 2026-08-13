@@ -2,3 +2,8 @@
 # Anchored so it cannot match a source file or directory of the same name.
 /scarlet
 .zed
+
+# Certificates minted by scripts/tls-certs.sh for the TLS rig. A private key in
+# a public repository is a private key everyone has, so these are regenerated
+# per checkout rather than committed.
+/test/tls/
