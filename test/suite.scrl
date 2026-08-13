@@ -899,6 +899,24 @@ fn publish_later(host String, port Int, channel String) Nil {
 	}
 }
 
+// Publish nothing. If `read_within` ignored the deadline this parks forever,
+// so a hang is the failure — the suite process not returning is the signal,
+// not a Check. `scripts/test` is the harness; bound the run if you plant.
+fn test_pubsub_timeout(host String, port Int) Array(Check) {
+	channel = k('channel-timeout')
+	match redis.connect(host, port) {
+		Err(e) -> [Check('pubsub timeout connect', False, redis.show_error(e))]
+		Ok(c) -> match pubsub.subscribe(c, [channel]) {
+			Err(e) -> [Check('pubsub timeout subscribe', False, redis.show_error(e))]
+			Ok(sub) -> {
+				(rest, outcome) = pubsub.next_message_within(sub, 200)
+				pubsub.close(rest)
+				[eq('timed listen with nothing published returns None', outcome, Ok(None))]
+			}
+		}
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Error handling.
 // ---------------------------------------------------------------------------
@@ -1025,7 +1043,12 @@ fn run_cli(host String, port Int) Nil {
 			},
 		)
 		println('pub/sub:')
-		Ok(array.concat(checks, test_pubsub(host, port)))
+		Ok(
+			array.concat(
+				checks,
+				array.concat(test_pubsub(host, port), test_pubsub_timeout(host, port)),
+			),
+		)
 	})
 	match outcome {
 		Err(e) -> {

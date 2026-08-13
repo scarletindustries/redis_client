@@ -100,23 +100,25 @@ pub opaque type Conn {
 // `socket.write` does not accept a `TlsSocket` and `tls.write` does not accept
 // a `Socket` (scarlet/net/tls.scrl), so "wrote the password to the unencrypted
 // half" cannot be written here at all. Every byte this client sends or receives
-// goes through the four functions below, and they are the only place that has
-// to know which kind it is holding.
+// goes through the functions below, and they are the only place that has to
+// know which kind it is holding.
 //
-// Not `pub`: `Conn` is opaque, so nothing outside this module can reach one.
-// `socket_of` deliberately does not hand it out — see the note there.
-type Transport {
+// `pub opaque` so `pubsub.Subscription` can own one — a subscriber takes the
+// connection over and reads it directly, because the server pushes messages
+// nobody asked for. Nothing outside this module can construct or match on it;
+// `transport_of` is the door, and the operations below are the only I/O.
+pub opaque type Transport {
 	Plain(sock Socket)
 	// Named `Secure` and not `Tls` only because `RedisError` already has a
 	// `Tls` variant and the two would collide in this module's namespace.
 	Secure(sock tls.TlsSocket)
 }
 
-// The four transport operations, each lifting its own error type into
-// `RedisError` so that everything above this line is written once rather than
-// once per transport.
+// The transport operations, each lifting its own error type into `RedisError`
+// so that everything above this line is written once rather than once per
+// transport. Pub/sub calls the ones that are `pub`; pipelines stay in here.
 
-fn transport_write(t Transport, data Binary) Result(Nil, RedisError) {
+pub fn transport_write(t Transport, data Binary) Result(Nil, RedisError) {
 	match t {
 		Plain(sock) -> net_err(socket.write(sock, data))
 		Secure(sock) -> tls_err(tls.write(sock, data))
@@ -143,14 +145,36 @@ fn join(parts Array(Binary)) Binary {
 	array.fold(parts, <<>>, binary.append)
 }
 
-fn transport_read(t Transport, max Int) Result(Read, RedisError) {
+pub fn transport_read(t Transport, max Int) Result(Read, RedisError) {
 	match t {
 		Plain(sock) -> net_err(socket.read(sock, max))
 		Secure(sock) -> tls_err(tls.read(sock, max))
 	}
 }
 
-fn transport_close(t Transport) Nil {
+// A bounded read. The plain half is `socket.read_within`. This pin's
+// `scarlet/net/tls` has no equivalent — `tls.read_within` is a missing
+// member on 0.0.1-canary.20260813.1750 — so the TLS half refuses rather
+// than calling `tls.read` and ignoring the deadline. A timeout that is
+// silently dropped would hang a caller that depends on it, and would read
+// as working until someone did.
+pub fn transport_read_within(
+	t Transport,
+	max Int,
+	timeout_ms Int,
+) Result(Read, RedisError) {
+	match t {
+		Plain(sock) -> net_err(socket.read_within(sock, max, timeout_ms))
+		Secure(_) ->
+			Err(
+				Misuse(
+					'next_message_within is not offered over TLS: this pin has no tls.read_within',
+				),
+			)
+	}
+}
+
+pub fn transport_close(t Transport) Nil {
 	match t {
 		Plain(sock) -> socket.close(sock) or Nil
 		Secure(sock) -> tls.close(sock) or Nil
@@ -387,27 +411,29 @@ pub fn close(c Conn) Nil {
 	}
 }
 
-// The underlying cleartext socket. Pub/Sub needs it to take the connection over
-// for server-pushed messages; ordinary command code should not.
+// The underlying transport. Pub/Sub takes it over for server-pushed messages;
+// ordinary command code should not.
 //
-// A pool has no one socket to give, and could not lend one either: a
-// `Subscription` owns its socket for as long as it lives, so a connection
-// leased for a subscription would never come back. Hence the `Result` — a
-// subscriber wants a connection of its own.
-//
-// A TLS connection is refused here rather than this returning the `Transport`
-// sum, and the reason is not that the break would be inconvenient. `Subscription`
-// needs a read with a deadline, and `tls` has no `read_within`: handing out a
-// TLS transport would buy a `Subscription` that cannot implement
-// `next_within` at all. So the sum stays private and this stays cleartext-only
-// until the language grows a bounded TLS read, which is what pub/sub over TLS
-// actually waits on. The refusal is loud — a subscriber gets this error at the
-// call rather than a connection that quietly turned out to be in the clear.
+// A pool has no one transport to give, and could not lend one either: a
+// `Subscription` owns it for as long as it lives, so a connection leased for
+// a subscription would never come back. Hence the `Result` — a subscriber
+// wants a connection of its own. TLS is fine here: the same `Transport` a
+// `Conn` already holds.
+pub fn transport_of(c Conn) Result(Transport, RedisError) {
+	match c {
+		Direct(t) -> Ok(t)
+		Pooled(_, _) -> Err(Misuse('this needs a connection of its own, not a pooled one'))
+	}
+}
+
+// The underlying cleartext socket, when there is one. A TLS connection has
+// no `Socket` to give — `socket.write` will not accept a `TlsSocket` — so
+// this refuses rather than handing out something the caller could not use.
+// Pub/sub goes through `transport_of`, not this.
 pub fn socket_of(c Conn) Result(Socket, RedisError) {
 	match c {
 		Direct(Plain(sock)) -> Ok(sock)
-		Direct(Secure(_)) ->
-			Err(Misuse('pub/sub needs a cleartext connection: TLS has no bounded read yet'))
+		Direct(Secure(_)) -> Err(Misuse('a TLS connection has no cleartext socket'))
 		Pooled(_, _) -> Err(Misuse('this needs a connection of its own, not a pooled one'))
 	}
 }

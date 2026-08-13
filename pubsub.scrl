@@ -13,22 +13,23 @@
 // another. This is exactly the buffer `Conn` was able to prove empty and
 // therefore does not carry.
 //
-// A `Subscription` takes over the socket of the `Conn` it was made from. That
-// connection must not be used for commands again, and closing either closes
-// the same socket.
+// A `Subscription` takes over the transport of the `Conn` it was made from.
+// That connection must not be used for commands again, and closing either
+// closes the same socket. The transport is the same sum a `Conn` holds, so
+// a subscriber works in the clear or under TLS.
 
 import scarlet/array
 import scarlet/result
 import scarlet/binary
-import scarlet/net/error.{NetError, TimedOut, UnexpectedEof}
-import scarlet/net/socket.{Closed, Data, Socket}
-import ./redis.{Conn, Net, RedisError}
+import scarlet/net/error.{TimedOut, UnexpectedEof}
+import scarlet/net/socket.{Closed, Data}
+import ./redis.{Conn, Net, RedisError, Transport}
 import ./resp.{Bad, Done, List, NeedMore, Push}
 
 const READ_SIZE = 65536
 
 pub opaque type Subscription {
-	sock Socket
+	sock Transport
 	// Bytes received but not yet consumed by a message.
 	buf Binary
 }
@@ -136,14 +137,14 @@ pub fn ssubscribe(c Conn, to_channels Array(String)) Result(Subscription, RedisE
 }
 
 fn start(c Conn, verb String, names Array(String)) Result(Subscription, RedisError) {
-	// A `Subscription` owns its socket for as long as it lives, so a pooled
+	// A `Subscription` owns its transport for as long as it lives, so a pooled
 	// connection is refused here rather than leased and never given back.
-	sock <- result.then(redis.socket_of(c))
-	match socket.write(
+	sock <- result.then(redis.transport_of(c))
+	match redis.transport_write(
 		sock,
 		resp.encode_command(array.map(array.concat([verb], names), binary.from_string)),
 	) {
-		Err(e) -> Err(Net(e))
+		Err(e) -> Err(e)
 		Ok(Nil) -> drain(Subscription(sock: sock, buf: <<>>), array.length(names))
 	}
 }
@@ -197,14 +198,14 @@ pub fn sunsubscribe(
 
 fn send(s Subscription, verb String, names Array(String)) (Subscription, Result(Nil, RedisError)) {
 	request = resp.encode_command(array.map(array.concat([verb], names), binary.from_string))
-	match socket.write(s.sock, request) {
+	match redis.transport_write(s.sock, request) {
 		Ok(Nil) -> (s, Ok(Nil))
-		Err(e) -> (s, Err(Net(e)))
+		Err(e) -> (s, Err(e))
 	}
 }
 
 pub fn close(s Subscription) Nil {
-	socket.close(s.sock) or Nil
+	redis.transport_close(s.sock)
 }
 
 // ---------------------------------------------------------------------------
@@ -223,6 +224,10 @@ pub fn next_message(s Subscription) (Subscription, Result(Event, RedisError)) {
 // The same, but giving up after `timeout_ms` with `Ok(None)`. For a loop that
 // has to do something else periodically — check a shutdown flag, emit a
 // heartbeat — rather than block for ever.
+//
+// Over TLS this pin cannot offer a deadline: `scarlet/net/tls` has no
+// `read_within`. The call returns `Err(Misuse(..))` rather than parking in
+// an unbounded `tls.read`. A timeout that was ignored would hang, not fail.
 pub fn next_message_within(
 	s Subscription,
 	timeout_ms Int,
@@ -244,10 +249,10 @@ fn take(s Subscription) (Subscription, Result(resp.Value, RedisError)) {
 	match resp.parse(s.buf, 0) {
 		Done(value, next) -> (Subscription(..s, buf: binary.drop_bytes(s.buf, next)), Ok(value))
 		Bad(why) -> (s, Err(redis.Protocol(why)))
-		NeedMore -> match socket.read(s.sock, READ_SIZE) {
+		NeedMore -> match redis.transport_read(s.sock, READ_SIZE) {
 			Ok(Data(chunk)) -> take(Subscription(..s, buf: binary.append(s.buf, chunk)))
 			Ok(Closed) -> (s, Err(Net(UnexpectedEof)))
-			Err(e) -> (s, Err(Net(e)))
+			Err(e) -> (s, Err(e))
 		}
 	}
 }
@@ -260,14 +265,14 @@ fn take_within(
 		Done(value, next) ->
 			(Subscription(..s, buf: binary.drop_bytes(s.buf, next)), Ok(Some(value)))
 		Bad(why) -> (s, Err(redis.Protocol(why)))
-		NeedMore -> match socket.read_within(s.sock, READ_SIZE, timeout_ms) {
+		NeedMore -> match redis.transport_read_within(s.sock, READ_SIZE, timeout_ms) {
 			Ok(Data(chunk)) ->
 				take_within(Subscription(..s, buf: binary.append(s.buf, chunk)), timeout_ms)
 			Ok(Closed) -> (s, Err(Net(UnexpectedEof)))
 			// Not a failure: the deadline passed with nothing to report. Any
 			// partial message already read stays in the buffer for next time.
-			Err(TimedOut) -> (s, Ok(None))
-			Err(e) -> (s, Err(Net(e)))
+			Err(Net(TimedOut)) -> (s, Ok(None))
+			Err(e) -> (s, Err(e))
 		}
 	}
 }

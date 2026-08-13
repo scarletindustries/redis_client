@@ -19,9 +19,9 @@
 // there is nothing to undo after a run.
 //
 // WHICH ARMS RUN DEPENDS ON `SSL_CERT_FILE`, because the untrusted-issuer arm
-// needs it absent and the other three need it present, and one process cannot
+// needs it absent and the other seven need it present, and one process cannot
 // have it both ways. The mode is printed: a run that reports one check is not a
-// run that passed four.
+// run that passed seven.
 //
 // A failed check, or a run that built no checks, ends the process non-zero.
 // Scarlet has no exit: the harness prints why and then slices an empty
@@ -35,9 +35,12 @@ import scarlet/net
 import scarlet/net/socket.{Closed, Data}
 import scarlet/net/tls
 import scarlet/os
+import scarlet/process
 import scarlet/string
 import ../number
+import ../pubsub
 import ../redis
+import ../redis.{Misuse}
 import ../resp
 
 const DEFAULT_HOST = 'localhost'
@@ -218,6 +221,65 @@ fn client_pipeline(host String, port Int) String {
 	}
 }
 
+// Subscribe over TLS, then publish from a second TLS connection. The
+// subscriber parks in `next_message` — the untimed listen, which this pin
+// can offer because it is `tls.read`, not `tls.read_within`.
+fn client_pubsub(host String, port Int) String {
+	channel = 'tls:rig:pubsub'
+	match redis.connect_tls(host, port) {
+		Err(e) -> redis.show_error(e)
+		Ok(c) -> match pubsub.subscribe(c, [channel]) {
+			Err(e) -> redis.show_error(e)
+			Ok(sub) -> {
+				_ = process.spawn(fn() publish_tls_later(host, port, channel))
+				(rest, first) = pubsub.next_message(sub)
+				pubsub.close(rest)
+				match first {
+					Ok(pubsub.Message(got, payload)) -> '${got}:${payload}'
+					Ok(_) -> 'unexpected pub/sub event'
+					Err(e) -> redis.show_error(e)
+				}
+			}
+		}
+	}
+}
+
+fn publish_tls_later(host String, port Int, channel String) Nil {
+	process.sleep(100)
+	match redis.connect_tls(host, port) {
+		Err(e) -> println('tls publisher failed: ${redis.show_error(e)}')
+		Ok(c) -> {
+			_ = pubsub.publish(c, channel, 'ping')
+			redis.close(c)
+		}
+	}
+}
+
+// A timed listen over TLS must refuse, not hang. This pin has no
+// `tls.read_within`; calling `tls.read` and ignoring the deadline would
+// park until a message arrived. The refusal is `Misuse`, so a caller can
+// match it. Publish nothing: if the timeout were ignored this would hang,
+// and the harness bound is what makes that a failure rather than a stall.
+fn client_pubsub_timeout(host String, port Int) String {
+	channel = 'tls:rig:pubsub-timeout'
+	match redis.connect_tls(host, port) {
+		Err(e) -> redis.show_error(e)
+		Ok(c) -> match pubsub.subscribe(c, [channel]) {
+			Err(e) -> redis.show_error(e)
+			Ok(sub) -> {
+				(rest, outcome) = pubsub.next_message_within(sub, 200)
+				pubsub.close(rest)
+				match outcome {
+					Err(Misuse(_)) -> 'MISUSE'
+					Ok(None) -> 'NONE'
+					Ok(Some(_)) -> 'SOME'
+					Err(e) -> redis.show_error(e)
+				}
+			}
+		}
+	}
+}
+
 fn pipeline_on(c redis.Conn) String {
 	key = 'tls:rig:pipeline'
 	batch = [['SET', key, '1'], ['INCR', key], ['GET', key]]
@@ -273,6 +335,8 @@ fn trusted_arms(host String, port Int) Array(Check) {
 		is('malformed name is refused', handshake_as(host, port, 'bad_name!'), 'InvalidServerName'),
 		is('client PING over TLS', client_ping(host, port), 'PONG'),
 		is('client pipeline over TLS', client_pipeline(host, port), 'OK,2,2'),
+		is('client pub/sub over TLS', client_pubsub(host, port), 'tls:rig:pubsub:ping'),
+		is('timed listen over TLS is refused', client_pubsub_timeout(host, port), 'MISUSE'),
 	]
 }
 
