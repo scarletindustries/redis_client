@@ -248,15 +248,37 @@ scarlet run test/pool.scrl    # the pool's own, which are about lifecycle
 
 ### TLS
 
-`Conn` cannot yet be TLS-backed, so there is no `rediss://` to use. What exists
-is the rig that the transport will be built against, because verification is
-the hard part of TLS and a rig that cannot tell an encrypted connection from a
-credulous one proves nothing:
+A `Conn` can be TLS-backed. `connect_tls` and `connect_tls_auth` are the dials;
+they are `connect` and `connect_auth` with the handshake done first, and they
+negotiate `HELLO 3` inside the dial exactly as the plaintext pair do, so a
+`Conn` from either is equally one whose replies this client can read.
+
+```
+c <- result.then(redis.connect_tls('redis.example', 6380))
+```
+
+There is still no `rediss://` URL to pass — nothing here parses URLs yet.
+
+`host` is both the address dialled and the name the certificate is verified
+against, and there is no argument that relaxes that, because the language
+offers none. A private CA is trusted by adding it to the trust store the
+machine already has.
+
+Two things TLS does not yet reach. **Pub/Sub is cleartext-only**: a
+`Subscription` needs a read with a deadline and `scarlet/net/tls` has no
+`read_within`, so `socket_of` refuses a TLS connection rather than handing out
+one that could not implement `next_within`. And a **pipeline over TLS is one
+`tls.write`** rather than the plaintext path's vectored `write_parts`, since
+`tls` has no `write_parts` — one record for the batch, not one per command.
+
+The rig verifies the transport, because verification is the hard part of TLS
+and a rig that cannot tell an encrypted connection from a credulous one proves
+nothing:
 
 ```
 ./scripts/tls-certs.sh                                    # once, mints test/tls/
 docker compose --profile tls up -d                        # redis TLS on :6380
-SSL_CERT_FILE=test/tls/ca.crt scarlet run test/tls.scrl   # PONG + two refusals
+SSL_CERT_FILE=test/tls/ca.crt scarlet run test/tls.scrl   # 5 arms, 2 of them the client
 scarlet run test/tls.scrl                                 # the untrusted-issuer refusal
 ```
 
@@ -269,8 +291,8 @@ There is no way to ask Scarlet to skip verification, and the rig does not want
 one.
 
 The two invocations are two processes because the untrusted-issuer arm needs
-`SSL_CERT_FILE` absent and the other three need it present. The program prints
-which mode it ran: a run reporting one check is not a run that passed four.
+`SSL_CERT_FILE` absent and the other five need it present. The program prints
+which mode it ran: a run reporting one check is not a run that passed five.
 
 Certificates are minted per checkout rather than committed — a private key in a
 public repository is a private key everyone has — so `test/tls/` is ignored and

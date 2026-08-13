@@ -1,11 +1,11 @@
-// A Redis client over a plain TCP socket.
+// A Redis client over a TCP socket, in the clear or under TLS.
 //
 // This module is the connection and the reply-decoding vocabulary. The
 // commands themselves live in `./redis/<group>.scrl`, one module per Redis
 // command group, and every one of them is built from `command` plus the
 // `expect_*` decoders below.
 //
-// A `Conn` is a socket — no read buffer threaded through the caller's
+// A `Conn` is a transport — no read buffer threaded through the caller's
 // code, because under strict request/response there is nothing to thread. We
 // write one command and read until exactly one reply is complete; Redis sends
 // exactly one reply per command and never speaks unbidden, so bytes arriving
@@ -19,8 +19,8 @@
 // buffer-owning `Subscription` type rather than reusing `Conn`. Pipelining —
 // more than one command in flight — would need the same, and is not offered.
 //
-// A `Conn` is a socket, or else it is a pool of them. The second kind holds no
-// socket at all: it forwards each command to `./redis/pool.scrl`, which runs it
+// A `Conn` is a transport, or else it is a pool of them. The second kind holds
+// no socket at all: it forwards each command to `./redis/pool.scrl`, which runs it
 // on whichever of its connections is free and sends the reply back. The two are
 // one type because every command in this library is a function of a `Conn`, and
 // making a pool a second type would mean either writing all of them twice or
@@ -43,7 +43,8 @@ import scarlet/int
 import scarlet/net
 import scarlet/result
 import scarlet/net/error.{NetError, UnexpectedEof}
-import scarlet/net/socket.{Closed, Data, Socket}
+import scarlet/net/socket.{Closed, Data, Read, Socket}
+import scarlet/net/tls
 import scarlet/process
 import scarlet/process.{Crash, Down, Pid, Subject}
 import scarlet/resource
@@ -78,7 +79,7 @@ const READ_SIZE = 65536
 // a `Conn` in hand is always a socket that was actually dialled, or a pool
 // whose connections were.
 pub opaque type Conn {
-	Direct(sock Socket)
+	Direct(transport Transport)
 	// A pool, reached through the closure the pool handed us. It is a closure
 	// rather than the pool's own mailbox because the two modules would
 	// otherwise have to import each other: this way `pool` says how a pool is
@@ -91,6 +92,69 @@ pub opaque type Conn {
 	// dropped, so without this a caller would wait for ever for a reply nobody
 	// is left to compute. Monitoring it turns that wait into an error.
 	Pooled(control fn(Control) Nil, gateway Pid)
+}
+
+// What a direct `Conn` writes its bytes down.
+//
+// A sum rather than a flag, because the language refuses to let it be a flag:
+// `socket.write` does not accept a `TlsSocket` and `tls.write` does not accept
+// a `Socket` (scarlet/net/tls.scrl), so "wrote the password to the unencrypted
+// half" cannot be written here at all. Every byte this client sends or receives
+// goes through the four functions below, and they are the only place that has
+// to know which kind it is holding.
+//
+// Not `pub`: `Conn` is opaque, so nothing outside this module can reach one.
+// `socket_of` deliberately does not hand it out — see the note there.
+type Transport {
+	Plain(sock Socket)
+	// Named `Secure` and not `Tls` only because `RedisError` already has a
+	// `Tls` variant and the two would collide in this module's namespace.
+	Secure(sock tls.TlsSocket)
+}
+
+// The four transport operations, each lifting its own error type into
+// `RedisError` so that everything above this line is written once rather than
+// once per transport.
+
+fn transport_write(t Transport, data Binary) Result(Nil, RedisError) {
+	match t {
+		Plain(sock) -> net_err(socket.write(sock, data))
+		Secure(sock) -> tls_err(tls.write(sock, data))
+	}
+}
+
+// One write carrying several requests.
+//
+// The plain half uses `socket.write_parts`, which reaches the kernel in one
+// vectored syscall without concatenating. `tls` has no `write_parts`, so the
+// TLS half joins the parts first and issues a single `tls.write`. That is one
+// TLS record rather than one per command — not merely a workaround for the
+// missing function, since a record per command would leak the batch's shape
+// into the ciphertext lengths and cost a header and a MAC each time.
+fn transport_write_all(t Transport, parts Array(Binary)) Result(Nil, RedisError) {
+	match t {
+		Plain(sock) -> net_err(socket.write_parts(sock, parts))
+		Secure(sock) -> tls_err(tls.write(sock, join(parts)))
+	}
+}
+
+// `scarlet/binary` has no `concat`, so the fold is written out here.
+fn join(parts Array(Binary)) Binary {
+	array.fold(parts, <<>>, binary.append)
+}
+
+fn transport_read(t Transport, max Int) Result(Read, RedisError) {
+	match t {
+		Plain(sock) -> net_err(socket.read(sock, max))
+		Secure(sock) -> tls_err(tls.read(sock, max))
+	}
+}
+
+fn transport_close(t Transport) Nil {
+	match t {
+		Plain(sock) -> socket.close(sock) or Nil
+		Secure(sock) -> tls.close(sock) or Nil
+	}
 }
 
 // What a pooled `Conn` can ask of the pool behind it. Two variants because
@@ -122,7 +186,7 @@ pub type Health {
 	Broken
 }
 
-// The five ways a command fails, kept apart because they call for different
+// The six ways a command fails, kept apart because they call for different
 // responses: `Net` means the connection is gone, `Server` means Redis
 // understood the command and refused it, `Protocol` means the bytes on the
 // wire were not the RESP we expected — a bug here, a desync, or a server that
@@ -134,12 +198,19 @@ pub type Health {
 // this command an answer ended before it gave one. It is not the network, not
 // the server, not the wire and not the caller — it is the machinery in
 // between, and it is the answer a caller gets instead of waiting for ever.
+//
+// `Tls` is the sixth and is kept out of `Net` rather than folded into it,
+// because a `NetError` cannot spell `CertificateUnknownIssuer` or
+// `HostnameMismatch` and flattening them would throw away the one distinction
+// the TLS module exists to make: a caller may retry `tls.Transport`, and must
+// never retry its way past a certificate that did not verify.
 pub type RedisError {
 	Net(err NetError)
 	Server(message String)
 	Protocol(why String)
 	Misuse(why String)
 	Pool(fault PoolFault)
+	Tls(err tls.TlsError)
 }
 
 // Why a pooled command has no answer.
@@ -217,7 +288,28 @@ pub fn with_conn(host String, port Int, next fn(Conn) Result(a, RedisError)) Res
 // quietly. Failing at connect is the only honest option.
 pub fn connect(host String, port Int) Result(Conn, RedisError) {
 	sock <- result.then(net_err(net.connect(host, port)))
-	c = Direct(sock: sock)
+	hello(Direct(transport: Plain(sock: sock)))
+}
+
+// `connect` over TLS — the `rediss://` dial.
+//
+// `tls.connect` completes the handshake before it returns, so a certificate
+// that does not verify is reported by this call rather than surfacing later at
+// an unrelated command. It is the whole handshake from the first byte, which is
+// what `rediss://` is; the STARTTLS-shaped `tls.handshake` door is not involved.
+//
+// `host` is both the address dialled and the name the certificate is checked
+// against. There is no argument here that relaxes that, because there is none
+// in the language: a private CA is trusted by adding it to the trust store the
+// machine already has, never by asking the client to stop checking.
+pub fn connect_tls(host String, port Int) Result(Conn, RedisError) {
+	sock <- result.then(tls_err(tls.connect(host, port)))
+	hello(Direct(transport: Secure(sock: sock)))
+}
+
+// The RESP3 handshake both dials share, so that a `Conn` from either is equally
+// one whose replies this client can read.
+fn hello(c Conn) Result(Conn, RedisError) {
 	match command(c, ['HELLO', '3']) {
 		Ok(_) -> Ok(c)
 		Err(Server(message)) -> {
@@ -245,7 +337,23 @@ pub fn connect_auth(
 	password String,
 ) Result(Conn, RedisError) {
 	sock <- result.then(net_err(net.connect(host, port)))
-	c = Direct(sock: sock)
+	hello_auth(Direct(transport: Plain(sock: sock)), username, password)
+}
+
+// `connect_auth` over TLS. The credentials ride inside the handshake exactly as
+// they do in the clear; what changes is that they no longer cross the network
+// in it.
+pub fn connect_tls_auth(
+	host String,
+	port Int,
+	username String,
+	password String,
+) Result(Conn, RedisError) {
+	sock <- result.then(tls_err(tls.connect(host, port)))
+	hello_auth(Direct(transport: Secure(sock: sock)), username, password)
+}
+
+fn hello_auth(c Conn, username String, password String) Result(Conn, RedisError) {
 	match command(c, ['HELLO', '3', 'AUTH', username, password]) {
 		Ok(_) -> Ok(c)
 		Err(e) -> {
@@ -271,7 +379,7 @@ pub fn with_conn_auth(
 
 pub fn close(c Conn) Nil {
 	match c {
-		Direct(sock) -> socket.close(sock) or Nil
+		Direct(t) -> transport_close(t)
 		// A pooled handle is a copy, and closing a copy must not take the
 		// pool's connections out from under everyone else holding one.
 		// `pool.stop` is the single way to end a pool.
@@ -279,16 +387,27 @@ pub fn close(c Conn) Nil {
 	}
 }
 
-// The underlying socket. Pub/Sub needs it to take the connection over for
-// server-pushed messages; ordinary command code should not.
+// The underlying cleartext socket. Pub/Sub needs it to take the connection over
+// for server-pushed messages; ordinary command code should not.
 //
 // A pool has no one socket to give, and could not lend one either: a
 // `Subscription` owns its socket for as long as it lives, so a connection
 // leased for a subscription would never come back. Hence the `Result` — a
 // subscriber wants a connection of its own.
+//
+// A TLS connection is refused here rather than this returning the `Transport`
+// sum, and the reason is not that the break would be inconvenient. `Subscription`
+// needs a read with a deadline, and `tls` has no `read_within`: handing out a
+// TLS transport would buy a `Subscription` that cannot implement
+// `next_within` at all. So the sum stays private and this stays cleartext-only
+// until the language grows a bounded TLS read, which is what pub/sub over TLS
+// actually waits on. The refusal is loud — a subscriber gets this error at the
+// call rather than a connection that quietly turned out to be in the clear.
 pub fn socket_of(c Conn) Result(Socket, RedisError) {
 	match c {
-		Direct(sock) -> Ok(sock)
+		Direct(Plain(sock)) -> Ok(sock)
+		Direct(Secure(_)) ->
+			Err(Misuse('pub/sub needs a cleartext connection: TLS has no bounded read yet'))
 		Pooled(_, _) -> Err(Misuse('this needs a connection of its own, not a pooled one'))
 	}
 }
@@ -357,6 +476,39 @@ pub fn health(outcome Result(a, RedisError)) Health {
 		// is judged. Answered rather than ignored, because the connection it
 		// would be judging is one whose process has just ended.
 		Err(Pool(_)) -> Broken
+		Err(Tls(e)) -> tls_health(e)
+	}
+}
+
+// Whether a connection that failed with a TLS error is worth keeping.
+//
+// Every variant answers `Broken`, but for two different reasons, and they are
+// written out one variant at a time rather than under a `_` so that an eleventh
+// `TlsError` — one that might genuinely be retryable — cannot be absorbed into
+// this judgement without someone deciding it here.
+//
+// The certificate variants are dial-time failures: `tls.connect` finishes the
+// handshake before it returns a socket, so a connection that reached a pool has
+// already verified. If one is somehow seen here the connection never came up,
+// and a retry reaches the same certificate — nothing about waiting changes what
+// the peer presents.
+//
+// The rest are the record layer or the socket under it failing mid-exchange. A
+// broken TLS stream is worse than a desynced plaintext one: the sequence
+// numbers are gone, so it cannot be re-framed by reading ahead the way
+// `read_reply` recovers a boundary, and there is nothing to do but dial again.
+fn tls_health(e tls.TlsError) Health {
+	match e {
+		tls.CertificateUnknownIssuer -> Broken
+		tls.CertificateExpired -> Broken
+		tls.CertificateNotYetValid -> Broken
+		tls.CertificateRevoked -> Broken
+		tls.HostnameMismatch -> Broken
+		tls.BadCertificate -> Broken
+		tls.InvalidServerName -> Broken
+		tls.ProtocolError -> Broken
+		tls.HandshakeFailed -> Broken
+		tls.Transport(_) -> Broken
 	}
 }
 
@@ -412,14 +564,14 @@ pub fn command(c Conn, args Array(String)) Result(Value, RedisError) {
 // When they are not independent, put them in one `pool.with_conn`.
 pub fn command_raw(c Conn, args Array(Binary)) Result(Value, RedisError) {
 	match c {
-		Direct(sock) -> exchange(sock, args)
+		Direct(t) -> exchange(t, args)
 		Pooled(_, _) -> lease(c, fn(direct) command_raw(direct, args))
 	}
 }
 
-fn exchange(sock Socket, args Array(Binary)) Result(Value, RedisError) {
-	_ <- result.then(net_err(socket.write(sock, resp.encode_command(args))))
-	match read_reply(sock, <<>>) {
+fn exchange(t Transport, args Array(Binary)) Result(Value, RedisError) {
+	_ <- result.then(transport_write(t, resp.encode_command(args)))
+	match read_reply(t, <<>>) {
 		Ok(RedisErr(message)) -> Err(server_error(message))
 		// RESP3 can carry an error as a length-prefixed blob, so that it may
 		// contain a newline. Same meaning, different framing.
@@ -469,7 +621,7 @@ pub fn pipeline_raw(
 	commands Array(Array(Binary)),
 ) Result(Array(Result(Value, RedisError)), RedisError) {
 	match c {
-		Direct(sock) -> exchange_many(sock, commands)
+		Direct(t) -> exchange_many(t, commands)
 		// The whole batch goes to one connection and comes back as one round
 		// trip, exactly as it would unpooled.
 		Pooled(_, _) -> lease(c, fn(direct) pipeline_raw(direct, commands))
@@ -477,19 +629,18 @@ pub fn pipeline_raw(
 }
 
 fn exchange_many(
-	sock Socket,
+	t Transport,
 	commands Array(Array(Binary)),
 ) Result(Array(Result(Value, RedisError)), RedisError) {
 	count = array.length(commands)
 	if count == 0 {
 		Ok([])
 	} else {
-		// One vectored write: every request reaches the kernel in a single
-		// syscall, without first being concatenated into one big binary.
-		_ <- result.then(
-			net_err(socket.write_parts(sock, array.map(commands, resp.encode_command))),
-		)
-		read_replies(sock, <<>>, 0, count, [])
+		// One write for the whole batch, so the round trip a pipeline exists to
+		// save is actually saved. How that write is issued differs per transport
+		// and `transport_write_all` is where that difference lives.
+		_ <- result.then(transport_write_all(t, array.map(commands, resp.encode_command)))
+		read_replies(t, <<>>, 0, count, [])
 	}
 }
 
@@ -498,7 +649,7 @@ fn exchange_many(
 // treat leftover bytes as a desync until the last reply is in, because the
 // bytes after reply one are reply two.
 fn read_replies(
-	sock Socket,
+	t Transport,
 	buf Binary,
 	off Int,
 	remaining Int,
@@ -515,17 +666,16 @@ fn read_replies(
 		match resp.parse(buf, off) {
 			Bad(why) -> Err(Protocol(why))
 			// Out of band, and not one of the replies we are counting.
-			Done(Push(_), next) -> read_replies(sock, buf, next, remaining, acc)
+			Done(Push(_), next) -> read_replies(t, buf, next, remaining, acc)
 			Done(RedisErr(message), next) ->
-				read_replies(sock, buf, next, remaining - 1, [Err(server_error(message)), ..acc])
+				read_replies(t, buf, next, remaining - 1, [Err(server_error(message)), ..acc])
 			Done(BlobErr(message), next) ->
-				read_replies(sock, buf, next, remaining - 1, [Err(server_error(message)), ..acc])
-			Done(value, next) -> read_replies(sock, buf, next, remaining - 1, [Ok(value), ..acc])
+				read_replies(t, buf, next, remaining - 1, [Err(server_error(message)), ..acc])
+			Done(value, next) -> read_replies(t, buf, next, remaining - 1, [Ok(value), ..acc])
 			NeedMore -> {
-				read <- result.then(net_err(socket.read(sock, READ_SIZE)))
+				read <- result.then(transport_read(t, READ_SIZE))
 				match read {
-					Data(chunk) ->
-						read_replies(sock, binary.append(buf, chunk), off, remaining, acc)
+					Data(chunk) -> read_replies(t, binary.append(buf, chunk), off, remaining, acc)
 					Closed -> Err(Net(UnexpectedEof))
 				}
 			}
@@ -540,15 +690,22 @@ pub fn net_err(r Result(a, NetError)) Result(a, RedisError) {
 	result.map_err(r, Net)
 }
 
+// The same for a TLS-level failure. Kept separate from `net_err` rather than
+// unwrapping `tls.Transport(cause)` into `Net(cause)`: which layer refused
+// tells a caller whether to retry, and merging them loses it.
+pub fn tls_err(r Result(a, tls.TlsError)) Result(a, RedisError) {
+	result.map_err(r, Tls)
+}
+
 // Parse from the front of the buffer, reading more bytes whenever the reply is
 // not all there yet. One `socket.read` is not one reply: a big reply arrives
 // over many reads, which is exactly why the parser resumes from offset 0 on
 // the grown buffer instead of trying to parse each chunk on its own.
-fn read_reply(sock Socket, buf Binary) Result(Value, RedisError) {
-	read_from(sock, buf, 0)
+fn read_reply(t Transport, buf Binary) Result(Value, RedisError) {
+	read_from(t, buf, 0)
 }
 
-fn read_from(sock Socket, buf Binary, off Int) Result(Value, RedisError) {
+fn read_from(t Transport, buf Binary, off Int) Result(Value, RedisError) {
 	match resp.parse(buf, off) {
 		Bad(why) -> Err(Protocol(why))
 		// A push frame is not the answer to anything — it is a pub/sub message
@@ -556,7 +713,7 @@ fn read_from(sock Socket, buf Binary, off Int) Result(Value, RedisError) {
 		// it and keep reading for the reply we are actually owed. Pushes are
 		// delivered through `pubsub.Subscription`; a command connection that
 		// has not subscribed will never see one.
-		Done(Push(_), next) -> read_from(sock, buf, next)
+		Done(Push(_), next) -> read_from(t, buf, next)
 		Done(value, next) -> {
 			trailing = binary.byte_size(buf) - next
 			if trailing == 0 {
@@ -568,9 +725,9 @@ fn read_from(sock Socket, buf Binary, off Int) Result(Value, RedisError) {
 			}
 		}
 		NeedMore -> {
-			read <- result.then(net_err(socket.read(sock, READ_SIZE)))
+			read <- result.then(transport_read(t, READ_SIZE))
 			match read {
-				Data(chunk) -> read_from(sock, binary.append(buf, chunk), off)
+				Data(chunk) -> read_from(t, binary.append(buf, chunk), off)
 				// The peer hung up mid-reply. Not a clean end: we were promised
 				// more bytes.
 				Closed -> Err(Net(UnexpectedEof))
@@ -1044,6 +1201,9 @@ pub fn show_error(e RedisError) String {
 		Protocol(why) -> 'protocol error: ${why}'
 		Misuse(why) -> 'misused: ${why}'
 		Pool(fault) -> 'pool error: ${show_pool_fault(fault)}'
+		// Inspected rather than described arm by arm, as `Net` is: the variant
+		// name is the useful part and `TlsError` names its own failures well.
+		Tls(err) -> 'tls error: ${string.inspect(err)}'
 	}
 }
 

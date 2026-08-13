@@ -37,6 +37,7 @@ import scarlet/net/tls
 import scarlet/os
 import scarlet/string
 import ../number
+import ../redis
 import ../resp
 
 const DEFAULT_HOST = 'localhost'
@@ -141,6 +142,86 @@ fn handshake_as(host String, port Int, name String) String {
 }
 
 // ---------------------------------------------------------------------------
+// The client itself, over TLS.
+// ---------------------------------------------------------------------------
+
+// Everything above dials `scarlet/net/tls` by hand, because until T-246 the
+// client had no TLS transport to dial. These arms exercise the client: a
+// `Conn` that is TLS-backed, reached through `redis.connect_tls`.
+
+// A `Conn` in hand is one that has already negotiated RESP3, on TLS exactly as
+// on plaintext — `connect_tls` runs `HELLO 3` inside the dial. If it did not,
+// the server would still be answering in RESP2 and the decoders below would
+// misread a map as a flat array.
+fn client_ping(host String, port Int) String {
+	match redis.connect_tls(host, port) {
+		Err(e) -> redis.show_error(e)
+		Ok(c) -> {
+			reply = match redis.expect_status(redis.command(c, ['PING'])) {
+				Err(e) -> redis.show_error(e)
+				Ok(s) -> s
+			}
+			redis.close(c)
+			reply
+		}
+	}
+}
+
+// A pipeline over TLS must produce the same replies, in the same order, as the
+// same batch would in the clear. This is the arm that covers the one place the
+// two transports genuinely differ: `socket.write_parts` sends the batch as one
+// vectored write, and `tls` has no `write_parts`, so the TLS half concatenates
+// and issues a single `tls.write`.
+//
+// Three commands whose replies are all different shapes and which are ordered
+// by construction — `INCR` after `SET` is 2, and `GET` after that is '2'. A
+// batch that lost a command, or reordered one, or paired a reply with the wrong
+// request cannot produce this string.
+fn client_pipeline(host String, port Int) String {
+	match redis.connect_tls(host, port) {
+		Err(e) -> redis.show_error(e)
+		Ok(c) -> {
+			reply = pipeline_on(c)
+			redis.close(c)
+			reply
+		}
+	}
+}
+
+fn pipeline_on(c redis.Conn) String {
+	key = 'tls:rig:pipeline'
+	batch = [['SET', key, '1'], ['INCR', key], ['GET', key]]
+	match redis.pipeline(c, batch) {
+		Err(e) -> redis.show_error(e)
+		Ok(replies) -> match replies {
+			[a, b, d] -> {
+				set = show_reply(a, redis.expect_status)
+				incr = show_reply(b, fn(v) match redis.expect_int(v) {
+					Ok(n) -> Ok(int.to_string(n))
+					Err(e) -> Err(e)
+				})
+				got = show_reply(d, redis.expect_string)
+				'${set},${incr},${got}'
+			}
+
+			_ -> 'expected three replies, got ${int.to_string(array.length(replies))}'
+		}
+	}
+}
+
+// The `expect_*` decoders take the whole `Result`, not the `Value` inside it,
+// so that one reply of a pipeline is read exactly as `command`'s would be.
+fn show_reply(
+	r Result(resp.Value, redis.RedisError),
+	decode fn(Result(resp.Value, redis.RedisError)) Result(String, redis.RedisError),
+) String {
+	match decode(r) {
+		Ok(s) -> s
+		Err(e) -> redis.show_error(e)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // The two arm sets.
 // ---------------------------------------------------------------------------
 
@@ -160,6 +241,8 @@ fn trusted_arms(host String, port Int) Array(Check) {
 			'HostnameMismatch',
 		),
 		is('malformed name is refused', handshake_as(host, port, 'bad_name!'), 'InvalidServerName'),
+		is('client PING over TLS', client_ping(host, port), 'PONG'),
+		is('client pipeline over TLS', client_pipeline(host, port), 'OK,2,2'),
 	]
 }
 
