@@ -2,3 +2,7 @@
 # Anchored so it cannot match a source file or directory of the same name.
 /scarlet
 .zed
+
+# The TLS rig's throwaway CA and leaf, minted by test/gen-tls-certs.sh. A
+# private key is not something to check in, however worthless this one is.
+/test/tls-certs/

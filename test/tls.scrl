@@ -1,0 +1,231 @@
+// The TLS rig's own check-in test, run against what `docker compose up -d`
+// brings up.
+//
+//	SSL_CERT_FILE=test/tls-certs/ca.crt scarlet run test/tls.scrl [host] [tls port] [plain port]
+//
+// It speaks RESP over `scarlet/net/tls` directly rather than through `redis`,
+// because there is no `rediss://` transport to test yet. This file is what the
+// transport will be watched to fail and to pass against, so it has to stand up
+// on its own first.
+//
+// `SSL_CERT_FILE` is not a way of relaxing anything. It is where
+// `rustls-native-certs` looks for the machine's trust store, so pointing it at
+// the rig's CA is the ordinary "trust a private CA" path and verification stays
+// on — there is no way to ask the runtime to skip it. Skip the trust step and
+// the first check fails with `CertificateUnknownIssuer`, which is the honest
+// way to find that out.
+//
+// What this file does NOT witness:
+//
+//   - The client's own TLS transport, which does not exist yet.
+//   - What a TLS client does against a *plaintext* port: it hangs rather than
+//     erring, so a check for it would wedge a run instead of failing it.
+//     `cleartext gets nothing` covers the direction that can be bounded — that
+//     nothing on the TLS port answers a client that never negotiated.
+//   - `InvalidServerName`. An IP literal does not raise it: the handshake gets
+//     as far as verification and fails there instead, which is what
+//     `an address is not a name` pins.
+
+import scarlet/array
+import scarlet/binary
+import scarlet/int
+import scarlet/net
+import scarlet/net/error.{NetError, TimedOut}
+import scarlet/net/socket.{Closed, Data, Socket}
+import scarlet/net/tls.{HostnameMismatch, TlsError, TlsSocket}
+import scarlet/os
+import scarlet/string
+import ../number
+import ../resp.{Bad, Done, NeedMore, SimpleStr, Value}
+
+const READ_SIZE = 4096
+
+// Long enough that a slow answer is not read as no answer, short enough that a
+// wedged listener is a red run rather than a hung one.
+const REPLY_TIMEOUT_MS = 2000
+
+// ---------------------------------------------------------------------------
+// Assertions.
+// ---------------------------------------------------------------------------
+
+type Check {
+	name String
+	ok Bool
+	detail String
+}
+
+fn eq(name String, actual a, expected a) Check {
+	got = string.inspect(actual)
+	want = string.inspect(expected)
+	Check(name, got == want, 'expected ${want}, got ${got}')
+}
+
+// A port that answered a cleartext PING with a RESP reply is serving cleartext,
+// whatever else it also does. Everything else — a reset, a close, a TLS alert
+// arriving as bytes that are not RESP, silence — is a listener refusing to
+// speak it, and WHICH of those you get is a property of the server build:
+// redis 7.2.3 in the compose image closes, homebrew 7.2.4 resets. So this is
+// the property, not the mechanism; pinning the mechanism made the check fail on
+// a second server that was behaving correctly.
+fn refused_cleartext(name String, outcome Outcome) Check {
+	answered = match outcome {
+		Pong -> True
+		Other(_) -> True
+		_ -> False
+	}
+	Check(name, answered == False, 'expected no RESP reply, got ${string.inspect(outcome)}')
+}
+
+// ---------------------------------------------------------------------------
+// One attempt at a PING.
+// ---------------------------------------------------------------------------
+
+// What one attempt came back as. A reply that is not RESP, a peer that hung
+// up, and a TLS failure are three different things and only the last is about
+// TLS, so they are kept apart: a check that collapsed them into "an error"
+// would pass on the wrong evidence.
+type Outcome {
+	Pong
+	// A RESP reply that is not `+PONG`, rendered for the failure message.
+	Other(reply String)
+	Garbled(why String)
+	// The peer closed without answering.
+	Ended
+	// Nothing arrived within `REPLY_TIMEOUT_MS`.
+	Silent
+	Failed(error TlsError)
+	// The cleartext arm's failures, which are not TLS failures.
+	NetFailed(error NetError)
+}
+
+fn classify(value Value) Outcome {
+	match value {
+		SimpleStr(bytes) -> match binary.to_string(bytes) {
+			Ok('PONG') -> Pong
+			_ -> Other(string.inspect(value))
+		}
+		other -> Other(string.inspect(other))
+	}
+}
+
+// PING over TLS, verifying the certificate against `host`.
+fn tls_ping(host String, port Int) Outcome {
+	match tls.connect(host, port) {
+		Err(e) -> Failed(e)
+		Ok(c) -> {
+			outcome = match tls.write(c, resp.encode_command([<<'PING'>>])) {
+				Err(e) -> Failed(e)
+				Ok(Nil) -> tls_reply(c, <<>>)
+			}
+			// The connection is finished either way, and whether the peer got
+			// the close_notify says nothing about the check.
+			_ = tls.close(c)
+			outcome
+		}
+	}
+}
+
+fn tls_reply(c TlsSocket, buf Binary) Outcome {
+	match resp.parse(buf, 0) {
+		Done(value, _) -> classify(value)
+		Bad(why) -> Garbled(why)
+		// `tls.read` has no bounded form, so this arm is the one place the
+		// suite could park. It only runs against a peer that has already
+		// completed a handshake, which is the case that answers.
+		NeedMore -> match tls.read(c, READ_SIZE) {
+			Err(e) -> Failed(e)
+			Ok(Closed) -> Ended
+			Ok(Data(chunk)) -> tls_reply(c, binary.append(buf, chunk))
+		}
+	}
+}
+
+// PING in cleartext at whatever is listening on `port`, bounded so that a peer
+// which neither answers nor closes is `Silent` rather than a hung run.
+fn plain_ping(host String, port Int) Outcome {
+	match net.connect(host, port) {
+		Err(e) -> NetFailed(e)
+		Ok(sock) -> {
+			outcome = match socket.write(sock, resp.encode_command([<<'PING'>>])) {
+				Err(e) -> NetFailed(e)
+				Ok(Nil) -> plain_reply(sock, <<>>)
+			}
+			_ = socket.close(sock)
+			outcome
+		}
+	}
+}
+
+fn plain_reply(sock Socket, buf Binary) Outcome {
+	match resp.parse(buf, 0) {
+		Done(value, _) -> classify(value)
+		Bad(why) -> Garbled(why)
+		NeedMore -> match socket.read_within(sock, READ_SIZE, REPLY_TIMEOUT_MS) {
+			Err(TimedOut) -> Silent
+			Err(e) -> NetFailed(e)
+			Ok(Closed) -> Ended
+			Ok(Data(chunk)) -> plain_reply(sock, binary.append(buf, chunk))
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The checks.
+// ---------------------------------------------------------------------------
+
+fn main(host String, tls_port Int, plain_port Int) Nil {
+	checks = [
+		// The rig works: a certificate this machine trusts, for the name we
+		// asked for, and a server that answers behind it.
+		eq('a PONG over TLS', tls_ping(host, tls_port), Pong),
+		// The plaintext listener is a different server, so a PONG here is not
+		// evidence about the TLS one — it is what tells you the compose file
+		// came up at all, and which port the negative check below is about.
+		eq('a PONG in cleartext', plain_ping(host, plain_port), Pong),
+		// Nothing on the TLS port answers a client that did not negotiate.
+		// This is what separates a rig that is exercising TLS from one that
+		// quietly fell back: `--port 0` means there is no cleartext listener
+		// on that port to fall back to.
+		refused_cleartext('cleartext gets nothing', plain_ping(host, tls_port)),
+		// The certificate is checked against the name the caller asked for and
+		// against nothing else. The leaf is issued for `localhost`, so the
+		// loopback address it resolves to is the wrong name for it — same
+		// server, same port, same certificate, refused.
+		eq('an address is not a name', tls_ping('127.0.0.1', tls_port), Failed(HostnameMismatch)),
+	]
+	array.each(checks, fn(ch) match ch {
+		Check(name, True, _) -> println('  ok    ${name}')
+		Check(name, False, detail) -> println('  FAIL  ${name}: ${detail}')
+	})
+	failures = array.length(
+		array.filter(checks, fn(ch) match ch {
+			Check(_, ok, _) -> ok == False
+		}),
+	)
+	total = array.length(checks)
+	println('')
+	if failures == 0 {
+		println('${int.to_string(total)} checks, all passed')
+	} else {
+		println('${int.to_string(total)} checks, ${int.to_string(failures)} FAILED')
+	}
+}
+
+// Defaults match the docker-compose in this repo. The host has to be a name
+// the certificate is issued for, which is why it is `localhost` here and
+// `127.0.0.1` in the other two suites.
+match os.argv() {
+	[_, host, tls_port, plain_port] -> match (
+		number.parse_int(tls_port),
+		number.parse_int(plain_port),
+	) {
+		(Ok(t), Ok(p)) -> main(host, t, p)
+		_ -> println('ports must be numbers')
+	}
+	[_, host, tls_port] -> match number.parse_int(tls_port) {
+		Ok(t) -> main(host, t, 5379)
+		Err(Nil) -> println('port must be a number')
+	}
+	[_, host] -> main(host, 5380, 5379)
+	_ -> main('localhost', 5380, 5379)
+}

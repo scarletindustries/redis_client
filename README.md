@@ -239,9 +239,59 @@ redis.command_raw(c, [<<'SET'>>, key, jpeg])
 ## Hacking on it
 
 ```
-docker compose up -d          # redis on :5379
+sh test/gen-tls-certs.sh test/tls-certs # once: the test CA and its localhost leaf
+docker compose up -d          # redis on :5379, the same again over TLS on :5380
 scarlet run example/tour.scrl # one connection, one command after another
 scarlet run example/pool.scrl # twelve processes over four connections
 scarlet run test/suite.scrl   # 162 assertions against a live server
 scarlet run test/pool.scrl    # the pool's own, which are about lifecycle
 ```
+
+The certificates come first because the redis image carries no openssl to mint
+them with. They are ignored by git — a private key is not something to check
+in, however worthless this one is — and minting them again is deleting the
+directory and re-running that line.
+
+### The TLS listener
+
+`redis-tls` is the same server with `--port 0 --tls-port 6379`, published on
+:5380, holding a certificate for `localhost` issued by the throwaway CA next to
+it. There is no plaintext listener behind it, so a client that does not
+negotiate TLS gets nothing rather than quietly falling back to cleartext
+against the same data.
+
+Reaching it means trusting that CA, and there is no way to ask Scarlet to skip
+verification instead — a TLS client that can be talked into accepting any
+certificate is worse than no TLS client. One command does it, the same one on
+macOS and on Linux:
+
+```
+export SSL_CERT_FILE=$PWD/test/tls-certs/ca.crt
+scarlet run test/tls.scrl     # four checks that the rig is really speaking TLS
+```
+
+That variable is where the runtime looks for the machine's certificate store,
+so it *replaces* the store for that one process rather than adding to it: a
+program run this way trusts the rig's CA and nothing else. Nothing is installed
+and there is nothing to undo afterwards. Skip it and the first check fails with
+`CertificateUnknownIssuer`, which is what that looks like from the inside.
+
+The leaf is issued for the name `localhost` and no other, which is why this
+suite connects by that name where the other two use `127.0.0.1`: the address is
+a different name as far as verification is concerned, and gets
+`HostnameMismatch`. An address is not refused *for being* an address — a leaf
+carrying an `IP:` subject alternative name verifies by IP quite happily.
+
+Any TLS-terminating Redis will do, so the same certificates work against a
+local server with no daemon in the picture:
+
+```
+redis-server --port 0 --tls-port 6395 --save '' \
+	--tls-cert-file test/tls-certs/server.crt \
+	--tls-key-file test/tls-certs/server.key \
+	--tls-ca-cert-file test/tls-certs/ca.crt --tls-auth-clients no
+scarlet run test/tls.scrl localhost 6395 5379
+```
+
+`--save ''` because that server writes its `dump.rdb` into whatever directory
+it was started from, which here is the repository.
