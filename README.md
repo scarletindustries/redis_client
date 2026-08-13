@@ -245,6 +245,10 @@ scarlet run example/tour.scrl # one connection, one command after another
 scarlet run example/pool.scrl # twelve processes over four connections
 ```
 
+Two copies of `scripts/test` or `scarlet run test/suite.scrl` may run at
+once against the same server: each process claims a run id and keeps its
+keys under `scrl:test:<id>:` / `scrl:pool:<id>:`. They do not share keys.
+
 ### TLS
 
 A `Conn` can be TLS-backed. `connect_tls` and `connect_tls_auth` are the dials;

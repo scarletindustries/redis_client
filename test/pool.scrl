@@ -9,6 +9,8 @@
 // processes.
 //
 // The checks run in order of how much they stir the scheduler, quietest first.
+// Each process claims a run id (INCR on `scrl:run:pool`) and keeps its keys
+// under `scrl:pool:<id>:`, so two copies against one server do not share keys.
 
 import scarlet/array
 import scarlet/int
@@ -25,10 +27,13 @@ import ../keys
 import ../pubsub
 import ../strings
 
-const PREFIX = 'scrl:pool:'
+fn k(tag String, name String) String {
+	'scrl:pool:${tag}:${name}'
+}
 
-fn k(name String) String {
-	'${PREFIX}${name}'
+fn claim_run(c Conn) Result(String, RedisError) {
+	n <- result.then(strings.incr(c, 'scrl:run:pool'))
+	Ok(int.to_string(n))
 }
 
 // ---------------------------------------------------------------------------
@@ -69,12 +74,12 @@ fn test_start(host String) Array(Check) {
 // Which connection a block lands on.
 // ---------------------------------------------------------------------------
 
-fn test_blocks(p Conn) Result(Array(Check), RedisError) {
+fn test_blocks(p Conn, tag String) Result(Array(Check), RedisError) {
 	// A command module called straight on the pool, with no block in sight.
 	// This is the whole point of a pool being a `Conn`: `strings.set` was
 	// written against one connection and knows nothing about pools.
-	_ <- result.then(strings.set(p, k('direct'), 'hello'))
-	direct <- result.then(strings.get(p, k('direct')))
+	_ <- result.then(strings.set(p, k(tag, 'direct'), 'hello'))
+	direct <- result.then(strings.get(p, k(tag, 'direct')))
 
 	// Commands inside one block share a connection. WATCH/MULTI depends on it.
 	one_each <- result.then(
@@ -93,7 +98,7 @@ fn test_blocks(p Conn) Result(Array(Check), RedisError) {
 	}
 	alive <- result.then(pool.with_conn(p, fn(c) connection.ping(c)))
 
-	replies <- result.then(redis.pipeline(p, [['SET', k('pl'), '7'], ['INCR', k('pl')]]))
+	replies <- result.then(redis.pipeline(p, [['SET', k(tag, 'pl'), '7'], ['INCR', k(tag, 'pl')]]))
 	incremented <- result.then(match replies {
 		[_, incr] -> redis.expect_int(incr)
 		_ -> Err(redis.Protocol('expected two replies'))
@@ -106,7 +111,7 @@ fn test_blocks(p Conn) Result(Array(Check), RedisError) {
 		_ -> False
 	}
 
-	_ <- result.then(keys.del(p, [k('pl'), k('direct')]))
+	_ <- result.then(keys.del(p, [k(tag, 'pl'), k(tag, 'direct')]))
 	Ok(
 		[
 			eq('a command module called straight on the pool', direct, Some('hello')),
@@ -203,8 +208,8 @@ fn tally(done Subject(Int), left Int, acc Int) Int {
 // Many callers, few connections.
 // ---------------------------------------------------------------------------
 
-fn test_sharing(p Conn) Result(Array(Check), RedisError) {
-	_ <- result.then(pool.with_conn(p, fn(c) keys.del(c, [k('counter')])))
+fn test_sharing(p Conn, tag String) Result(Array(Check), RedisError) {
+	_ <- result.then(pool.with_conn(p, fn(c) keys.del(c, [k(tag, 'counter')])))
 
 	// Three blocks that overlap in time cannot be sharing a connection, so
 	// three distinct client ids is three open sockets.
@@ -212,10 +217,10 @@ fn test_sharing(p Conn) Result(Array(Check), RedisError) {
 
 	// Twenty callers over three connections. The counter they share is what
 	// proves none of them was quietly dropped.
-	served = fan_out(p, 20)
-	counted <- result.then(pool.with_conn(p, fn(c) strings.get(c, k('counter'))))
+	served = fan_out(p, 20, tag)
+	counted <- result.then(pool.with_conn(p, fn(c) strings.get(c, k(tag, 'counter'))))
 
-	_ <- result.then(pool.with_conn(p, fn(c) keys.del(c, [k('counter')])))
+	_ <- result.then(pool.with_conn(p, fn(c) keys.del(c, [k(tag, 'counter')])))
 	Ok(
 		[
 			eq('three overlapping blocks, three connections', spread, 3),
@@ -262,23 +267,23 @@ fn gather_ints(done Subject(Int), left Int, acc Array(Int)) Array(Int) {
 	}
 }
 
-fn fan_out(p Conn, n Int) Int {
+fn fan_out(p Conn, n Int, tag String) Int {
 	done = process.subject()
-	ask_incr(p, done, n)
+	ask_incr(p, done, n, tag)
 	gather_ok(done, n, 0)
 }
 
-fn ask_incr(p Conn, done Subject(Bool), left Int) Nil {
+fn ask_incr(p Conn, done Subject(Bool), left Int, tag String) Nil {
 	if left == 0 {
 		Nil
 	} else {
 		_ = process.spawn(
 			fn() process.send(
 				done,
-				result.is_ok(pool.with_conn(p, fn(c) strings.incr(c, k('counter')))),
+				result.is_ok(pool.with_conn(p, fn(c) strings.incr(c, k(tag, 'counter')))),
 			),
 		)
-		ask_incr(p, done, left - 1)
+		ask_incr(p, done, left - 1, tag)
 	}
 }
 
@@ -364,8 +369,13 @@ fn plus(a Score, b Score) Score {
 	}
 }
 
-fn run(name String, p Conn, body fn(Conn) Result(Array(Check), RedisError)) Array(Check) {
-	match body(p) {
+fn run(
+	name String,
+	p Conn,
+	tag String,
+	body fn(Conn, String) Result(Array(Check), RedisError),
+) Array(Check) {
+	match body(p, tag) {
 		Ok(checks) -> checks
 		// A group that died partway still reports — as one failure naming the
 		// group, rather than vanishing from the count.
@@ -425,14 +435,16 @@ fn finish(total Score) Nil {
 
 fn run_cli(host String, port Int) Nil {
 	starting = report('starting', test_start(host))
-	outcome = pool.with_pool(host, port, 3, fn(
-		p,
-	) Ok(
-		plus(
-			report('one block, one connection', run('blocks', p, test_blocks)),
-			report('many callers, few connections', run('sharing', p, test_sharing)),
-		),
-	))
+	outcome = pool.with_pool(host, port, 3, fn(p) {
+		tag <- result.then(claim_run(p))
+		println('keys under scrl:pool:${tag}:')
+		Ok(
+			plus(
+				report('one block, one connection', run('blocks', p, tag, test_blocks)),
+				report('many callers, few connections', run('sharing', p, tag, test_sharing)),
+			),
+		)
+	})
 	match outcome {
 		Err(e) -> {
 			println('pool tests could not run: ${redis.show_error(e)}')
