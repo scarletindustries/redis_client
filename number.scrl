@@ -82,9 +82,9 @@ pub fn parse_score_binary(b Binary) Result(Score, Nil) {
 		Err(Nil)
 	} else {
 		match binary.byte_at(b, 0) {
-			45 -> negate(magnitude(b, 1, size))
-			43 -> magnitude(b, 1, size)
-			_ -> magnitude(b, 0, size)
+			45 -> negate(magnitude(b, 1))
+			43 -> magnitude(b, 1)
+			_ -> magnitude(b, 0)
 		}
 	}
 }
@@ -97,11 +97,11 @@ pub fn parse_int_binary(b Binary) Result(Int, Nil) {
 		Err(Nil)
 	} else {
 		match binary.byte_at(b, 0) {
-			45 -> match binary.parse_int(binary.slice_bytes(b, 1, size - 1), Dec) {
+			45 -> match binary.parse_int(binary.drop_bytes(b, 1), Dec) {
 				Ok(n) -> Ok(0 - n)
 				Err(Nil) -> Err(Nil)
 			}
-			43 -> binary.parse_int(binary.slice_bytes(b, 1, size - 1), Dec)
+			43 -> binary.parse_int(binary.drop_bytes(b, 1), Dec)
 			_ -> binary.parse_int(b, Dec)
 		}
 	}
@@ -122,8 +122,13 @@ fn negate(r Result(Score, Nil)) Result(Score, Nil) {
 
 // The unsigned part: either an infinity spelling, or digits with an optional
 // fraction and an optional exponent.
-fn magnitude(b Binary, start Int, size Int) Result(Score, Nil) {
-	rest = binary.slice_bytes(b, start, size - start)
+//
+// `size` is derived here rather than passed: `rest` is the tail from `start`,
+// and a caller-supplied end that disagreed with `byte_size(b)` would make it a
+// different window than the one `digits` and `exponent` then scan.
+fn magnitude(b Binary, start Int) Result(Score, Nil) {
+	size = binary.byte_size(b)
+	rest = binary.drop_bytes(b, start)
 	if binary.eq_ignore_ascii_case(rest, <<'inf'>>) ||
 	binary.eq_ignore_ascii_case(rest, <<'infinity'>>) {
 		Ok(PosInf)
@@ -143,7 +148,7 @@ fn magnitude(b Binary, start Int, size Int) Result(Score, Nil) {
 		if taken + int_dropped + frac_dropped == 0 {
 			Err(Nil)
 		} else {
-			match exponent(b, after_frac, size) {
+			match exponent(b, after_frac) {
 				Err(Nil) -> Err(Nil)
 				// Digits dropped from the integer part were never divided out,
 				// so each one still counts as a power of ten.
@@ -190,13 +195,13 @@ fn digits(b Binary, i Int, size Int, acc Int, taken Int, dropped Int) (Int, Int,
 // The exponent after `e`/`E`, or 0 when there is none. Trailing bytes that are
 // not a well-formed exponent are an error rather than being ignored — '1.5x'
 // is not a number.
-fn exponent(b Binary, i Int, size Int) Result(Int, Nil) {
-	if i >= size {
+fn exponent(b Binary, i Int) Result(Int, Nil) {
+	if i >= binary.byte_size(b) {
 		Ok(0)
 	} else {
 		byte = binary.byte_at(b, i)
 		if byte == 101 || byte == 69 {
-			match parse_int_binary(binary.slice_bytes(b, i + 1, size - i - 1)) {
+			match parse_int_binary(binary.drop_bytes(b, i + 1)) {
 				Ok(exp) -> Ok(exp)
 				Err(Nil) -> Err(Nil)
 			}
