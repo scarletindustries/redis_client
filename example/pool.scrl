@@ -139,7 +139,7 @@ fn string_of(names Array(String)) String {
 	})
 }
 
-fn main(host String, port Int) Nil {
+fn run_cli(host String, port Int) Nil {
 	// `with_pool` dials every connection before the block starts, so a server
 	// that is down is one error here rather than twelve errors later.
 	match pool.with_pool(host, port, CONNECTIONS, tour) {
@@ -149,11 +149,13 @@ fn main(host String, port Int) Nil {
 }
 
 // Defaults match the docker-compose in this repo.
-match os.argv() {
-	[_, host, port] -> match number.parse_int(port) {
-		Ok(p) -> main(host, p)
-		Err(Nil) -> println('port must be a number')
+pub fn main() Nil {
+	match os.argv() {
+		[_, host, port] -> match number.parse_int(port) {
+			Ok(p) -> run_cli(host, p)
+			Err(Nil) -> println('port must be a number')
+		}
+		[_, host] -> run_cli(host, 5379)
+		_ -> run_cli('127.0.0.1', 5379)
 	}
-	[_, host] -> main(host, 5379)
-	_ -> main('127.0.0.1', 5379)
 }
