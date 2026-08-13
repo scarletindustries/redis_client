@@ -2,3 +2,31 @@ services:
   redis:
     image: redis:latest
     ports: ['5379:6379']
+
+  # The TLS listener the rig in test/tls.scrl runs against.
+  #
+  # Behind a profile, and not in the default `up`, because it cannot start
+  # until ./scripts/tls-certs.sh has minted test/tls/. Those are a private key
+  # and cannot be committed, so a plain `docker compose up -d` that included
+  # this service would crash-loop on a fresh checkout and break the plaintext
+  # suite's documented one-command start. Bring it up with:
+  #
+  #   ./scripts/tls-certs.sh
+  #   docker compose --profile tls up -d
+  #
+  # `--tls-auth-clients no` because the Scarlet client presents no client
+  # certificate: verification here is the client checking the server, which is
+  # the direction the rig is about.
+  redis-tls:
+    profiles: ['tls']
+    image: redis:latest
+    ports: ['6380:6380']
+    volumes: ['./test/tls:/certs:ro']
+    command: >
+      redis-server
+      --port 0
+      --tls-port 6380
+      --tls-cert-file /certs/server.crt
+      --tls-key-file /certs/server.key
+      --tls-ca-cert-file /certs/ca.crt
+      --tls-auth-clients no

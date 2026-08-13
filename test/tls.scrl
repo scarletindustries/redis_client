@@ -1,0 +1,197 @@
+// The TLS rig: a Scarlet program against a real TLS-terminating Redis.
+//
+//	./scripts/tls-certs.sh                       # once
+//	docker compose --profile tls up -d
+//	SSL_CERT_FILE=test/tls/ca.crt scarlet run test/tls.scrl   # trusted arms
+//	scarlet run test/tls.scrl                                 # untrusted arm
+//
+// **The negative arms are the point of this file.** A TLS client that accepts
+// any certificate still returns PONG, so a rig that only checks for PONG
+// cannot tell an encrypted connection from a credulous one. Three separate
+// ways of being the wrong peer are checked, and each must come back as its own
+// `TlsError` rather than merely as "an error".
+//
+// Trust is granted through `SSL_CERT_FILE`, which is what `rustls-native-certs`
+// reads on Unix. That ADDS a root; it does not disable checking — the
+// wrong-name arm below fails *while it is set*, which is what proves it. There
+// is deliberately no way to ask the runtime to skip verification, and nothing
+// here switches it off. Nothing is written to the machine's trust store, so
+// there is nothing to undo after a run.
+//
+// WHICH ARMS RUN DEPENDS ON `SSL_CERT_FILE`, because the untrusted-issuer arm
+// needs it absent and the other three need it present, and one process cannot
+// have it both ways. The mode is printed: a run that reports one check is not a
+// run that passed four.
+//
+// THIS PROGRAM CANNOT FAIL A GATE. Like every other program in this repo it
+// prints its verdict and exits 0 — Scarlet has no exit, panic or assert yet
+// (T-271). CI does not run it, and wiring it up before T-271 would buy a green
+// that asserts nothing.
+
+import scarlet/array
+import scarlet/binary
+import scarlet/int
+import scarlet/net
+import scarlet/net/socket.{Closed, Data}
+import scarlet/net/tls
+import scarlet/os
+import scarlet/string
+import ../number
+import ../resp
+
+const DEFAULT_HOST = 'localhost'
+
+const DEFAULT_PORT = 6380
+
+// ---------------------------------------------------------------------------
+// Assertions.
+// ---------------------------------------------------------------------------
+
+type Check {
+	name String
+	ok Bool
+	detail String
+}
+
+fn is(name String, got String, want String) Check {
+	Check(name, got == want, 'expected ${want}, got ${got}')
+}
+
+fn report(checks Array(Check)) Int {
+	array.fold(checks, 0, fn(failures, c) match c {
+		Check(name, True, _) -> {
+			println('  ok    ${name}')
+			failures
+		}
+		Check(name, False, detail) -> {
+			println('  FAIL  ${name}: ${detail}')
+			failures + 1
+		}
+	})
+}
+
+// ---------------------------------------------------------------------------
+// Naming the failure, not just noticing one.
+// ---------------------------------------------------------------------------
+
+fn show_error(e tls.TlsError) String {
+	match e {
+		tls.CertificateUnknownIssuer -> 'CertificateUnknownIssuer'
+		tls.CertificateExpired -> 'CertificateExpired'
+		tls.CertificateNotYetValid -> 'CertificateNotYetValid'
+		tls.CertificateRevoked -> 'CertificateRevoked'
+		tls.HostnameMismatch -> 'HostnameMismatch'
+		tls.BadCertificate -> 'BadCertificate'
+		tls.ProtocolError -> 'ProtocolError'
+		tls.HandshakeFailed -> 'HandshakeFailed'
+		tls.InvalidServerName -> 'InvalidServerName'
+		tls.Transport(_) -> 'Transport'
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The arms.
+// ---------------------------------------------------------------------------
+
+// PING over TLS, encoded by this repo's own RESP encoder. Until `Conn` can be
+// TLS-backed (T-246) that encoder is the most of the client a TLS rig can
+// exercise, and it is the half that proves bytes survive the record layer.
+fn ping(host String, port Int) String {
+	match tls.connect(host, port) {
+		Err(e) -> show_error(e)
+		Ok(c) -> {
+			reply = ping_on(c)
+			_ = tls.close(c)
+			reply
+		}
+	}
+}
+
+fn ping_on(c tls.TlsSocket) String {
+	match tls.write(c, resp.encode_command([<<'PING'>>])) {
+		Err(e) -> 'write: ${show_error(e)}'
+		Ok(Nil) -> match tls.read(c, 64) {
+			Err(e) -> 'read: ${show_error(e)}'
+			Ok(Closed) -> 'closed before a reply'
+			Ok(Data(bytes)) -> match binary.to_string(bytes) {
+				Ok(s) -> string.trim(s)
+				Err(Nil) -> 'reply was not UTF-8'
+			}
+		}
+	}
+}
+
+// The name a certificate is checked against, when it is not the name we dialled.
+//
+// `tls.connect` resolves the name before it verifies it, so a malformed name
+// errs `Transport` at DNS resolution and never reaches verification. The split
+// `net.connect` + `tls.handshake` form is the only route that reaches
+// `InvalidServerName`.
+fn handshake_as(host String, port Int, name String) String {
+	match net.connect(host, port) {
+		Err(_) -> 'could not connect'
+		Ok(sock) -> match tls.handshake(sock, name) {
+			Err(e) -> show_error(e)
+			Ok(c) -> {
+				_ = tls.close(c)
+				'HANDSHAKE_OK'
+			}
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The two arm sets.
+// ---------------------------------------------------------------------------
+
+// With the test CA trusted. The wrong-name arm is here rather than in the
+// untrusted set on purpose: an untrusted issuer would mask it, and what needs
+// witnessing is that a name is still checked once the issuer is accepted.
+fn trusted_arms(host String, port Int) Array(Check) {
+	[
+		is('PING over TLS', ping(host, port), '+PONG'),
+		// server.crt carries SAN DNS:localhost and no IP SAN, so the address
+		// verifies against nothing. It is NOT refused as an unusable name:
+		// rustls accepts an IP literal as a server name and checks it against
+		// the certificate's IP SANs, of which this certificate has none.
+		is(
+			'wrong name is refused',
+			handshake_as('127.0.0.1', port, '127.0.0.1'),
+			'HostnameMismatch',
+		),
+		is('malformed name is refused', handshake_as(host, port, 'bad_name!'), 'InvalidServerName'),
+	]
+}
+
+// With no trust granted at all.
+fn untrusted_arms(host String, port Int) Array(Check) {
+	[is('untrusted issuer is refused', ping(host, port), 'CertificateUnknownIssuer')]
+}
+
+fn run(host String, port Int) Nil {
+	(mode, checks) = match os.get_env('SSL_CERT_FILE') {
+		Some(path) -> ('trusted via SSL_CERT_FILE=${path}', trusted_arms(host, port))
+		None -> ('no SSL_CERT_FILE set', untrusted_arms(host, port))
+	}
+	println('TLS rig against ${host}:${int.to_string(port)}, ${mode}')
+	println('')
+	failures = report(checks)
+	total = array.length(checks)
+	println('')
+	if failures == 0 {
+		println('${int.to_string(total)} checks, all passed')
+	} else {
+		println('${int.to_string(total)} checks, ${int.to_string(failures)} FAILED')
+	}
+}
+
+pub fn main() Nil {
+	match os.argv() {
+		[_, host, port] -> match number.parse_int(port) {
+			Ok(p) -> run(host, p)
+			Err(Nil) -> println('port must be a number')
+		}
+		[_, host] -> run(host, DEFAULT_PORT)
+		_ -> run(DEFAULT_HOST, DEFAULT_PORT)
+	}
+}
