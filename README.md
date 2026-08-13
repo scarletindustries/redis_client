@@ -240,10 +240,9 @@ redis.command_raw(c, [<<'SET'>>, key, jpeg])
 
 ```
 docker compose up -d          # redis on :5379
+scripts/test                  # suite + pool; non-zero if a check fails
 scarlet run example/tour.scrl # one connection, one command after another
 scarlet run example/pool.scrl # twelve processes over four connections
-scarlet run test/suite.scrl   # 162 assertions against a live server
-scarlet run test/pool.scrl    # the pool's own, which are about lifecycle
 ```
 
 ### TLS

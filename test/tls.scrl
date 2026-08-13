@@ -23,10 +23,10 @@
 // have it both ways. The mode is printed: a run that reports one check is not a
 // run that passed four.
 //
-// THIS PROGRAM CANNOT FAIL A GATE. Like every other program in this repo it
-// prints its verdict and exits 0 — Scarlet has no exit, panic or assert yet
-// (T-271). CI does not run it, and wiring it up before T-271 would buy a green
-// that asserts nothing.
+// A failed check, or a run that built no checks, ends the process non-zero.
+// Scarlet has no exit: the harness prints why and then slices an empty
+// array out of range. `scripts/test` also requires a `REDIS DONE` line with
+// a positive check count, so a file that ran nothing cannot pass.
 
 import scarlet/array
 import scarlet/binary
@@ -69,6 +69,36 @@ fn report(checks Array(Check)) Int {
 			failures + 1
 		}
 	})
+}
+
+// Crash on purpose after printing why. Scarlet has no exit; an out-of-range
+// slice is the only lever on the process status. Bounds are computed so
+// constant folding cannot turn this into a compile error.
+fn end_the_process(why String) Nil {
+	println('ABORT: ${why}')
+	empty Array(Int) = []
+	_ = empty[0..array.length(one_past_empty())]
+	Nil
+}
+
+fn one_past_empty() Array(Int) {
+	[1]
+}
+
+fn finish(checks Array(Check)) Nil {
+	failures = report(checks)
+	total = array.length(checks)
+	println('')
+	println('REDIS DONE checks=${int.to_string(total)} failed=${int.to_string(failures)}')
+	if failures == 0 && total > 0 {
+		println('${int.to_string(total)} checks, all passed')
+	} else if total == 0 {
+		println('0 checks, none ran')
+		end_the_process('a suite with no checks is not a passing suite')
+	} else {
+		println('${int.to_string(total)} checks, ${int.to_string(failures)} FAILED')
+		end_the_process('${int.to_string(failures)} of ${int.to_string(total)} checks failed')
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -258,21 +288,17 @@ fn run(host String, port Int) Nil {
 	}
 	println('TLS rig against ${host}:${int.to_string(port)}, ${mode}')
 	println('')
-	failures = report(checks)
-	total = array.length(checks)
-	println('')
-	if failures == 0 {
-		println('${int.to_string(total)} checks, all passed')
-	} else {
-		println('${int.to_string(total)} checks, ${int.to_string(failures)} FAILED')
-	}
+	finish(checks)
 }
 
 pub fn main() Nil {
 	match os.argv() {
 		[_, host, port] -> match number.parse_int(port) {
 			Ok(p) -> run(host, p)
-			Err(Nil) -> println('port must be a number')
+			Err(Nil) -> {
+				println('port must be a number')
+				end_the_process('port must be a number')
+			}
 		}
 		[_, host] -> run(host, DEFAULT_PORT)
 		_ -> run(DEFAULT_HOST, DEFAULT_PORT)

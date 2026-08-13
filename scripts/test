@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+#
+# Run the live-server suites and decide the exit status.
+#
+# Each program prints one `REDIS DONE checks=<n> failed=<n>` line and ends
+# the process non-zero when a check failed or none ran. That is already
+# honest on its own. This script is the second opinion, because a file that
+# never calls finish — an emptied `main`, a compile error, a crash before
+# the first check — would otherwise exit 0 with nothing on stdout.
+#
+# A file passes only if it printed a DONE line, the line says checks > 0
+# and failed = 0, and the process exited 0.
+#
+# Default files are the two plaintext suites. The TLS rig needs certs and
+# a compose profile; pass it explicitly:
+#
+#	scripts/test                              # suite + pool against :5379
+#	SCARLET=/path/to/scarlet scripts/test
+#	SSL_CERT_FILE=test/tls/ca.crt scripts/test test/tls.scrl
+
+set -uo pipefail
+
+SCARLET="${SCARLET:-scarlet}"
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$root" || exit 2
+
+if ! command -v "$SCARLET" > /dev/null 2>&1 && [ ! -x "$SCARLET" ]; then
+	echo "scripts/test: no scarlet binary at '${SCARLET}'." >&2
+	echo "Put it on PATH, or set SCARLET." >&2
+	exit 2
+fi
+
+if [ "$#" -gt 0 ]; then
+	files=("$@")
+else
+	files=(test/suite.scrl test/pool.scrl)
+fi
+
+if [ "${#files[@]}" -eq 0 ]; then
+	echo "scripts/test: no test files." >&2
+	echo "An empty run is not a passing run." >&2
+	exit 1
+fi
+
+failed_files=0
+total_checks=0
+total_failures=0
+
+for file in "${files[@]}"; do
+	output="$("$SCARLET" run "$file" 2>&1)"
+	rc=$?
+
+	read -r dones checks failures < <(printf '%s\n' "$output" | awk '
+		/^REDIS DONE /{
+			for (i = 1; i <= NF; i++) {
+				if ($i ~ /^checks=/) { split($i, a, "="); c += a[2] }
+				if ($i ~ /^failed=/) { split($i, b, "="); f += b[2] }
+			}
+			d++
+		}
+		END { print d + 0, c + 0, f + 0 }
+	')
+
+	total_checks=$((total_checks + checks))
+	total_failures=$((total_failures + failures))
+
+	reason=""
+	if [ "$dones" -eq 0 ]; then
+		reason="printed no 'REDIS DONE' line (exit ${rc})"
+	elif [ "$failures" -gt 0 ]; then
+		reason="${failures} of ${checks} checks failed"
+	elif [ "$checks" -eq 0 ]; then
+		reason="reported a suite with no checks in it"
+	elif [ "$rc" -ne 0 ]; then
+		reason="every check passed but the process exited ${rc}"
+	fi
+
+	if [ -n "$reason" ]; then
+		failed_files=$((failed_files + 1))
+		echo "--- FAIL ${file}: ${reason}"
+		printf '%s\n' "$output" | sed 's/^/    /'
+	else
+		echo "ok   ${file} (${checks} checks)"
+	fi
+done
+
+echo
+echo "${#files[@]} files, ${total_checks} checks, ${total_failures} failed, ${failed_files} files failed"
+
+if [ "$failed_files" -ne 0 ]; then
+	exit 1
+fi
+exit 0

@@ -2,9 +2,11 @@
 //
 //	scarlet run test/suite.scrl [host] [port]
 //
-// Every check asserts a value rather than printing one, so a regression fails
-// the run instead of scrolling past. The suite cleans up after itself and is
-// safe to run repeatedly; all its keys live under the `scrl:test:` prefix.
+// Every check asserts a value rather than printing one. A failure prints why
+// and then ends the process non-zero — Scarlet has no exit, so that is an
+// out-of-range slice after the reason. An empty run is also a failure.
+// The suite cleans up after itself and is safe to run repeatedly; all its
+// keys live under the `scrl:test:` prefix.
 
 import scarlet/array
 import scarlet/int
@@ -961,6 +963,36 @@ fn report(checks Array(Check)) Int {
 	)
 }
 
+// Crash on purpose after printing why. Scarlet has no exit; an out-of-range
+// slice is the only lever on the process status. Bounds are computed so
+// constant folding cannot turn this into a compile error.
+fn end_the_process(why String) Nil {
+	println('ABORT: ${why}')
+	empty Array(Int) = []
+	_ = empty[0..array.length(one_past_empty())]
+	Nil
+}
+
+fn one_past_empty() Array(Int) {
+	[1]
+}
+
+fn finish(checks Array(Check)) Nil {
+	failures = report(checks)
+	total = array.length(checks)
+	println('')
+	println('REDIS DONE checks=${int.to_string(total)} failed=${int.to_string(failures)}')
+	if failures == 0 && total > 0 {
+		println('${int.to_string(total)} checks, all passed')
+	} else if total == 0 {
+		println('0 checks, none ran')
+		end_the_process('a suite with no checks is not a passing suite')
+	} else {
+		println('${int.to_string(total)} checks, ${int.to_string(failures)} FAILED')
+		end_the_process('${int.to_string(failures)} of ${int.to_string(total)} checks failed')
+	}
+}
+
 fn run_cli(host String, port Int) Nil {
 	outcome = redis.with_conn(host, port, fn(c) {
 		checks = array.fold(
@@ -996,17 +1028,11 @@ fn run_cli(host String, port Int) Nil {
 		Ok(array.concat(checks, test_pubsub(host, port)))
 	})
 	match outcome {
-		Err(e) -> println('suite could not run: ${redis.show_error(e)}')
-		Ok(checks) -> {
-			failures = report(checks)
-			total = array.length(checks)
-			println('')
-			if failures == 0 {
-				println('${int.to_string(total)} checks, all passed')
-			} else {
-				println('${int.to_string(total)} checks, ${int.to_string(failures)} FAILED')
-			}
+		Err(e) -> {
+			println('suite could not run: ${redis.show_error(e)}')
+			end_the_process('suite could not run')
 		}
+		Ok(checks) -> finish(checks)
 	}
 }
 
@@ -1015,7 +1041,10 @@ pub fn main() Nil {
 	match os.argv() {
 		[_, host, port] -> match number.parse_int(port) {
 			Ok(p) -> run_cli(host, p)
-			Err(Nil) -> println('port must be a number')
+			Err(Nil) -> {
+				println('port must be a number')
+				end_the_process('port must be a number')
+			}
 		}
 		[_, host] -> run_cli(host, 5379)
 		_ -> run_cli('127.0.0.1', 5379)

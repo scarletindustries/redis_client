@@ -391,6 +391,38 @@ fn report(name String, checks Array(Check)) Score {
 	)
 }
 
+// Crash on purpose after printing why. Scarlet has no exit; an out-of-range
+// slice is the only lever on the process status. Bounds are computed so
+// constant folding cannot turn this into a compile error.
+fn end_the_process(why String) Nil {
+	println('ABORT: ${why}')
+	empty Array(Int) = []
+	_ = empty[0..array.length(one_past_empty())]
+	Nil
+}
+
+fn one_past_empty() Array(Int) {
+	[1]
+}
+
+fn finish(total Score) Nil {
+	match total {
+		Score(failed, count) -> {
+			println('')
+			println('REDIS DONE checks=${int.to_string(count)} failed=${int.to_string(failed)}')
+			if failed == 0 && count > 0 {
+				println('${int.to_string(count)} checks, all passed')
+			} else if count == 0 {
+				println('0 checks, none ran')
+				end_the_process('a suite with no checks is not a passing suite')
+			} else {
+				println('${int.to_string(count)} checks, ${int.to_string(failed)} FAILED')
+				end_the_process('${int.to_string(failed)} of ${int.to_string(count)} checks failed')
+			}
+		}
+	}
+}
+
 fn run_cli(host String, port Int) Nil {
 	starting = report('starting', test_start(host))
 	outcome = pool.with_pool(host, port, 3, fn(
@@ -402,29 +434,23 @@ fn run_cli(host String, port Int) Nil {
 		),
 	))
 	match outcome {
-		Err(e) -> println('pool tests could not run: ${redis.show_error(e)}')
-		Ok(shared) -> {
-			total = plus(
-				plus(starting, shared),
+		Err(e) -> {
+			println('pool tests could not run: ${redis.show_error(e)}')
+			end_the_process('pool tests could not run')
+		}
+		Ok(shared) ->
+			finish(
 				plus(
-					report('a killed connection', test_recovery(host, port)),
+					plus(starting, shared),
 					plus(
-						report('stopping', test_stop(host, port)),
-						report('a worker that dies mid-job', test_crash(host, port)),
+						report('a killed connection', test_recovery(host, port)),
+						plus(
+							report('stopping', test_stop(host, port)),
+							report('a worker that dies mid-job', test_crash(host, port)),
+						),
 					),
 				),
 			)
-			match total {
-				Score(failed, count) -> {
-					println('')
-					if failed == 0 {
-						println('${int.to_string(count)} checks, all passed')
-					} else {
-						println('${int.to_string(count)} checks, ${int.to_string(failed)} FAILED')
-					}
-				}
-			}
-		}
 	}
 }
 
@@ -433,7 +459,10 @@ pub fn main() Nil {
 	match os.argv() {
 		[_, host, port] -> match number.parse_int(port) {
 			Ok(p) -> run_cli(host, p)
-			Err(Nil) -> println('port must be a number')
+			Err(Nil) -> {
+				println('port must be a number')
+				end_the_process('port must be a number')
+			}
 		}
 		[_, host] -> run_cli(host, 5379)
 		_ -> run_cli('127.0.0.1', 5379)
