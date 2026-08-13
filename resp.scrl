@@ -127,7 +127,16 @@ pub fn parse(buf Binary, off Int) Parsed {
 // type tag and the CRLF stripped, and the offset just past that CRLF.
 fn line(buf Binary, off Int) Option((Binary, Int)) {
 	match binary.index_of(buf, CRLF, off) {
-		Some(end) -> Some((binary.slice_bytes(buf, off + 1, end - off - 1), end + 2))
+		Some(end) -> match binary.slice_bytes(buf, off + 1, end - off - 1) {
+			Ok(payload) -> Some((payload, end + 2))
+			// Unreachable: `parse` only routes non-CR tag bytes here, so the
+			// CRLF found at `end` is at `off + 1` or later and the length is
+			// >= 0. `<<>>` rather than `None` because `None` reads as NeedMore
+			// to every caller and would stall the connection on bytes that
+			// never come; an empty payload instead reaches the existing `Bad`
+			// in parse_num, parse_bulk, parse_boolean and parse_aggregate.
+			Err(Nil) -> Some((<<>>, end + 2))
+		}
 		None -> None
 	}
 }
@@ -201,7 +210,13 @@ fn parse_bulk(buf Binary, off Int, wrap fn(Binary) Value) Parsed {
 				// arrived yet.
 				NeedMore
 			} else {
-				Done(wrap(binary.slice_bytes(buf, after_head, size)), after_head + size + 2)
+				match binary.slice_bytes(buf, after_head, size) {
+					Ok(payload) -> Done(wrap(payload), after_head + size + 2)
+					// Unreachable: `size >= 0` and the guard above proved
+					// `byte_size(buf) >= after_head + size + 2`. Loud rather
+					// than an empty payload if that ever stops holding.
+					Err(Nil) -> Bad('bulk payload runs past the buffer')
+				}
 			}
 		}
 	}
@@ -214,13 +229,12 @@ fn parse_verbatim(buf Binary, off Int) Parsed {
 		Done(Bulk(payload), next) -> if binary.byte_size(payload) < 4 {
 			Bad('verbatim string is too short to carry a format')
 		} else {
-			Done(
-				Verbatim(
-					binary.slice_bytes(payload, 0, 3),
-					binary.slice_bytes(payload, 4, binary.byte_size(payload) - 4),
-				),
-				next,
-			)
+			match binary.slice_bytes(payload, 0, 3) {
+				Ok(format) -> Done(Verbatim(format, binary.drop_bytes(payload, 4)), next)
+				// Unreachable: the guard above proved `byte_size(payload) >= 4`,
+				// so bytes 0..3 are present. Loud rather than a blank format.
+				Err(Nil) -> Bad('verbatim format runs past the payload')
+			}
 		}
 		Done(other, next) -> Done(other, next)
 		NeedMore -> NeedMore

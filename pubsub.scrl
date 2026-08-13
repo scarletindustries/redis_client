@@ -242,7 +242,7 @@ pub fn next_message_within(
 // message in full.
 fn take(s Subscription) (Subscription, Result(resp.Value, RedisError)) {
 	match resp.parse(s.buf, 0) {
-		Done(value, next) -> (Subscription(..s, buf: rest(s.buf, next)), Ok(value))
+		Done(value, next) -> (Subscription(..s, buf: binary.drop_bytes(s.buf, next)), Ok(value))
 		Bad(why) -> (s, Err(redis.Protocol(why)))
 		NeedMore -> match socket.read(s.sock, READ_SIZE) {
 			Ok(Data(chunk)) -> take(Subscription(..s, buf: binary.append(s.buf, chunk)))
@@ -257,7 +257,8 @@ fn take_within(
 	timeout_ms Int,
 ) (Subscription, Result(Option(resp.Value), RedisError)) {
 	match resp.parse(s.buf, 0) {
-		Done(value, next) -> (Subscription(..s, buf: rest(s.buf, next)), Ok(Some(value)))
+		Done(value, next) ->
+			(Subscription(..s, buf: binary.drop_bytes(s.buf, next)), Ok(Some(value)))
 		Bad(why) -> (s, Err(redis.Protocol(why)))
 		NeedMore -> match socket.read_within(s.sock, READ_SIZE, timeout_ms) {
 			Ok(Data(chunk)) ->
@@ -269,10 +270,6 @@ fn take_within(
 			Err(e) -> (s, Err(Net(e)))
 		}
 	}
-}
-
-fn rest(buf Binary, from Int) Binary {
-	binary.slice_bytes(buf, from, binary.byte_size(buf) - from)
 }
 
 // Every push is an array whose first element names the kind.
