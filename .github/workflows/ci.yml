@@ -1,0 +1,87 @@
+name: CI
+
+# This repository had no workflows at all until 2026-08-13, and that is how it
+# came to sit broken against the compiler for a day without anyone knowing: the
+# only thing in the org that noticed was `website`'s `Language drift`, a job in
+# a different repository that is explicitly allowed to be red.
+#
+# Two things this gate deliberately does and does not do:
+#
+#   - It type-checks EVERY `.scrl` file, not one entrypoint. `redis.scrl` does
+#     not import `./pubsub`, so `scarlet check redis.scrl` was green on nine of
+#     the ten drift sites and blind to the tenth. One entrypoint is not the
+#     library.
+#
+#   - It does NOT run `test/suite.scrl`, `test/pool.scrl` or `example/*.scrl`
+#     as a gate. Those print `N checks, M FAILED` in prose and exit 0 — a
+#     Scarlet program has no exit, panic or assert yet — so a job wired to them
+#     would be green on a broken client. That is T-271; until it is fixed,
+#     shelling out to them here would buy a green that asserts nothing.
+#
+# The compiler is PINNED via `.scarlet-version`, not the rolling `canary` tag,
+# so a green here is reproducible after the fact and an upstream release cannot
+# turn every open pull request red on its own. Moving the pin is a commit, which
+# is the point: it is where the adaptation gets reviewed.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+
+jobs:
+  check:
+    name: type-check and fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get Scarlet (pinned)
+        run: |
+          set -euo pipefail
+          version="$(cat .scarlet-version)"
+          mkdir -p "$HOME/.scarlet/bin"
+          curl --proto '=https' --tlsv1.2 -fsSL \
+            "https://github.com/scarletindustries/language/releases/download/${version}/scarlet-linux-x86_64" \
+            -o "$HOME/.scarlet/bin/scarlet"
+          chmod +x "$HOME/.scarlet/bin/scarlet"
+          echo "$HOME/.scarlet/bin" >> "$GITHUB_PATH"
+
+      # Without this, a download that silently served the wrong build would make
+      # the pin decorative and the green would be against an unknown compiler.
+      - name: Scarlet version matches the pin
+        run: |
+          set -euo pipefail
+          want="$(cat .scarlet-version)"
+          got="$(scarlet --version | awk '{print $2}')"
+          echo "pinned: ${want}"
+          echo "binary: ${got}"
+          test "${want}" = "${got}"
+
+      - name: Type-check every module
+        run: |
+          set -uo pipefail
+          failed=0
+          checked=0
+          while IFS= read -r f; do
+            checked=$((checked + 1))
+            if ! out="$(scarlet check "$f" 2>&1)"; then
+              failed=$((failed + 1))
+              echo "::error file=${f}::scarlet check failed"
+              printf '%s\n' "$out"
+            fi
+          done < <(find . -name '*.scrl' -not -path './.git/*' | sort)
+          echo "checked ${checked} file(s), ${failed} failed"
+          # A find that matched nothing would otherwise report a clean zero.
+          test "${checked}" -gt 0
+          test "${failed}" -eq 0
+
+      - name: Formatting
+        run: scarlet fmt --check .
