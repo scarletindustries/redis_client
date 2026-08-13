@@ -36,6 +36,7 @@ import scarlet/net/socket.{Closed, Data}
 import scarlet/net/tls
 import scarlet/os
 import scarlet/process
+import scarlet/result
 import scarlet/string
 import ../number
 import ../pubsub
@@ -201,15 +202,14 @@ fn client_ping(host String, port Int) String {
 }
 
 // A pipeline over TLS must produce the same replies, in the same order, as the
-// same batch would in the clear. This is the arm that covers the one place the
-// two transports genuinely differ: `socket.write_parts` sends the batch as one
-// vectored write, and `tls` has no `write_parts`, so the TLS half concatenates
-// and issues a single `tls.write`.
+// same batch would in the clear. Three commands whose replies are all different
+// shapes and which are ordered by construction — `INCR` after `SET` is 2, and
+// `GET` after that is '2'. A batch that lost a command, or reordered one, or
+// paired a reply with the wrong request cannot produce this string.
 //
-// Three commands whose replies are all different shapes and which are ordered
-// by construction — `INCR` after `SET` is 2, and `GET` after that is '2'. A
-// batch that lost a command, or reordered one, or paired a reply with the wrong
-// request cannot produce this string.
+// This arm does not witness the one-record write. N separate `tls.write` calls
+// produce the same replies; `scripts/tls-records` is the check that fails
+// under that plant.
 fn client_pipeline(host String, port Int) String {
 	match redis.connect_tls(host, port) {
 		Err(e) -> redis.show_error(e)
@@ -280,23 +280,34 @@ fn client_pubsub_timeout(host String, port Int) String {
 	}
 }
 
-fn pipeline_on(c redis.Conn) String {
-	key = 'tls:rig:pipeline'
-	batch = [['SET', key, '1'], ['INCR', key], ['GET', key]]
-	match redis.pipeline(c, batch) {
-		Err(e) -> redis.show_error(e)
-		Ok(replies) -> match replies {
-			[a, b, d] -> {
-				set = show_reply(a, redis.expect_status)
-				incr = show_reply(b, fn(v) match redis.expect_int(v) {
-					Ok(n) -> Ok(int.to_string(n))
-					Err(e) -> Err(e)
-				})
-				got = show_reply(d, redis.expect_string)
-				'${set},${incr},${got}'
-			}
+fn claim_pipeline_key(c redis.Conn) Result(String, redis.RedisError) {
+	n <- result.then(redis.expect_int(redis.command(c, ['INCR', 'scrl:run:tls'])))
+	Ok('tls:rig:pipeline:${int.to_string(n)}')
+}
 
-			_ -> 'expected three replies, got ${int.to_string(array.length(replies))}'
+fn pipeline_on(c redis.Conn) String {
+	// Per-run key, same shape as suite/pool: two copies against one TLS
+	// listener must not share `tls:rig:pipeline` (T-407 / T-271).
+	match claim_pipeline_key(c) {
+		Err(e) -> redis.show_error(e)
+		Ok(key) -> {
+			batch = [['SET', key, '1'], ['INCR', key], ['GET', key]]
+			match redis.pipeline(c, batch) {
+				Err(e) -> redis.show_error(e)
+				Ok(replies) -> match replies {
+					[a, b, d] -> {
+						set = show_reply(a, redis.expect_status)
+						incr = show_reply(b, fn(v) match redis.expect_int(v) {
+							Ok(n) -> Ok(int.to_string(n))
+							Err(e) -> Err(e)
+						})
+						got = show_reply(d, redis.expect_string)
+						'${set},${incr},${got}'
+					}
+
+					_ -> 'expected three replies, got ${int.to_string(array.length(replies))}'
+				}
+			}
 		}
 	}
 }

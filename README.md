@@ -248,6 +248,7 @@ scarlet run example/pool.scrl # twelve processes over four connections
 Two copies of `scripts/test` or `scarlet run test/suite.scrl` may run at
 once against the same server: each process claims a run id and keeps its
 keys under `scrl:test:<id>:` / `scrl:pool:<id>:`. They do not share keys.
+The TLS pipeline arm does the same on `scrl:run:tls` / `tls:rig:pipeline:<id>`.
 
 ### TLS
 
@@ -278,7 +279,12 @@ cleartext `Socket` to give; pub/sub goes through `transport_of`.
 
 A **pipeline over TLS is one `tls.write`** rather than the plaintext path's
 vectored `write_parts`, since `tls` has no `write_parts` — one record for
-the batch, not one per command.
+the batch, not one per command. The client-side pipeline arm cannot see a
+per-command write: N separate `tls.write` calls produce the same RESP
+replies. That property is asserted by a second rig, `scripts/tls-records`,
+which terminates TLS in-process and counts client-to-server records after
+the handshake. No Redis. It binds `127.0.0.1` on an ephemeral port, so it
+does not need the compose TLS profile and does not use host :6380.
 
 The rig verifies the transport, because verification is the hard part of TLS
 and a rig that cannot tell an encrypted connection from a credulous one proves
@@ -289,6 +295,7 @@ nothing:
 docker compose --profile tls up -d                        # redis TLS on :6380
 SSL_CERT_FILE=test/tls/ca.crt scarlet run test/tls.scrl   # 7 arms, 4 of them the client
 scarlet run test/tls.scrl                                 # the untrusted-issuer refusal
+scripts/tls-records                                       # one-record pipeline; no Redis
 ```
 
 **Trusting the test CA is one environment variable, on both macOS and Linux.**

@@ -130,9 +130,10 @@ pub fn transport_write(t Transport, data Binary) Result(Nil, RedisError) {
 // The plain half uses `socket.write_parts`, which reaches the kernel in one
 // vectored syscall without concatenating. `tls` has no `write_parts`, so the
 // TLS half joins the parts first and issues a single `tls.write`. That is one
-// TLS record rather than one per command — not merely a workaround for the
-// missing function, since a record per command would leak the batch's shape
-// into the ciphertext lengths and cost a header and a MAC each time.
+// TLS record rather than one per command — a record per command would leak
+// the batch's shape into the ciphertext lengths. `test/tls.scrl` cannot see
+// this (N writes produce the same replies); `scripts/tls-records` counts
+// records on the wire.
 fn transport_write_all(t Transport, parts Array(Binary)) Result(Nil, RedisError) {
 	match t {
 		Plain(sock) -> net_err(socket.write_parts(sock, parts))

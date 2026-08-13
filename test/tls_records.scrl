@@ -1,0 +1,138 @@
+// Traffic generator for the record-counting peer.
+//
+//	scripts/tls-records
+//
+// This file is not a Redis suite. It talks to scripts/tls-peer.py, which is
+// what sees the one-record property; this program only produces the pipeline
+// so there is something to count. N separate tls.write calls still print
+// OK,2,2 — that string is the framing control, not the record count.
+//
+// Do not point it at the compose Redis. The peer binds 127.0.0.1 on an
+// ephemeral port and presents ipsan.crt; host and port are required.
+
+import scarlet/array
+import scarlet/int
+import scarlet/os
+import ../number
+import ../redis
+import ../resp
+
+type Check {
+	name String
+	ok Bool
+	detail String
+}
+
+fn is(name String, got String, want String) Check {
+	Check(name, got == want, 'expected ${want}, got ${got}')
+}
+
+fn report(checks Array(Check)) Int {
+	array.fold(checks, 0, fn(failures, c) match c {
+		Check(name, True, _) -> {
+			println('  ok    ${name}')
+			failures
+		}
+		Check(name, False, detail) -> {
+			println('  FAIL  ${name}: ${detail}')
+			failures + 1
+		}
+	})
+}
+
+fn end_the_process(why String) Nil {
+	println('ABORT: ${why}')
+	empty Array(Int) = []
+	_ = empty[0..array.length(one_past_empty())]
+	Nil
+}
+
+fn one_past_empty() Array(Int) {
+	[1]
+}
+
+fn finish(checks Array(Check)) Nil {
+	failures = report(checks)
+	total = array.length(checks)
+	println('')
+	println('REDIS DONE checks=${int.to_string(total)} failed=${int.to_string(failures)}')
+	if failures == 0 && total > 0 {
+		println('${int.to_string(total)} checks, all passed')
+	} else if total == 0 {
+		println('0 checks, none ran')
+		end_the_process('a suite with no checks is not a passing suite')
+	} else {
+		println('${int.to_string(total)} checks, ${int.to_string(failures)} FAILED')
+		end_the_process('${int.to_string(failures)} of ${int.to_string(total)} checks failed')
+	}
+}
+
+fn show_reply(
+	r Result(resp.Value, redis.RedisError),
+	decode fn(Result(resp.Value, redis.RedisError)) Result(String, redis.RedisError),
+) String {
+	match decode(r) {
+		Ok(s) -> s
+		Err(e) -> redis.show_error(e)
+	}
+}
+
+fn pipeline_on(c redis.Conn) String {
+	// Fixed key: one client, one ephemeral peer, no shared server.
+	key = 'tls:records:pipeline'
+	batch = [['SET', key, '1'], ['INCR', key], ['GET', key]]
+	match redis.pipeline(c, batch) {
+		Err(e) -> redis.show_error(e)
+		Ok(replies) -> match replies {
+			[a, b, d] -> {
+				set = show_reply(a, redis.expect_status)
+				incr = show_reply(b, fn(v) match redis.expect_int(v) {
+					Ok(n) -> Ok(int.to_string(n))
+					Err(e) -> Err(e)
+				})
+				got = show_reply(d, redis.expect_string)
+				'${set},${incr},${got}'
+			}
+
+			_ -> 'expected three replies, got ${int.to_string(array.length(replies))}'
+		}
+	}
+}
+
+fn client_pipeline(host String, port Int) String {
+	match redis.connect_tls(host, port) {
+		Err(e) -> redis.show_error(e)
+		Ok(c) -> {
+			reply = pipeline_on(c)
+			redis.close(c)
+			reply
+		}
+	}
+}
+
+fn run(host String, port Int) Nil {
+	println('record-count client against ${host}:${int.to_string(port)}')
+	println('')
+	got = client_pipeline(host, port)
+	// Printed so scripts/tls-records can see the framing control when the
+	// check name alone would hide it, and so a records=3 plant still shows
+	// OK,2,2 on the client side.
+	println('pipeline replies ${got}')
+	finish([is('client pipeline over TLS', got, 'OK,2,2')])
+}
+
+pub fn main() Nil {
+	match os.argv() {
+		[_, host, port] -> match number.parse_int(port) {
+			Ok(p) -> run(host, p)
+			Err(Nil) -> {
+				println('port must be a number')
+				end_the_process('port must be a number')
+			}
+		}
+		_ -> {
+			println('usage: scarlet run test/tls_records.scrl <host> <port>')
+			end_the_process('host and port are required; this is not the compose Redis')
+		}
+	}
+}
