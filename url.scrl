@@ -1,0 +1,465 @@
+// Redis connection URLs — `redis://` in the clear, `rediss://` under TLS.
+//
+// A hosted Redis hands out one string with everything in it, and until this
+// module the only way into this client was `connect(host, port)` and its
+// authenticated pair. There was nowhere to put that string. This turns it into
+// the arguments those functions already take, and refuses anything it cannot
+// turn into them — the dial happens in `redis.scrl` and `pool.scrl`, and it
+// happens only after every part of the URL has been understood.
+//
+// Nothing here touches a socket. That is what makes it testable without a
+// server, and every assertion about it in `test/suite.scrl` is a pure one.
+//
+// Two rules carry most of the weight:
+//
+// Percent-escapes are decoded only after the string has been cut into
+// components, never before. `decode` says why, and it is the difference
+// between reading a hosted provider's password correctly and cutting it in
+// half.
+//
+// What cannot be understood is an error rather than a guess. An unknown
+// scheme, a port that is not a number, a query string this client has no
+// meaning for: each is an `Err` here, before anything is dialled, rather than
+// a default quietly substituted. A URL that means something this client cannot
+// do should not connect to something almost like it.
+
+import scarlet/binary.{Dec, Hex}
+import scarlet/int
+import scarlet/result
+
+// Redis listens on 6379 under both schemes. TLS does not move it — `rediss://`
+// against a server whose TLS port is 6380 has to say so, the same as any other
+// non-default port.
+pub const DEFAULT_PORT = 6379
+
+// The username a bare-password URL authenticates as. `redis://:secret@host`
+// carries no username, which is the shape a `requirepass` server (no ACL
+// users) is configured for, and `default` is the user it means. The same
+// convention `redis.connect_auth` documents.
+pub const DEFAULT_USERNAME = 'default'
+
+const SCHEME_MARK = <<'://'>>
+const AT = <<'@'>>
+const COLON = <<':'>>
+const SLASH = <<'/'>>
+const QUERY = <<'?'>>
+const FRAGMENT = <<'#'>>
+const CLOSE_BRACKET = <<']'>>
+
+// Byte values the scanners compare against directly.
+const PERCENT = 37
+const OPEN_BRACKET_BYTE = 91
+
+// Which of the two schemes a URL asked for.
+//
+// A sum rather than a `Bool`, so that neither this module nor its callers can
+// hold a "secure" flag that means nothing on its own: `redis.connect_target`
+// matches on this, and a third scheme would be a compile error there rather
+// than a silently plaintext dial.
+pub type Scheme {
+	Plain
+	Tls
+}
+
+// A URL, parsed into exactly the arguments the connect functions take.
+//
+// `creds` is one `Option` of both halves rather than two independent
+// `Option`s, because AUTH takes both or neither: a username with no password
+// is refused at parse time (`MissingPassword`) instead of being represented
+// here and discovered on the wire.
+pub type Url {
+	scheme Scheme
+	host String
+	port Int
+	creds Option((String, String))
+	db Option(Int)
+}
+
+// Why a string is not a Redis URL.
+//
+// Every one of these is decided before a socket is opened. They carry the
+// offending text rather than describing it, so a caller can put the actual
+// input in front of whoever typed it.
+pub type UrlError {
+	// No `://` at all — a bare `host:port`, most likely.
+	NoScheme
+	UnknownScheme(scheme String)
+	MissingHost
+	BadPort(text String)
+	BadDatabase(text String)
+	// A username with no password. AUTH needs both.
+	MissingPassword
+	BadEscape(component String, escape String)
+	NotUtf8(component String)
+	// A query or a fragment. Refused rather than ignored — see `split_parts`.
+	UnsupportedComponent(what String)
+}
+
+// The pieces a URL is cut into before any of them is decoded.
+type Parts {
+	scheme Scheme
+	authority Binary
+	path Binary
+}
+
+// The authority, understood.
+type Authority {
+	creds Option((String, String))
+	host String
+	port Int
+}
+
+// Parse a `redis://` or `rediss://` URL.
+//
+//	redis://localhost:6379
+//	redis://:secret@cache.internal:6379/2
+//	rediss://default:p%40ss@redis.example.com:6380/0
+//
+// A `Url` in hand is one every part of which was understood; there is no
+// partial parse and no defaulted-away mistake.
+pub fn parse(text String) Result(Url, UrlError) {
+	parts <- result.then(split_parts(binary.from_string(text)))
+	authority <- result.then(split_authority(parts.authority))
+	db <- result.then(database_of(parts.path))
+	Ok(
+		Url(
+			scheme: parts.scheme,
+			host: authority.host,
+			port: authority.port,
+			creds: authority.creds,
+			db: db,
+		),
+	)
+}
+
+// A sentence naming what was wrong, for the error a caller actually sees.
+pub fn describe(e UrlError) String {
+	match e {
+		NoScheme -> 'not a Redis URL: expected it to begin redis:// or rediss://'
+		UnknownScheme(scheme) ->
+			'unknown URL scheme `${scheme}`: this client speaks redis:// and rediss://'
+		MissingHost -> 'URL has no host'
+		BadPort(text) -> 'URL port `${text}` is not a number in 1..65535'
+		BadDatabase(text) -> 'URL database `${text}` is not a non-negative whole number'
+		MissingPassword -> 'URL has a username but no password: write redis://user:password@host'
+		BadEscape(component, escape) ->
+			'URL ${component} has a malformed percent-escape `${escape}`'
+		NotUtf8(component) -> 'URL ${component} is not valid UTF-8 once its escapes are decoded'
+		UnsupportedComponent(what) -> 'URL has a ${what}, which this client has no meaning for'
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Cutting the string up.
+// ---------------------------------------------------------------------------
+
+// Scheme, authority and path, with the escapes still in them.
+//
+// A query or a fragment is refused here rather than skipped past. Ignoring one
+// would mean `redis://host/0?db=5` connecting to database 0 without a word —
+// the client silently on a different database from the one the string names,
+// which is the whole failure the `/db` handling below exists to prevent. A
+// literal `?` is always a delimiter; a password containing one is written
+// `%3F` and reaches `decode` unharmed.
+fn split_parts(raw Binary) Result(Parts, UrlError) {
+	match binary.index_of(raw, SCHEME_MARK, 0) {
+		None -> Err(NoScheme)
+		Some(at) -> {
+			scheme <- result.then(scheme_of(take(raw, 0, at)))
+			body = binary.drop_bytes(raw, at + 3)
+			if present(body, QUERY) {
+				Err(UnsupportedComponent('query string'))
+			} else if present(body, FRAGMENT) {
+				Err(UnsupportedComponent('fragment'))
+			} else {
+				match binary.index_of(body, SLASH, 0) {
+					None -> Ok(Parts(scheme: scheme, authority: body, path: <<>>))
+					Some(cut) ->
+						Ok(
+							Parts(
+								scheme: scheme,
+								authority: take(body, 0, cut),
+								path: binary.drop_bytes(body, cut + 1),
+							),
+						)
+				}
+			}
+		}
+	}
+}
+
+// RFC 3986 §3.1 makes a scheme case-insensitive, so `REDIS://` is the same
+// request as `redis://`.
+fn scheme_of(b Binary) Result(Scheme, UrlError) {
+	if binary.eq_ignore_ascii_case(b, <<'redis'>>) {
+		Ok(Plain)
+	} else if binary.eq_ignore_ascii_case(b, <<'rediss'>>) {
+		Ok(Tls)
+	} else {
+		Err(UnknownScheme(lossy(b)))
+	}
+}
+
+// Userinfo from host, at the LAST `@`.
+//
+// A correctly written URL has exactly one, because RFC 3986 does not allow a
+// bare `@` inside userinfo — it is written `%40`, which is not this byte and
+// is still encoded at this point. Taking the last one costs nothing when there
+// is one and degrades sensibly when a hand-written URL has an unescaped `@` in
+// its password, where the first would cut the password in half and hand the
+// rest to the resolver as a hostname.
+fn split_authority(authority Binary) Result(Authority, UrlError) {
+	match last_index_of(authority, AT) {
+		None -> authority_of(None, authority)
+		Some(at) -> {
+			creds <- result.then(credentials_of(take(authority, 0, at)))
+			authority_of(creds, binary.drop_bytes(authority, at + 1))
+		}
+	}
+}
+
+// Username and password, split at the FIRST `:` and decoded afterwards.
+//
+// Split first, then decode — never the other way round. RFC 3986 §2.4 states
+// it as a rule about when decoding may happen, and the reason is that decoding
+// manufactures delimiters that the URL does not contain. A password of `p/ss`
+// is written `p%2Fss`; decode the authority before cutting the path off it and
+// the parser sees a `/` in the middle of the password and takes everything
+// after it for a path. `%40` does the same to the `@` that ends the userinfo,
+// and `%3A` to this `:`.
+//
+// The assertions in `test/suite.scrl` use a password holding all three, for
+// the reason that an alphanumeric one passes under either order and witnesses
+// nothing.
+//
+// The first `:` and not the last, so that a password may contain one: it is
+// the username that may not, and everything after the first `:` is password.
+fn credentials_of(userinfo Binary) Result(Option((String, String)), UrlError) {
+	if binary.byte_size(userinfo) == 0 {
+		// `redis://@host` — an empty userinfo is no credentials, not empty ones.
+		Ok(None)
+	} else {
+		match binary.index_of(userinfo, COLON, 0) {
+			None -> Err(MissingPassword)
+			Some(at) -> {
+				username <- result.then(decode(take(userinfo, 0, at), 'username'))
+				password <- result.then(decode(binary.drop_bytes(userinfo, at + 1), 'password'))
+				Ok(Some((if username == '' { DEFAULT_USERNAME } else { username }, password)))
+			}
+		}
+	}
+}
+
+// Host and port.
+//
+// An IPv6 literal is bracketed (`[::1]:6379`) and is the reason the port is
+// found from the right rather than by splitting on `:`: the address is full of
+// them. The brackets are a URL delimiter and not part of the address, so they
+// come off here — what is dialled and, under `rediss://`, what the certificate
+// is checked against, is `::1`.
+//
+// An IP literal is NOT refused under either scheme. T-269 measured what the
+// TLS layer actually does with one: a certificate carrying `IP:127.0.0.1` in
+// its SAN verifies against `tls.handshake(sock, '127.0.0.1')`, and one without
+// it fails as `HostnameMismatch` — an ordinary verification failure, decided
+// where every other one is. `InvalidServerName` is for a name that is neither
+// an address nor a hostname. Refusing `rediss://127.0.0.1:6380` here would
+// refuse a dial the layer below handles correctly.
+fn authority_of(creds Option((String, String)), hostport Binary) Result(Authority, UrlError) {
+	if binary.byte_at(hostport, 0) == OPEN_BRACKET_BYTE {
+		match binary.index_of(hostport, CLOSE_BRACKET, 0) {
+			None -> Err(MissingHost)
+			Some(close) -> {
+				host <- result.then(decode(take(hostport, 1, close - 1), 'host'))
+				port <- result.then(port_after(binary.drop_bytes(hostport, close + 1)))
+				named(creds, host, port)
+			}
+		}
+	} else {
+		match last_index_of(hostport, COLON) {
+			None -> {
+				host <- result.then(decode(hostport, 'host'))
+				named(creds, host, DEFAULT_PORT)
+			}
+			Some(at) -> {
+				host <- result.then(decode(take(hostport, 0, at), 'host'))
+				port <- result.then(port_of(binary.drop_bytes(hostport, at + 1)))
+				named(creds, host, port)
+			}
+		}
+	}
+}
+
+fn named(creds Option((String, String)), host String, port Int) Result(Authority, UrlError) {
+	if host == '' {
+		Err(MissingHost)
+	} else {
+		Ok(Authority(creds: creds, host: host, port: port))
+	}
+}
+
+// What follows an IPv6 literal's `]`: either nothing, or `:` and a port.
+fn port_after(tail Binary) Result(Int, UrlError) {
+	if binary.byte_size(tail) == 0 {
+		Ok(DEFAULT_PORT)
+	} else {
+		match binary.index_of(tail, COLON, 0) {
+			Some(0) -> port_of(binary.drop_bytes(tail, 1))
+			_ -> Err(BadPort(lossy(tail)))
+		}
+	}
+}
+
+// A port is digits, and inside the range a port can be. An empty one —
+// `redis://host:` — is the default, which is what RFC 3986 §3.2.3 says an
+// empty port component means.
+fn port_of(b Binary) Result(Int, UrlError) {
+	if binary.byte_size(b) == 0 {
+		Ok(DEFAULT_PORT)
+	} else {
+		match binary.parse_int(b, Dec) {
+			Err(Nil) -> Err(BadPort(lossy(b)))
+			Ok(n) -> if n < 1 || n > 65535 {
+				Err(BadPort(lossy(b)))
+			} else {
+				Ok(n)
+			}
+		}
+	}
+}
+
+// The `/db` on the end, which is a database index and nothing else.
+//
+// Left undecoded on purpose: a database is a number, and `%30` for `0` is not
+// a thing any server or provider emits. Anything that is not plain digits is
+// refused rather than coerced, so a URL ending in a path this client does not
+// understand cannot quietly select database 0.
+fn database_of(path Binary) Result(Option(Int), UrlError) {
+	if binary.byte_size(path) == 0 {
+		// Both `redis://host` and `redis://host/` say nothing about a database,
+		// and neither one means database 0 — it means leave it where the server
+		// put it.
+		Ok(None)
+	} else if present(path, SLASH) {
+		Err(BadDatabase(lossy(path)))
+	} else {
+		match binary.parse_int(path, Dec) {
+			Err(Nil) -> Err(BadDatabase(lossy(path)))
+			Ok(n) -> if n < 0 {
+				Err(BadDatabase(lossy(path)))
+			} else {
+				Ok(Some(n))
+			}
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Percent-decoding.
+// ---------------------------------------------------------------------------
+
+// Decode one component's `%XX` escapes.
+//
+// Called only on a piece that has already been cut out of the URL, which is
+// the invariant `credentials_of` explains: a decoded byte is data and must
+// never be looked at again as a delimiter.
+//
+// `+` is left alone. It means a space in a form body, not in a URL, and a
+// password containing one would otherwise arrive with it silently changed.
+fn decode(b Binary, component String) Result(String, UrlError) {
+	decoded <- result.then(unescape(b, 0, <<>>, component))
+	match binary.to_string(decoded) {
+		Ok(s) -> Ok(s)
+		Err(Nil) -> Err(NotUtf8(component))
+	}
+}
+
+fn unescape(b Binary, at Int, acc Binary, component String) Result(Binary, UrlError) {
+	if at >= binary.byte_size(b) {
+		Ok(acc)
+	} else if binary.byte_at(b, at) == PERCENT {
+		hi = binary.byte_at(b, at + 1)
+		lo = binary.byte_at(b, at + 2)
+		// Checked digit by digit rather than handed to `parse_int`, which
+		// accepts a sign: `%-1` would otherwise decode to a byte instead of
+		// being reported as the malformed escape it is.
+		if hex_value(hi) < 0 || hex_value(lo) < 0 {
+			// Clamped, because the escape that is being complained about may be
+			// the reason it is short: `...%4` at the very end of a component has
+			// only two bytes to name, and a fixed three would slice past the end
+			// and report an empty string as the offending text.
+			Err(BadEscape(component, lossy(take_upto(b, at, 3))))
+		} else {
+			byte = hex_value(hi) * 16 + hex_value(lo)
+			unescape(b, at + 3, binary.append(acc, <<byte:8>>), component)
+		}
+	} else {
+		unescape(b, at + 1, binary.append(acc, <<binary.byte_at(b, at):8>>), component)
+	}
+}
+
+// The value of one hex digit, or -1 for anything else — including the -1
+// `byte_at` returns past the end of the binary, so a truncated escape at the
+// very end of a component needs no separate length check.
+fn hex_value(byte Int) Int {
+	if byte >= 48 && byte <= 57 {
+		byte - 48
+	} else if byte >= 97 && byte <= 102 {
+		byte - 87
+	} else if byte >= 65 && byte <= 70 {
+		byte - 55
+	} else {
+		-1
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Small helpers over `binary`.
+// ---------------------------------------------------------------------------
+
+fn present(haystack Binary, needle Binary) Bool {
+	match binary.index_of(haystack, needle, 0) {
+		Some(_) -> True
+		None -> False
+	}
+}
+
+fn last_index_of(haystack Binary, needle Binary) Option(Int) {
+	scan_last(haystack, needle, 0, None)
+}
+
+fn scan_last(haystack Binary, needle Binary, from Int, best Option(Int)) Option(Int) {
+	match binary.index_of(haystack, needle, from) {
+		None -> best
+		Some(at) -> scan_last(haystack, needle, at + 1, Some(at))
+	}
+}
+
+// `slice_bytes` is fallible in general, but every call here is inside a length
+// this module has just measured, so an `Err` would be a bug in the scanning
+// above rather than anything about the input. `<<>>` keeps the parser total
+// instead of threading a `Result` through every cut for a case that cannot
+// arise — and an empty component is refused by whichever check reads it next,
+// so the bug would surface as a rejected URL rather than a wrong connection.
+fn take(b Binary, at Int, len Int) Binary {
+	match binary.slice_bytes(b, at, len) {
+		Ok(part) -> part
+		Err(Nil) -> <<>>
+	}
+}
+
+// `take`, clamped to what is left. Only error messages need this: the parser
+// itself never asks for more than it has measured.
+fn take_upto(b Binary, at Int, len Int) Binary {
+	take(b, at, int.min(len, binary.byte_size(b) - at))
+}
+
+// Bytes for an error message. A component that is not UTF-8 has already
+// failed, or is about to; this only has to name it without losing the error
+// that was actually being reported.
+fn lossy(b Binary) String {
+	match binary.to_string(b) {
+		Ok(s) -> s
+		Err(Nil) -> '<not utf-8>'
+	}
+}

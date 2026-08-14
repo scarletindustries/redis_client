@@ -70,6 +70,7 @@ import ./resp.{
 	Value,
 	Verbatim,
 }
+import ./url
 
 // How much to ask the kernel for per read. Replies smaller than this arrive in
 // one call; larger ones simply loop.
@@ -397,6 +398,85 @@ pub fn with_conn_auth(
 	next fn(Conn) Result(a, RedisError),
 ) Result(a, RedisError) {
 	match resource.try_with(fn() connect_auth(host, port, username, password), close, next) {
+		Ok(inner) -> inner
+		Err(e) -> Err(e)
+	}
+}
+
+// Connect from a `redis://` or `rediss://` URL — the one string a hosted Redis
+// gives you, rather than the four arguments it decomposes into.
+//
+// Everything the URL says is understood before anything is dialled: an unknown
+// scheme, a port that is not a number, a database that is not an index are all
+// `Misuse` from `url.parse`, and no socket is opened. `url.parse` is public and
+// returns a `UrlError` for a caller that wants to match on which of those it
+// was; this reports it as the message on a `Misuse`, because by the time it is
+// a `RedisError` the only honest thing to say is that the call was wrong before
+// it reached the wire.
+pub fn connect_url(text String) Result(Conn, RedisError) {
+	target <- result.then(parse_url(text))
+	connect_target(target)
+}
+
+// `url.parse`, with its error in this module's vocabulary. Public because
+// `pool.scrl` needs exactly this and should not have its own copy of the
+// mapping.
+pub fn parse_url(text String) Result(url.Url, RedisError) {
+	match url.parse(text) {
+		Ok(target) -> Ok(target)
+		Err(e) -> Err(Misuse(url.describe(e)))
+	}
+}
+
+// Dial an already-parsed URL. The four connect functions above, chosen by what
+// the URL turned out to say, plus the `SELECT` its path asks for.
+//
+// Public for `pool.scrl`, whose workers dial one of these per connection and
+// again on every reconnect — which is what keeps a replaced connection on the
+// same database and the same credentials as the one it replaced.
+pub fn connect_target(target url.Url) Result(Conn, RedisError) {
+	opened <- result.then(match (target.scheme, target.creds) {
+		(url.Plain, None) -> connect(target.host, target.port)
+		(url.Plain, Some((username, password))) ->
+			connect_auth(target.host, target.port, username, password)
+		(url.Tls, None) -> connect_tls(target.host, target.port)
+		(url.Tls, Some((username, password))) ->
+			connect_tls_auth(target.host, target.port, username, password)
+	})
+	select_db(opened, target.db)
+}
+
+// The `/db` at the end of a URL, which is a second round trip after the
+// handshake — there is no room in `HELLO` for it.
+//
+// A URL connect performs it rather than leaving it to the caller. Half-applying
+// a connection string is worse than not accepting one: a caller who passed
+// `.../3` and got a connection on database 0 has no way to notice until a key
+// is missing, and every command in between went to the wrong place.
+//
+// So a refused `SELECT` fails the connect and closes the socket, exactly as a
+// refused `HELLO` does. The alternative is handing back a connection that works
+// perfectly and is on the wrong database, which is the failure this is for.
+//
+// `connection.select` is the same command; it cannot be called from here
+// because that module imports this one. `hello` above inlines its own `HELLO`
+// for the same reason.
+fn select_db(c Conn, db Option(Int)) Result(Conn, RedisError) {
+	match db {
+		None -> Ok(c)
+		Some(n) -> match expect_ok(command(c, ['SELECT', arg(n)])) {
+			Ok(Nil) -> Ok(c)
+			Err(e) -> {
+				close(c)
+				Err(e)
+			}
+		}
+	}
+}
+
+// The URL counterpart to `with_conn`.
+pub fn with_conn_url(text String, next fn(Conn) Result(a, RedisError)) Result(a, RedisError) {
+	match resource.try_with(fn() connect_url(text), close, next) {
 		Ok(inner) -> inner
 		Err(e) -> Err(e)
 	}

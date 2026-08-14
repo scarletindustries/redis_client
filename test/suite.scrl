@@ -35,6 +35,7 @@ import ../sorted_sets.{HIGHEST, LOWEST}
 import ../streams.{Exact, MaxLen}
 import ../strings
 import ../transactions
+import ../url
 import ../resp.{Num}
 
 fn k(tag String, name String) String {
@@ -97,7 +98,9 @@ fn test_strings(c Conn, tag String) Result(Array(Check), RedisError) {
 	_ <- result.then(strings.set(c, k(tag, 'empty'), ''))
 	empty <- result.then(strings.get(c, k(tag, 'empty')))
 
-	_ <- result.then(keys.del(c, [key, k(tag, 'str2'), k(tag, 'ctr'), k(tag, 'f'), k(tag, 'empty')]))
+	_ <- result.then(
+		keys.del(c, [key, k(tag, 'str2'), k(tag, 'ctr'), k(tag, 'f'), k(tag, 'empty')]),
+	)
 	Ok(
 		[
 			eq('get', got, Some('hello')),
@@ -873,9 +876,9 @@ fn test_connection(c Conn, tag String) Result(Array(Check), RedisError) {
 fn test_pubsub(host String, port Int, tag String) Array(Check) {
 	channel = k(tag, 'channel')
 	match redis.connect(host, port) {
-		Err(e) -> [Check( 'pubsub connect', False, redis.show_error(e))]
+		Err(e) -> [Check('pubsub connect', False, redis.show_error(e))]
 		Ok(c) -> match pubsub.subscribe(c, [channel]) {
-			Err(e) -> [Check( 'subscribe', False, redis.show_error(e))]
+			Err(e) -> [Check('subscribe', False, redis.show_error(e))]
 			Ok(sub) -> {
 				_ = process.spawn(fn() publish_later(host, port, channel))
 				// A generous timeout: this asserts a message arrives, not how
@@ -910,9 +913,9 @@ fn publish_later(host String, port Int, channel String) Nil {
 fn test_pubsub_timeout(host String, port Int, tag String) Array(Check) {
 	channel = k(tag, 'channel-timeout')
 	match redis.connect(host, port) {
-		Err(e) -> [Check( 'pubsub timeout connect', False, redis.show_error(e))]
+		Err(e) -> [Check('pubsub timeout connect', False, redis.show_error(e))]
 		Ok(c) -> match pubsub.subscribe(c, [channel]) {
-			Err(e) -> [Check( 'pubsub timeout subscribe', False, redis.show_error(e))]
+			Err(e) -> [Check('pubsub timeout subscribe', False, redis.show_error(e))]
 			Ok(sub) -> {
 				(rest, outcome) = pubsub.next_message_within(sub, 200)
 				pubsub.close(rest)
@@ -961,6 +964,258 @@ fn test_errors(c Conn, tag String) Result(Array(Check), RedisError) {
 // Running.
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Connection URLs.
+// ---------------------------------------------------------------------------
+
+// `url.parse` is pure, so none of this touches the server; it runs here because
+// this is where the library's checks live. Each assertion compares the whole
+// `Url` rather than one field of it, so a change that fixes the port by
+// mangling the host cannot pass.
+fn test_url(c Conn, tag String) Result(Array(Check), RedisError) {
+	_ = c
+	_ = tag
+	Ok(
+		[
+			eq(
+				'redis:// with an explicit port',
+				url.parse('redis://127.0.0.1:6379'),
+				Ok(url.Url(scheme: url.Plain, host: '127.0.0.1', port: 6379, creds: None, db: None)),
+			),
+			eq(
+				'rediss:// defaults to 6379, the same port as redis://',
+				url.parse('rediss://cache.example.com'),
+				Ok(
+					url.Url(
+						scheme: url.Tls,
+						host: 'cache.example.com',
+						port: 6379,
+						creds: None,
+						db: None,
+					),
+				),
+			),
+			eq(
+				'the scheme is case-insensitive',
+				url.parse('REDIS://h'),
+				Ok(url.Url(scheme: url.Plain, host: 'h', port: 6379, creds: None, db: None)),
+			),
+			eq(
+				'an empty port is the default port',
+				url.parse('redis://h:'),
+				Ok(url.Url(scheme: url.Plain, host: 'h', port: 6379, creds: None, db: None)),
+			),
+			// T-269 measured the TLS layer against an IP literal rather than reading
+			// tls.scrl's comments about it: a certificate with `IP:127.0.0.1` in its
+			// SAN verifies, one without it is a `HostnameMismatch`, and
+			// `InvalidServerName` is for a name that is neither address nor hostname.
+			// So the parser must hand this through and let the handshake judge it.
+			eq(
+				'rediss:// accepts an IP-literal host',
+				url.parse('rediss://127.0.0.1:6380'),
+				Ok(url.Url(scheme: url.Tls, host: '127.0.0.1', port: 6380, creds: None, db: None)),
+			),
+			eq(
+				'an IPv6 literal keeps the address and drops the brackets',
+				url.parse('redis://[::1]:6379'),
+				Ok(url.Url(scheme: url.Plain, host: '::1', port: 6379, creds: None, db: None)),
+			),
+			eq(
+				'a bracketed host with no port takes the default',
+				url.parse('rediss://[2001:db8::1]'),
+				Ok(url.Url(scheme: url.Tls, host: '2001:db8::1', port: 6379, creds: None, db: None)),
+			),
+			eq(
+				'username and password',
+				url.parse('redis://alice:s3cret@h:6380/2'),
+				Ok(
+					url.Url(
+						scheme: url.Plain,
+						host: 'h',
+						port: 6380,
+						creds: Some(('alice', 's3cret')),
+						db: Some(2),
+					),
+				),
+			),
+			eq(
+				'a bare password authenticates as `default`',
+				url.parse('redis://:s3cret@h'),
+				Ok(
+					url.Url(
+						scheme: url.Plain,
+						host: 'h',
+						port: 6379,
+						creds: Some(('default', 's3cret')),
+						db: None,
+					),
+				),
+			),
+			eq(
+				'a username with no password is refused',
+				url.parse('redis://alice@h'),
+				Err(url.MissingPassword),
+			),
+			eq(
+				'an empty userinfo is no credentials',
+				url.parse('redis://@h'),
+				Ok(url.Url(scheme: url.Plain, host: 'h', port: 6379, creds: None, db: None)),
+			),
+			// The one this group exists for. The password holds all three characters
+			// that decoding would otherwise manufacture as delimiters — `%40` an `@`,
+			// `%2F` a `/`, `%3A` a `:` — and the username holds a fourth. Decode
+			// before cutting the URL up and the `/` inside the username ends the
+			// authority, so what is left is refused as a database index.
+			eq(
+				'percent-escapes are decoded after the URL is cut up, not before',
+				url.parse('redis://a%2Fb:p%40ss%2Fw%3Ard@h.example:6379/1'),
+				Ok(
+					url.Url(
+						scheme: url.Plain,
+						host: 'h.example',
+						port: 6379,
+						creds: Some(('a/b', 'p@ss/w:rd')),
+						db: Some(1),
+					),
+				),
+			),
+			// The honest control: this one passes whichever order the parser uses, so
+			// on its own it witnesses nothing. It is here to stay green while the
+			// assertion above goes red, which is what makes that failure specific.
+			eq(
+				'an alphanumeric password parses (and would under either order)',
+				url.parse('redis://user:plainpass@h'),
+				Ok(
+					url.Url(
+						scheme: url.Plain,
+						host: 'h',
+						port: 6379,
+						creds: Some(('user', 'plainpass')),
+						db: None,
+					),
+				),
+			),
+			eq(
+				'a malformed escape is refused',
+				url.parse('redis://:p%zz@h'),
+				Err(url.BadEscape('password', '%zz')),
+			),
+			eq(
+				'a truncated escape at the end of a component is refused',
+				url.parse('redis://:pass%4@h'),
+				Err(url.BadEscape('password', '%4')),
+			),
+			eq(
+				'`+` is left alone, because it is not a space outside a form body',
+				url.parse('redis://:a+b@h'),
+				Ok(
+					url.Url(
+						scheme: url.Plain,
+						host: 'h',
+						port: 6379,
+						creds: Some(('default', 'a+b')),
+						db: None,
+					),
+				),
+			),
+			eq(
+				'database 0 is a database, not the absence of one',
+				db_of('redis://h/0'),
+				Ok(Some(0)),
+			),
+			eq('no path selects no database', db_of('redis://h'), Ok(None)),
+			eq('a trailing slash selects no database', db_of('redis://h/'), Ok(None)),
+			eq(
+				'a path that is not a number is refused',
+				db_of('redis://h/main'),
+				Err(url.BadDatabase('main')),
+			),
+			eq(
+				'a two-segment path is refused',
+				db_of('redis://h/1/2'),
+				Err(url.BadDatabase('1/2')),
+			),
+			eq('a bare host:port is not a URL', url.parse('localhost:6379'), Err(url.NoScheme)),
+			eq(
+				'an unknown scheme is refused',
+				url.parse('http://h'),
+				Err(url.UnknownScheme('http')),
+			),
+			eq(
+				'a port that is not a number is refused',
+				url.parse('redis://h:port'),
+				Err(url.BadPort('port')),
+			),
+			eq(
+				'a port past 65535 is refused',
+				url.parse('redis://h:70000'),
+				Err(url.BadPort('70000')),
+			),
+			eq('a URL with no host is refused', url.parse('redis://'), Err(url.MissingHost)),
+			// Refused rather than ignored: silently dropping `?db=5` would connect to
+			// a different database from the one the string names.
+			eq(
+				'a query string is refused rather than ignored',
+				url.parse('redis://h/0?db=5'),
+				Err(url.UnsupportedComponent('query string')),
+			),
+			eq(
+				'a fragment is refused rather than ignored',
+				url.parse('redis://h#tail'),
+				Err(url.UnsupportedComponent('fragment')),
+			),
+		],
+	)
+}
+
+// The database a URL selects, for the assertions that are only about the path.
+fn db_of(text String) Result(Option(Int), url.UrlError) {
+	result.map(url.parse(text), fn(u) u.db)
+}
+
+// What a URL connect does that a `host, port` one cannot: the `/db` on the end
+// is a second round trip, and these are the two things that have to be true of
+// it. Live, because that round trip is the whole question.
+fn test_url_live(host String, port Int, tag String) Array(Check) {
+	base = 'redis://${host}:${int.to_string(port)}'
+	key = k(tag, 'url')
+
+	wrote = redis.with_conn_url('${base}/1', fn(c) {
+		_ <- result.then(strings.set(c, key, 'on-db-1'))
+		strings.get(c, key)
+	})
+	// The same key, read on database 0 through the connect that names no
+	// database. This is what makes the check above about SELECT rather than
+	// about SET: without the SELECT both reads would find it.
+	elsewhere = redis.with_conn(host, port, fn(c) strings.get(c, key))
+	_ = redis.with_conn_url('${base}/1', fn(c) keys.del(c, [key]))
+
+	// A database the server refuses. The connect must fail rather than hand back
+	// a working connection on database 0 — a `Server` error specifically, which
+	// is the SELECT being refused rather than the dial failing.
+	refused = redis.with_conn_url('${base}/99', fn(c) connection.ping(c))
+
+	[
+		eq('a URL with /1 writes to database 1', wrote, Ok(Some('on-db-1'))),
+		eq('and database 0 never saw that key', elsewhere, Ok(None)),
+		that('a database the server refuses fails the connect', server_refused(refused)),
+		that(
+			'a malformed URL fails before anything is dialled',
+			match redis.connect_url('http://${host}') {
+				Err(redis.Misuse(_)) -> True
+				_ -> False
+			},
+		),
+	]
+}
+
+fn server_refused(r Result(a, RedisError)) Bool {
+	match r {
+		Err(Server(_)) -> True
+		_ -> False
+	}
+}
+
 fn run(
 	name String,
 	c Conn,
@@ -971,7 +1226,7 @@ fn run(
 		Ok(checks) -> checks
 		// A group that died partway still reports — as one failure naming the
 		// group, rather than vanishing from the count.
-		Err(e) -> [Check( '${name} (group aborted)', False, redis.show_error(e))]
+		Err(e) -> [Check('${name} (group aborted)', False, redis.show_error(e))]
 	}
 }
 
@@ -1040,6 +1295,7 @@ fn run_cli(host String, port Int) Nil {
 				('pipelining', test_pipeline),
 				('connection and server', test_connection),
 				('errors', test_errors),
+				('connection urls', test_url),
 			],
 			[],
 			fn(acc, group) match group {
@@ -1051,12 +1307,9 @@ fn run_cli(host String, port Int) Nil {
 			},
 		)
 		println('pub/sub:')
-		Ok(
-			array.concat(
-				checks,
-				array.concat(test_pubsub(host, port, tag), test_pubsub_timeout(host, port, tag)),
-			),
-		)
+		live = array.concat(test_pubsub(host, port, tag), test_pubsub_timeout(host, port, tag))
+		println('url connect:')
+		Ok(array.concat(checks, array.concat(live, test_url_live(host, port, tag))))
 	})
 	match outcome {
 		Err(e) -> {

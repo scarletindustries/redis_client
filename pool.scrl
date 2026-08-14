@@ -40,6 +40,7 @@ import scarlet/process.{Subject}
 import scarlet/resource
 import scarlet/result
 import ./redis.{Broken, Conn, Dispatch, Health, Healthy, Job, RedisError, Shutdown}
+import ./url
 
 // ---------------------------------------------------------------------------
 // The protocol between the three kinds of process: callers, the gateway, and
@@ -85,7 +86,7 @@ type Boot {
 // A size below one is one. A pool that can serve nothing would park every
 // caller for ever, which is never what the caller meant.
 pub fn start(host String, port Int, size Int) Result(Conn, RedisError) {
-	start_with(host, port, size, None)
+	start_with(plain(host, port, None), size)
 }
 
 // `start`, for a server that demands AUTH before it will accept anything
@@ -101,15 +102,32 @@ pub fn start_auth(
 	username String,
 	password String,
 ) Result(Conn, RedisError) {
-	start_with(host, port, size, Some((username, password)))
+	start_with(plain(host, port, Some((username, password))), size)
 }
 
-fn start_with(
-	host String,
-	port Int,
-	size Int,
-	creds Option((String, String)),
-) Result(Conn, RedisError) {
+// Start a pool from a `redis://` or `rediss://` URL.
+//
+// This is where a pool gets TLS: `start` and `start_auth` name a host and a
+// port and are cleartext by construction, and until there was a URL to say
+// `rediss://` there was no way to ask a pool for anything else. Every worker
+// dials the same target, so a pool started from a URL with a database on it is
+// eight connections all on that database — including any that reconnect later.
+//
+// The URL is parsed once, here, rather than per worker: a malformed one is an
+// error from this call with no processes spawned, in keeping with `start`'s
+// promise that a pool which comes back has every connection already up.
+pub fn start_url(text String, size Int) Result(Conn, RedisError) {
+	target <- result.then(redis.parse_url(text))
+	start_with(target, size)
+}
+
+// What `start` and `start_auth` dial: cleartext, no database selected. The one
+// place the host/port pairs turn into the target the workers carry.
+fn plain(host String, port Int, creds Option((String, String))) url.Url {
+	url.Url(scheme: url.Plain, host: host, port: port, creds: creds, db: None)
+}
+
+fn start_with(target url.Url, size Int) Result(Conn, RedisError) {
 	ack = process.subject()
 	// Unlinked, deliberately. A pool is shared: its handle is copied to every
 	// process that needs Redis, and the one that happened to call `start` is
@@ -118,7 +136,7 @@ fn start_with(
 	// let a fault inside the pool take down a caller that was only ever going
 	// to be told about it. What the pool owes its users is an error, which is
 	// what the monitors here and in `lease` deliver.
-	pid = process.spawn_unlinked(fn() manage(host, port, int.max(1, size), creds, ack))
+	pid = process.spawn_unlinked(fn() manage(target, int.max(1, size), ack))
 	// A pool that dies while starting still owes an answer to `start`. Without
 	// this the boot would be waited on for ever, which is the one failure a
 	// caller cannot even time out of.
@@ -193,6 +211,18 @@ pub fn with_pool_auth(
 	}
 }
 
+// The URL counterpart to `with_pool`.
+pub fn with_pool_url(
+	text String,
+	size Int,
+	next fn(Conn) Result(a, RedisError),
+) Result(a, RedisError) {
+	match resource.try_with(fn() start_url(text, size), stop, next) {
+		Ok(inner) -> inner
+		Err(e) -> Err(e)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Using the pool.
 // ---------------------------------------------------------------------------
@@ -232,23 +262,19 @@ pub fn with_conn(c Conn, next fn(Conn) Result(a, RedisError)) Result(a, RedisErr
 // network — matching a request to a free worker, or parking it behind the
 // requests before it, is a value moving between two queues.
 fn manage(
-	host String,
-	port Int,
+	target url.Url,
 	size Int,
-	creds Option((String, String)),
 	ack Subject(Result(Subject(Request), RedisError)),
 ) Nil {
 	booting = process.subject()
 	gateway = process.subject()
-	hire(host, port, size, creds, booting, gateway)
+	hire(target, size, booting, gateway)
 	await(booting, gateway, ack, size, empty(), None)
 }
 
 fn hire(
-	host String,
-	port Int,
+	target url.Url,
 	left Int,
-	creds Option((String, String)),
 	booting Subject(Boot),
 	gateway Subject(Request),
 ) Nil {
@@ -264,8 +290,8 @@ fn hire(
 		// every caller is already watching for, so the bug is reported to all of
 		// them at once instead of stranding whichever one it happened to be
 		// serving. Loud and contained: the pool dies, the program does not.
-		_ = process.spawn(fn() work(host, port, creds, booting, gateway))
-		hire(host, port, left - 1, creds, booting, gateway)
+		_ = process.spawn(fn() work(target, booting, gateway))
+		hire(target, left - 1, booting, gateway)
 	}
 }
 
@@ -385,23 +411,15 @@ fn serve(
 // One connection, one process, for the life of the pool. The socket is dialled
 // here, used here and closed here, and never crosses to another process — which
 // is the point of the whole arrangement.
-fn work(
-	host String,
-	port Int,
-	creds Option((String, String)),
-	booting Subject(Boot),
-	gateway Subject(Request),
-) Nil {
+fn work(target url.Url, booting Subject(Boot), gateway Subject(Request)) Nil {
 	inbox = process.subject()
-	opened = dial(host, port, creds)
+	opened = dial(target)
 	process.send(booting, Boot(worker: inbox, opened: result.map(opened, fn(_) Nil)))
-	labour(host, port, creds, gateway, inbox, held(opened))
+	labour(target, gateway, inbox, held(opened))
 }
 
 fn labour(
-	host String,
-	port Int,
-	creds Option((String, String)),
+	target url.Url,
 	gateway Subject(Request),
 	inbox Subject(Task),
 	conn Option(Conn),
@@ -415,22 +433,26 @@ fn labour(
 			// error rather than a wait.
 			lease = match conn {
 				Some(c) -> Ok(c)
-				None -> dial(host, port, creds)
+				None -> dial(target)
 			}
 			kept = retain(lease, job(lease))
 			process.send(gateway, Ready(inbox))
-			labour(host, port, creds, gateway, inbox, kept)
+			labour(target, gateway, inbox, kept)
 		}
 	}
 }
 
-// The one place that decides whether a dial authenticates — everywhere else
-// in this file just carries `creds` through to here.
-fn dial(host String, port Int, creds Option((String, String))) Result(Conn, RedisError) {
-	match creds {
-		Some((username, password)) -> redis.connect_auth(host, port, username, password)
-		None -> redis.connect(host, port)
-	}
+// The one place a connection is opened — everywhere else in this file just
+// carries `target` through to here.
+//
+// Every dial goes through this, the first and every reconnect alike, so a
+// connection that replaces a broken one comes back with the same transport,
+// the same credentials and the same database as the one it replaced. A
+// reconnect that quietly landed on database 0 would be the same wrong-database
+// failure `redis.connect_target` refuses to hand back, arriving later and
+// harder to see.
+fn dial(target url.Url) Result(Conn, RedisError) {
+	redis.connect_target(target)
 }
 
 // Keep the connection unless the job left it in doubt.

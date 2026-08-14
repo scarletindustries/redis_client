@@ -36,6 +36,31 @@ plumbing between the lines you care about.
 A missing key is `None`, not `''`. A refused command is an `Err` you can match
 on, and the connection stays usable afterwards.
 
+## Connection URLs
+
+A hosted Redis hands out one string rather than a host and a port. `connect_url`
+takes it, and so do `with_conn_url` and `pool.start_url`:
+
+```scarlet
+redis.with_conn_url('rediss://default:s3cret@cache.example.com:6380/2', greet)
+```
+
+`redis://` is in the clear and `rediss://` is TLS; both default to port 6379.
+Userinfo authenticates, and a bare `redis://:secret@host` is username `default`
+— the shape a `requirepass` server with no ACL users wants. Percent-escapes are
+decoded after the URL is cut into components, so a password containing `@`, `/`
+or `:` survives being written `%40`, `%2F` or `%3A`.
+
+A trailing `/2` selects database 2, which is a second round trip after the
+handshake. A `SELECT` the server refuses fails the connect rather than handing
+back a working connection on the wrong database, and a pooled connection that
+reconnects later re-selects it.
+
+Anything the parser cannot account for is an error before a socket is opened,
+rather than a default quietly substituted: an unknown scheme, a port that is not
+a number, a query string this client has no meaning for. `url.parse` is public
+and says which.
+
 ## Pooling
 
 One connection per process is a fine rule for a script and an awkward one for a
@@ -261,7 +286,10 @@ negotiate `HELLO 3` inside the dial exactly as the plaintext pair do, so a
 c <- result.then(redis.connect_tls('redis.example', 6380))
 ```
 
-There is still no `rediss://` URL to pass — nothing here parses URLs yet.
+Or pass the URL itself: `rediss://` goes through `connect_url`, `with_conn_url`
+and `pool.start_url` — see [Connection URLs](#connection-urls). An IP-literal
+host is dialled like any other, and the certificate is checked against it the
+same way; the handshake decides, not the parser.
 
 `host` is both the address dialled and the name the certificate is verified
 against, and there is no argument that relaxes that, because the language
