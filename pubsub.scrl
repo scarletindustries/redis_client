@@ -225,9 +225,9 @@ pub fn next_message(s Subscription) (Subscription, Result(Event, RedisError)) {
 // has to do something else periodically — check a shutdown flag, emit a
 // heartbeat — rather than block for ever.
 //
-// Over TLS this pin cannot offer a deadline: `scarlet/net/tls` has no
-// `read_within`. The call returns `Err(Misuse(..))` rather than parking in
-// an unbounded `tls.read`. A timeout that was ignored would hang, not fail.
+// Over TLS this is not yet wired to `scarlet/net/tls`'s `read_within`
+// (T-529). The call returns `Err(Misuse(..))` rather than parking in an
+// unbounded `tls.read`. A timeout that was ignored would hang, not fail.
 pub fn next_message_within(
 	s Subscription,
 	timeout_ms Int,

@@ -170,7 +170,7 @@ pub fn transport_read_within(
 		Secure(_) ->
 			Err(
 				Misuse(
-					'next_message_within is not offered over TLS: this pin has no tls.read_within',
+					'next_message_within is not offered over TLS: not wired to tls.read_within yet',
 				),
 			)
 	}

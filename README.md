@@ -298,12 +298,13 @@ machine already has.
 
 **Pub/sub works over TLS.** `subscribe` / `next_message` take over the same
 `Transport` a `Conn` holds, so a subscriber is in the clear or under TLS
-for the same reason a `PING` is. **A timed listen does not**: this pin's
-`scarlet/net/tls` has no `read_within`, so `next_message_within` on a TLS
-subscription is `Err(Misuse(..))` rather than a `tls.read` that ignores the
-deadline. A timeout that was silently dropped would hang a caller that
-depends on it. `socket_of` still refuses TLS, because there is no
-cleartext `Socket` to give; pub/sub goes through `transport_of`.
+for the same reason a `PING` is. **A timed listen does not, yet**: the pin
+carries `scarlet/net/tls`'s `read_within` now, but `next_message_within` is
+not wired to it (T-529), so a TLS subscription still answers `Err(Misuse(..))`
+rather than a `tls.read` that ignores the deadline. A timeout that was
+silently dropped would hang a caller that depends on it. `socket_of` still
+refuses TLS, because there is no cleartext `Socket` to give; pub/sub goes
+through `transport_of`.
 
 A **pipeline over TLS is one `tls.write`** rather than the plaintext path's
 vectored `write_parts`, since `tls` has no `write_parts` — one record for
